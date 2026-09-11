@@ -52,7 +52,7 @@ it("creates notebooks, preserves tool settings, duplicates paper and prevents na
   data.notebooks = [notebook];
   data.pages = [original];
   document.body.innerHTML = '<div id="app"></div>';
-  const context = new Proxy({}, { get: () => vi.fn(), set: () => true });
+  const context = new Proxy({}, { get: (_target, key) => key === "measureText" ? (text: string) => ({ width: text.length * 12 }) : vi.fn(), set: () => true });
   vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(context as CanvasRenderingContext2D);
   vi.stubGlobal("requestAnimationFrame", vi.fn());
   vi.stubGlobal("cancelAnimationFrame", vi.fn());
@@ -91,6 +91,15 @@ it("creates notebooks, preserves tool settings, duplicates paper and prevents na
     document.querySelector<HTMLButtonElement>("[data-open-book]")!.click();
     await vi.waitFor(() => expect(element("page-title-label")?.textContent).toBe("Original page"));
     expect(element("editor-workspace").hidden).toBe(false);
+    element("notebook-menu").click();
+    expect(element("notebook-menu-popup").hidden).toBe(false);
+    expect(element("notebook-menu-popup").textContent).toContain("Import picture / PDF");
+    expect(element("notebook-menu-popup").textContent).toContain("Export PDF / picture");
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    expect(element("notebook-menu-popup").hidden).toBe(true);
+    element("toolbar-insert").click();
+    expect(element("insert-menu").hidden).toBe(false);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
     element("highlighter-tool").click();
     expect(element("highlighter-tool").getAttribute("aria-pressed")).toBe("true");
     expect(element<HTMLInputElement>("width-range").value).toBe("18");
@@ -99,10 +108,12 @@ it("creates notebooks, preserves tool settings, duplicates paper and prevents na
     element("highlighter-tool").click();
     expect(JSON.parse(localStorage.getItem("notepad.writing-tools")!).settings.highlighter.width).toBe(18);
 
+    const originalSlot = document.querySelector(`[data-flow-page="${original.id}"]`);
     element("duplicate-page").click();
     await vi.waitFor(() => expect(element("page-title-label").textContent).toBe("Original page (copy)"));
     expect(data.pages[1]).toMatchObject({ background: "grid", text: "ข้อความทดสอบ" });
     expect(data.pages[1]!.id).not.toBe(original.id);
+    expect(document.querySelector(`[data-flow-page="${original.id}"]`)).toBe(originalSlot);
     element("add-page").click();
     await vi.waitFor(() => expect(element("page-position").textContent).toBe("3 / 3"));
     expect(data.pages[2]).toMatchObject({ background: "grid", text: "", strokes: [] });

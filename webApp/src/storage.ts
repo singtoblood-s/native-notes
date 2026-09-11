@@ -88,6 +88,7 @@ export interface NoteStore {
   listPages(notebookId: string, includeDeleted?: boolean): Promise<NotePage[]>;
   getPage(id: string): Promise<NotePage | null>;
   savePage(page: NotePage, queue?: boolean): Promise<SaveResult>;
+  importDocument(notebook: Notebook, pages: NotePage[]): Promise<void>;
   deletePage(id: string): Promise<SaveResult>;
   restorePage(id: string): Promise<SaveResult>;
   archiveNotebook(id: string): Promise<SaveResult>;
@@ -771,6 +772,27 @@ export class SQLiteNoteStoreEngine implements NoteStore {
 
   async savePage(page: NotePage, queue = true): Promise<SaveResult> { return this.transaction(() => this.savePageRow(page, queue)); }
 
+  async importDocument(notebook: Notebook, pages: NotePage[]): Promise<void> {
+    const book = validateNotebookSnapshot(notebook);
+    if (!pages.length || pages.length > 100) throw new Error("Import between 1 and 100 pages at a time.");
+    const checked = pages.map(page => validatePageSnapshot(page));
+    if (new Set(checked.map(page => page.id)).size !== checked.length || checked.some(page => page.notebookId !== book.id)) throw new Error("Invalid imported pages.");
+    if (new TextEncoder().encode(JSON.stringify(checked)).byteLength > 40 * 1024 * 1024) throw new Error("Imported pages exceed 40 MB. Split the document and try again.");
+    await this.transaction(() => {
+      const existing = this.notebookFromRow(this.row(book.id, "notebooks"));
+      if (existing?.deletedAt) throw new Error("This notebook is in the trash.");
+      if (checked.some(page => this.row(page.id, "pages"))) throw new Error("An imported page already exists.");
+      if (!existing) {
+        const result = this.saveNotebookRow(book, true);
+        if (result.status === "failed") throw new Error(result.message ?? "Could not save imported notebook.");
+      }
+      for (const page of checked) {
+        const result = this.savePageRow(page, true);
+        if (result.status === "failed") throw new Error(result.message ?? "Could not save imported pages.");
+      }
+    });
+  }
+
   async deletePage(entityID: string): Promise<SaveResult> {
     return this.transaction(() => {
       const current = this.pageFromRow(this.row(entityID, "pages"));
@@ -1365,6 +1387,7 @@ export class SQLiteNoteStore implements NoteStore {
   deleteConflict(conflictID: string): Promise<void> { return this.rpc("deleteConflict", [conflictID]); }
   exportArchive(): Promise<Archive> { return this.rpc("exportArchive"); }
   importArchive(archive: Archive): Promise<{ notebooks: number; pages: number }> { return this.rpc("importArchive", [archive]); }
+  importDocument(notebook: Notebook, pages: NotePage[]): Promise<void> { return this.rpc("importDocument", [notebook, pages]); }
   ensureStarterData(): Promise<{ notebook: Notebook; page: NotePage }> { return this.rpc("ensureStarterData"); }
 
   acquireSyncLease(): () => void {

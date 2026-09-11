@@ -21,6 +21,25 @@ function pageOperation() : SyncOperation {
 }
 
 describe("conflict recovery storage", () => {
+  it("validates imported pages before writing and persists a whole document in one transaction", async () => {
+    const notebook = createNotebook("PDF import");
+    const pages = [createPage(notebook.id), createPage(notebook.id)];
+    pages.forEach((page, order) => { page.formatVersion = 2; page.order = order; });
+    const saveNotebookRow = vi.fn(() => ({ status: "saved" }));
+    const savePageRow = vi.fn(() => ({ status: "saved" }));
+    const transaction = vi.fn(async (body: () => unknown) => body());
+    const fake = { transaction, row: () => null, notebookFromRow: () => null, saveNotebookRow, savePageRow } as unknown as SQLiteNoteStoreEngine;
+    await SQLiteNoteStoreEngine.prototype.importDocument.call(fake, notebook, pages);
+    expect(transaction).toHaveBeenCalledTimes(1);
+    expect(saveNotebookRow).toHaveBeenCalledTimes(1);
+    expect(savePageRow).toHaveBeenCalledTimes(2);
+    transaction.mockClear(); savePageRow.mockClear();
+    await expect(SQLiteNoteStoreEngine.prototype.importDocument.call(fake, notebook, [pages[0]!, pages[0]!])).rejects.toThrow("Invalid imported pages");
+    expect(transaction).not.toHaveBeenCalled();
+    expect(savePageRow).not.toHaveBeenCalled();
+    savePageRow.mockImplementation(() => { throw new Error("Disk full"); });
+    await expect(SQLiteNoteStoreEngine.prototype.importDocument.call(fake, notebook, pages)).rejects.toThrow("Disk full");
+  });
   it("saves and queues old local strokes with repaired timing while preserving their geometry", () => {
     const page = createPage(notebookID);
     page.id = pageID;

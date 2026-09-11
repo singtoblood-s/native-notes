@@ -63,7 +63,7 @@ async function loadGeneratedServiceWorker() {
     async open() { return cache; },
     async keys() { return ["notepad-static-old", "unrelated-cache"]; },
     async delete() { return true; },
-    async match(_request: string | TestRequest) { return undefined as TestResponse | undefined; },
+    async match(_request: string | TestRequest, _options?: { ignoreVary?: boolean }) { return undefined as TestResponse | undefined; },
   };
   const self = {
     location: { origin: "https://notes.example.test" },
@@ -78,6 +78,17 @@ async function loadGeneratedServiceWorker() {
 }
 
 describe("generated service worker contract", () => {
+  it("serves a precached module offline despite differing Origin request headers", async () => {
+    const loaded = await loadGeneratedServiceWorker();
+    const module = new TestResponse("export default true;");
+    loaded.caches.match = async (_request, options) => options?.ignoreVary ? module : undefined;
+    let response: Promise<TestResponse> | undefined;
+    loaded.handlers.get("fetch")?.({
+      request: new TestRequest("https://notes.example.test/native-notes/assets/index-test.js", "cors", { Origin: "https://notes.example.test" }),
+      respondWith(value: Promise<TestResponse>) { response = value; },
+    });
+    await expect(response).resolves.toBe(module);
+  });
   it("precaches the complete offline app shell, including WASM and worker assets", async () => {
     const { handlers, cache } = await loadGeneratedServiceWorker();
     let installPromise: Promise<unknown> | undefined;

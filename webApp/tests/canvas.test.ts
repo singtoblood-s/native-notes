@@ -15,7 +15,7 @@ function setup(): {
   viewport: HTMLElement;
   changes: ReturnType<typeof vi.fn>;
   canvasController: PaperCanvas;
-  viewportRect: { width: number; height: number };
+  viewportRect: { width: number; height: number; top: number };
 } {
   const viewport = document.createElement("div");
   const paper = document.createElement("div");
@@ -23,8 +23,8 @@ function setup(): {
   viewport.append(paper);
   paper.append(canvas);
   document.body.append(viewport);
-  const viewportRect = { width: 800, height: 600 };
-  Object.defineProperty(viewport, "getBoundingClientRect", { value: () => ({ left: 0, top: 0, width: viewportRect.width, height: viewportRect.height, right: viewportRect.width, bottom: viewportRect.height }) });
+  const viewportRect = { width: 800, height: 600, top: 0 };
+  Object.defineProperty(viewport, "getBoundingClientRect", { value: () => ({ left: 0, top: viewportRect.top, width: viewportRect.width, height: viewportRect.height, right: viewportRect.width, bottom: viewportRect.height }) });
   Object.defineProperty(canvas, "getBoundingClientRect", { value: () => ({ left: 0, top: 0, width: 512, height: 683, right: 512, bottom: 683 }) });
   const changes = vi.fn();
   const canvasController = new PaperCanvas(canvas, paper, viewport, { onChange: changes, onZoom: vi.fn() });
@@ -51,6 +51,44 @@ beforeEach(() => {
 afterEach(() => { document.body.innerHTML = ""; vi.unstubAllGlobals(); });
 
 describe("PaperCanvas pointer contract", () => {
+  it("bounds raster memory for large imported PDF page dimensions", () => {
+    const { canvasController, canvas } = setup();
+    canvasController.setPage("poster", 10_000, 10_000, "blank", []);
+    expect(canvas.width * canvas.height).toBeLessThanOrEqual(8_010_000);
+    expect(canvas.width).toBeLessThanOrEqual(8192);
+    expect(canvasController.currentScale * 10_000).toBeLessThanOrEqual(800);
+    canvasController.destroy();
+  });
+  it("fits small picture pages to the same width as their flow previews", () => {
+    const { canvasController } = setup();
+    canvasController.setNavigationMode("continuous");
+    canvasController.setPage("small-picture", 320, 400, "blank", []);
+    expect(canvasController.currentScale * 320).toBe(800);
+    canvasController.destroy();
+  });
+  it("uses screen deltas during flow scrolling and keeps a single touch active until release", () => {
+    const { canvas, viewport, viewportRect, canvasController } = setup();
+    canvasController.setNavigationMode("continuous");
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 92, pointerType: "touch", clientY: 300 }));
+    expect(canvasController.isInputActive).toBe(true);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 92, pointerType: "touch", clientY: 200 }));
+    // Simulate the active viewport moving with its parent scroller.
+    viewportRect.top = -100;
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 92, pointerType: "touch", clientY: 100 }));
+    expect(viewport.scrollTop).toBe(200);
+    canvas.dispatchEvent(pointer("pointercancel", { pointerId: 92, pointerType: "touch" }));
+    expect(canvasController.isInputActive).toBe(false);
+    canvasController.destroy();
+  });
+
+  it("preserves zoom on equally sized pages in page-turn mode", () => {
+    const { canvasController, paper } = setup();
+    canvasController.zoomBy(1.5);
+    const before = transformOf(paper);
+    canvasController.setPage("next", 1024, 1366, "blank", []);
+    expect(transformOf(paper)).toEqual(before);
+    canvasController.destroy();
+  });
   it("cancels native canvas touch moves without duplicate ink or blocking outside scrolling", () => {
     const { canvas, viewport, changes, canvasController } = setup();
     canvasController.setNavigationMode("continuous");

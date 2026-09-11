@@ -65,7 +65,9 @@ self.addEventListener("fetch", (event) => {
     }));
     return;
   }
-  event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request).then((response) => {
+  // Static precache requests and module/stylesheet requests may carry different
+  // Origin headers (Vary: Origin on the preview server). Their asset bytes are identical.
+  event.respondWith(caches.match(event.request, { ignoreVary: true }).then((cached) => cached || fetch(event.request).then((response) => {
     if (response.ok) void caches.open(CACHE_NAME).then((cache) => cache.put(event.request, response.clone()));
     return response;
   })));

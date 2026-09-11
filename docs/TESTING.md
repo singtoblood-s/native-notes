@@ -75,3 +75,16 @@ the editor and API, but they do not replace physical Apple Pencil/S Pen
 testing. Accounts have no email recovery in v1, and note contents are not
 end-to-end encrypted. Use non-sensitive sample notes while evaluating a
 configured test service.
+
+## Media and page-navigation regression (2026-09-11)
+
+Run `npm run test:browser` from `webApp` after `npx playwright install chromium`.
+The new `scripts/editor-smoke.mjs` starts its own Vite server at port 4177 and
+uses an isolated browser context with no real sync account. It tests PDF/image
+import, handwriting, native file selection, clipboard, cancelled/successful
+long press, stable page geometry, all view modes, exports, persistence, tablet
+menus, and a corrupt file. Set `QA_BROWSER_CHANNEL=msedge` to use installed Edge.
+Set `QA_URL` to a local production preview and `QA_OFFLINE=1` to repeat the same
+checks after service-worker installation with networking disabled.
+See [the checklist](EDITOR_POLISH_CHECKLIST.md) for exact PowerShell commands,
+limits, results and outstanding physical-device checks.

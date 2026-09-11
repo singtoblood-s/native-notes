@@ -74,6 +74,8 @@
 .back-library span { font-size: 13px; }
 #editor-workspace .topbar { background: #284d7a; border: 0; }
 #editor-workspace .topbar button, #editor-workspace .topbar .eyebrow, #editor-workspace .topbar strong, #editor-workspace .topbar span { color: #fff; }
+#editor-workspace .topbar .quick-menu button { color: var(--ink); }
+#editor-workspace .topbar .quick-menu button:hover { background: var(--paper-deep); }
 #editor-workspace .topbar .drawer-trigger, #editor-workspace .topbar .text-toggle { border-color: #ffffff33; }
 #editor-workspace .topbar button:hover { background: #ffffff15; }
 .new-document-option { display: flex; align-items: center; gap: 18px; min-height: 76px; padding: 12px; border-radius: 6px; background: #fff; text-align: left; }
@@ -545,3 +547,22 @@ body.drawer-open { overflow: hidden; }
   -webkit-user-select: text;
   -webkit-touch-callout: default;
 }
+
+/* Identical paper geometry for editing and preview, independent of raster resolution. */
+.page-flow:not([data-view-mode="paged"]) { height: auto; }
+.page-flow:not([data-view-mode="paged"]) .flow-page { width: min(100%, 1000px); height: auto; min-height: 0; border: 0; border-radius: 0; overflow: hidden; }
+.page-flow[data-view-mode="horizontal"] .flow-page { width: min(calc(100vw - 60px), 900px); }
+.page-flow:not([data-view-mode="paged"]) .paper-viewport { position: absolute; inset: 0; }
+.flow-page.active > .flow-preview-canvas { visibility: hidden; }
+.page-flow[data-view-mode="paged"] .flow-preview-canvas { display: none; }
+.flow-preview-canvas { height: 100%; aspect-ratio: inherit; }
+.flow-page.flow-preview { transition: none; }
+.flow-page.flow-preview:hover, .flow-page.flow-preview:focus-visible { transform: none; }
+.paper-scroll { overflow-anchor: none; }
+.quick-menu { max-height: min(70dvh, 540px); overflow-y: auto; }
+.quick-menu button { min-height: 44px; font-size: 13px; }
+.clipboard-menu { position: fixed; z-index: 150; max-width: calc(100vw - 16px); }
+.media-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.media-status { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+#editor-toast { position: fixed; z-index: 160; bottom: 60px; left: 50%; transform: translateX(-50%); max-width: calc(100vw - 32px); padding: 12px 18px; border-radius: 6px; color: white; background: #252429; box-shadow: 0 4px 20px #0002; font-size: 13px; }

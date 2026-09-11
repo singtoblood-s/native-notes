@@ -31,6 +31,7 @@ export interface CanvasPreviewPage {
   background: PageBackground;
   strokes: readonly InkStroke[];
   images?: readonly CanvasImage[];
+  text?: string;
 }
 
 interface TouchPointer extends CanvasPoint {}
@@ -127,6 +128,12 @@ export interface CanvasCallbacks {
 
 const previewStates = new WeakMap<HTMLCanvasElement, PreviewState>();
 
+export function clearPagePreview(canvas: HTMLCanvasElement): void {
+  previewStates.delete(canvas);
+  canvas.width = canvas.height = 1;
+  delete canvas.dataset.version;
+}
+
 interface PreviewState extends CanvasPreviewPage {
   images: CanvasImage[];
   maxWidth: number;
@@ -141,6 +148,7 @@ export function renderPagePreview(canvas: HTMLCanvasElement, page: CanvasPreview
     width,
     height,
     background: page.background,
+    text: page.text,
     strokes: page.strokes,
     images: normalizeCanvasImages(page.images ?? []),
     maxWidth: finite(maxWidth) && maxWidth > 0 ? maxWidth : 320,
@@ -163,6 +171,7 @@ export class PaperCanvas {
   private readonly callbacks: CanvasCallbacks;
   private strokes: InkStroke[] = [];
   private background: PageBackground = "blank";
+  private text = "";
   private width = 1024;
   private height = 1366;
   private tool: CanvasTool = { kind: "pen", color: 0xff252429, width: 2.5 };
@@ -176,6 +185,10 @@ export class PaperCanvas {
   /** Pen hover/contact takes priority over touch navigation on writing tools. */
   private penPointers = new Set<number>();
   private panLast: TouchPointer | null = null;
+  private scrollLast: TouchPointer | null = null;
+  private scrollVelocity = 0;
+  private scrollTime = 0;
+  private momentumFrame: number | null = null;
   private pinchStart: {
     distance: number;
     scale: number;
@@ -238,22 +251,25 @@ export class PaperCanvas {
     }
   }
 
-  setPage(pageID: string, width: number, height: number, background: PageBackground, strokes: InkStroke[], images: readonly CanvasImage[] = []): void {
+  setPage(pageID: string, width: number, height: number, background: PageBackground, strokes: InkStroke[], images: readonly CanvasImage[] = [], text = ""): void {
+    this.stopMomentum();
     // Navigating to another page intentionally abandons the old page's live
     // contact; normal interruptions preserve any sampled ink.
     this.cancelActiveInput(false, false);
     const dimensionsChanged = this.width !== width || this.height !== height;
     const newPage = pageID !== this.pageKey;
+    const firstPage = !this.pageKey;
     this.pageKey = pageID;
     this.width = width;
     this.height = height;
     this.background = background;
+    this.text = text;
     this.replaceImages(images);
     this.paper.style.width = `${width}px`;
     this.paper.style.height = `${height}px`;
-    if (dimensionsChanged || newPage) this.resizeCanvas(false);
+    if (dimensionsChanged || this.canvas.width !== Math.round(width * this.dpr)) this.resizeCanvas(false);
     this.setStrokes(strokes, newPage, false);
-    if (newPage || dimensionsChanged) this.fitToWidth();
+    if (firstPage || dimensionsChanged || (newPage && this.navigationMode !== "paged")) this.fitToWidth();
     this.render();
   }
 
@@ -263,9 +279,13 @@ export class PaperCanvas {
     this.render();
   }
 
+  setText(text: string): void { this.text = text; this.render(); }
+
   /** Route one-finger flow touches to the surrounding scroll container. */
   setNavigationMode(mode: CanvasNavigationMode, scrollViewport?: HTMLElement): void {
+    if (this.navigationMode === mode && (!scrollViewport || this.scrollViewport === scrollViewport)) return;
     this.navigationMode = mode;
+    this.stopMomentum();
     if (scrollViewport) this.scrollViewport = scrollViewport;
     this.clearTouchNavigation();
     this.updateTouchAction();
@@ -294,7 +314,7 @@ export class PaperCanvas {
   get currentScale(): number { return this.scale; }
   /** True while a stroke, erase gesture, or intentional touch navigation is active. */
   get isInputActive(): boolean {
-    return this.active !== null || this.eraserBefore !== null || (this.tool.kind === "hand" ? this.touchPointers.size > 0 : this.touchPointers.size >= 2);
+    return this.active !== null || this.eraserBefore !== null || ((this.tool.kind === "hand" || this.navigationMode !== "paged") ? this.touchPointers.size > 0 : this.touchPointers.size >= 2);
   }
   get hasUndo(): boolean { return this.undoStack.length > 0; }
   get hasRedo(): boolean { return this.redoStack.length > 0; }
@@ -336,8 +356,9 @@ export class PaperCanvas {
     this.fitMode = "width";
     const rect = this.viewport.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
-    const gutter = viewportGutter(rect.width);
-    const nextScale = clamp((rect.width - gutter * 2) / this.width, MIN_CANVAS_SCALE, FIT_MAX_SCALE);
+    const gutter = this.navigationMode === "paged" ? viewportGutter(rect.width) : 0;
+    const fit = (rect.width - gutter * 2) / this.width;
+    const nextScale = this.navigationMode === "paged" ? clamp(fit, this.minimumScale, FIT_MAX_SCALE) : fit;
     this.scale = nextScale;
     const bounded = clampPan(
       (rect.width - this.width * this.scale) / 2,
@@ -363,7 +384,7 @@ export class PaperCanvas {
     const gutter = viewportGutter(rect.width);
     const availableWidth = Math.max(1, rect.width - gutter * 2);
     const availableHeight = Math.max(1, rect.height - gutter * 2);
-    this.scale = clamp(Math.min(availableWidth / this.width, availableHeight / this.height), MIN_CANVAS_SCALE, FIT_MAX_SCALE);
+    this.scale = clamp(Math.min(availableWidth / this.width, availableHeight / this.height), this.minimumScale, FIT_MAX_SCALE);
     const bounded = clampPan(
       (rect.width - this.width * this.scale) / 2,
       (rect.height - this.height * this.scale) / 2,
@@ -384,6 +405,7 @@ export class PaperCanvas {
   fitToViewport(): void { this.fitToWidth(); }
 
   destroy(): void {
+    this.stopMomentum();
     this.cancelActiveInput(false, false);
     window.removeEventListener("resize", this.handleResize);
     this.resizeObserver?.disconnect();
@@ -409,10 +431,11 @@ export class PaperCanvas {
 
   private readonly handleResize = (): void => {
     const currentRect = this.viewport.getBoundingClientRect();
+    if (this.lastViewportSize?.width === currentRect.width && this.lastViewportSize?.height === currentRect.height && this.dpr === this.rasterScale()) return;
     const previousSize = this.lastViewportSize ?? { width: currentRect.width, height: currentRect.height };
     const previousCenter = { x: previousSize.width / 2, y: previousSize.height / 2 };
     const previousWorld = worldPointAt(previousCenter, this.scale, this.offsetX, this.offsetY);
-    this.resizeCanvas(false);
+    if (this.dpr !== this.rasterScale()) this.resizeCanvas(false);
     const nextRect = this.viewport.getBoundingClientRect();
     if (this.pageKey && nextRect.width > 0 && nextRect.height > 0 && this.fitMode === "width") {
       this.fitToWidth();
@@ -441,8 +464,23 @@ export class PaperCanvas {
     this.render();
   };
 
+  private rasterScale(): number {
+    // Bound both backing surfaces for large imported paper sizes on mobile GPUs.
+    return Math.min(3, Math.max(1, window.devicePixelRatio || 1), Math.sqrt(8_000_000 / (this.width * this.height)), 8192 / this.width, 8192 / this.height);
+  }
+
+  private get minimumScale(): number {
+    const rect = this.viewport.getBoundingClientRect();
+    const gutter = viewportGutter(rect.width);
+    return Math.max(.001, Math.min(MIN_CANVAS_SCALE, (rect.width - 2 * gutter) / this.width, (rect.height - 2 * gutter) / this.height));
+  }
+
+  private get maximumScale(): number {
+    return Math.max(MAX_CANVAS_SCALE, this.viewport.getBoundingClientRect().width / this.width);
+  }
+
   private resizeCanvas(render = true): void {
-    this.dpr = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
+    this.dpr = this.rasterScale();
     this.canvas.width = Math.round(this.width * this.dpr);
     this.canvas.height = Math.round(this.height * this.dpr);
     this.canvas.style.width = `${this.width}px`;
@@ -466,6 +504,7 @@ export class PaperCanvas {
   };
 
   private readonly handlePointerDown = (event: PointerEvent): void => {
+    this.stopMomentum();
     event.preventDefault();
     this.markPenPointer(event);
     // A reused pointer ID is a fresh contact boundary even when Safari omitted
@@ -480,6 +519,9 @@ export class PaperCanvas {
       if (event.pointerType === "mouse" && event.button !== 0) return;
       if (event.pointerType === "touch" && this.tool.kind !== "hand" && this.penPointers.size > 0) return;
       this.touchPointers.set(event.pointerId, this.touchPoint(event));
+      this.scrollLast = { x: event.clientX, y: event.clientY };
+      this.scrollTime = performance.now();
+      this.scrollVelocity = 0;
       this.capturePointer(event.pointerId);
       this.rebaseTouchGesture();
       return;
@@ -531,6 +573,8 @@ export class PaperCanvas {
       if (values.length >= 2) {
         if (!this.pinchStart) this.beginPinch();
         this.updatePinch();
+      } else if (values.length === 1 && this.navigationMode !== "paged" && this.fitMode !== "custom") {
+        this.scrollWithTouch({ x: event.clientX, y: event.clientY });
       } else if (values.length === 1 && this.tool.kind === "hand" && this.panLast) {
         const point = values[0]!;
         this.offsetX += point.x - this.panLast.x;
@@ -538,7 +582,7 @@ export class PaperCanvas {
         this.panLast = point;
         this.applyPan();
       } else if (values.length === 1 && this.navigationMode !== "paged") {
-        this.scrollWithTouch(values[0]!);
+        this.scrollWithTouch({ x: event.clientX, y: event.clientY });
       }
       return;
     }
@@ -558,6 +602,7 @@ export class PaperCanvas {
     this.lostCapturePointers.delete(event.pointerId);
     if (event.pointerType === "touch" || this.touchPointers.has(event.pointerId)) {
       if (this.active || this.eraserBefore) return;
+      if (this.touchPointers.size === 1 && this.navigationMode !== "paged" && this.fitMode !== "custom" && performance.now() - this.scrollTime < 100) this.startMomentum();
       this.endTouchPointer(event.pointerId);
       return;
     }
@@ -729,7 +774,7 @@ export class PaperCanvas {
     const nextCenter = midpoint(first, second);
     const nextDistance = Math.max(1, distance(first, second));
     const world = worldPointAt(start.center, start.scale, start.offsetX, start.offsetY);
-    const nextScale = clamp(start.scale * (nextDistance / start.distance), MIN_CANVAS_SCALE, MAX_CANVAS_SCALE);
+    const nextScale = clamp(start.scale * (nextDistance / start.distance), this.minimumScale, this.maximumScale);
     const nextOffset = offsetAtAnchor(world, nextScale, nextCenter);
     this.fitMode = "custom";
     this.applyTransform(nextScale, nextOffset, true);
@@ -737,6 +782,7 @@ export class PaperCanvas {
 
   private endTouchPointer(pointerID: number): void {
     if (!this.touchPointers.delete(pointerID)) return;
+    this.scrollLast = null;
     this.rebaseTouchGesture();
   }
 
@@ -759,17 +805,41 @@ export class PaperCanvas {
   }
 
   private scrollWithTouch(point: TouchPointer): void {
-    const previous = this.panLast;
+    const previous = this.scrollLast;
+    this.scrollLast = point;
     if (!previous) return;
     const deltaX = point.x - previous.x;
     const deltaY = point.y - previous.y;
+    const time = performance.now();
+    const delta = this.navigationMode === "horizontal" ? deltaX : deltaY;
+    this.scrollVelocity = -delta / Math.max(8, time - this.scrollTime);
+    this.scrollTime = time;
     if (this.navigationMode === "continuous") this.scrollViewport.scrollTop -= deltaY;
     else if (this.navigationMode === "horizontal") this.scrollViewport.scrollLeft -= deltaX;
-    this.panLast = point;
+  }
+
+  private stopMomentum(): void {
+    if (this.momentumFrame !== null) cancelAnimationFrame(this.momentumFrame);
+    this.momentumFrame = null;
+  }
+
+  private startMomentum(): void {
+    if (Math.abs(this.scrollVelocity) < .1 || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    let last = performance.now();
+    const tick = (time: number): void => {
+      const dt = Math.min(32, Math.max(0, time - last)); last = time;
+      const axis = this.navigationMode === "horizontal" ? "scrollLeft" : "scrollTop";
+      const before = this.scrollViewport[axis];
+      this.scrollViewport[axis] += this.scrollVelocity * dt;
+      this.scrollVelocity *= Math.pow(.94, dt / 16);
+      if (Math.abs(this.scrollVelocity) > .05 && this.scrollViewport[axis] !== before) this.momentumFrame = requestAnimationFrame(tick);
+      else this.momentumFrame = null;
+    };
+    this.momentumFrame = requestAnimationFrame(tick);
   }
 
   private applyTransform(nextScale: number, nextOffset: CanvasPoint, notifyZoom: boolean): void {
-    const scale = clamp(finite(nextScale) ? nextScale : this.scale, MIN_CANVAS_SCALE, MAX_CANVAS_SCALE);
+    const scale = clamp(finite(nextScale) ? nextScale : this.scale, this.minimumScale, this.maximumScale);
     const rect = this.viewport.getBoundingClientRect();
     const gutter = viewportGutter(rect.width);
     const bounded = clampPan(
@@ -934,7 +1004,7 @@ export class PaperCanvas {
 
   private zoomTo(next: number, anchor: TouchPointer, previousAnchor = anchor): void {
     const world = worldPointAt(previousAnchor, this.scale, this.offsetX, this.offsetY);
-    const nextScale = clamp(finite(next) ? next : this.scale, MIN_CANVAS_SCALE, MAX_CANVAS_SCALE);
+    const nextScale = clamp(finite(next) ? next : this.scale, this.minimumScale, this.maximumScale);
     this.fitMode = "custom";
     this.applyTransform(nextScale, offsetAtAnchor(world, nextScale, anchor), true);
   }
@@ -960,6 +1030,7 @@ export class PaperCanvas {
       if (!cached?.ready) continue;
       try { ctx.drawImage(cached.element, image.x, image.y, image.width, image.height); } catch { /* an image can be invalidated while loading */ }
     }
+    drawPageText(ctx, this.text, this.width, this.height);
     for (const stroke of this.strokes) drawInkStroke(ctx, stroke);
     ctx.restore();
   }
@@ -1039,6 +1110,7 @@ function drawPagePreview(canvas: HTMLCanvasElement, state: PreviewState): void {
     if (!cached?.ready) continue;
     try { context.drawImage(cached.element, image.x, image.y, image.width, image.height); } catch { /* An image may be invalidated while loading. */ }
   }
+  drawPageText(context, state.text ?? "", state.width, state.height);
   for (const stroke of state.strokes) drawInkStroke(context, stroke);
   context.restore();
 }
@@ -1060,7 +1132,7 @@ function ensurePreviewImage(canvas: HTMLCanvasElement, state: PreviewState, imag
   return cached;
 }
 
-function renderPaperBackground(context: CanvasRenderingContext2D, width: number, height: number, background: PageBackground): void {
+export function renderPaperBackground(context: CanvasRenderingContext2D, width: number, height: number, background: PageBackground): void {
   context.clearRect(0, 0, width, height);
   context.fillStyle = "#fffdf7";
   context.fillRect(0, 0, width, height);
@@ -1081,7 +1153,54 @@ function renderPaperBackground(context: CanvasRenderingContext2D, width: number,
   }
 }
 
-function drawInkStroke(context: CanvasRenderingContext2D, stroke: InkStroke): void {
+export function drawPageText(context: CanvasRenderingContext2D, text: string, width: number, height: number): void {
+  if (!text) return;
+  context.save();
+  context.fillStyle = "#252429";
+  context.font = "24px system-ui, sans-serif";
+  context.textBaseline = "top";
+  let y = 32;
+  for (const paragraph of text.split("\n")) {
+    let line = "";
+    for (const char of paragraph) {
+      if (line && context.measureText(line + char).width > width - 64) {
+        context.fillText(line, 32, y); y += 34; line = "";
+        if (y > height - 32) break;
+      }
+      line += char;
+    }
+    if (y > height - 32) break;
+    context.fillText(line, 32, y); y += 34;
+  }
+  context.restore();
+}
+
+/** Await every image for deterministic exports, using the same layer order as the editor. */
+export async function renderPageExport(page: CanvasPreviewPage): Promise<HTMLCanvasElement> {
+  await document.fonts?.ready;
+  const canvas = document.createElement("canvas");
+  const scale = Math.min(2, 2400 / Math.max(page.width, page.height));
+  canvas.width = Math.max(1, Math.round(page.width * scale));
+  canvas.height = Math.max(1, Math.round(page.height * scale));
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Cannot export this page in this browser.");
+  context.scale(scale, scale);
+  renderPaperBackground(context, page.width, page.height, page.background);
+  for (const image of page.images ?? []) {
+    const element = new Image();
+    await new Promise<void>((resolve, reject) => {
+      element.onload = () => resolve();
+      element.onerror = () => reject(new Error("A page image could not be loaded. Export stopped to avoid missing content."));
+      element.src = image.src;
+    });
+    context.drawImage(element, image.x, image.y, image.width, image.height);
+  }
+  drawPageText(context, page.text ?? "", page.width, page.height);
+  for (const stroke of page.strokes) drawInkStroke(context, stroke);
+  return canvas;
+}
+
+export function drawInkStroke(context: CanvasRenderingContext2D, stroke: InkStroke): void {
   const points = stroke.points;
   const color = stroke.color >>> 0;
   const alpha = ((color >>> 24) & 0xff) / 255;
