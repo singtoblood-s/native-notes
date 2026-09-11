@@ -1,0 +1,22 @@
+{
+  "name": "notepad-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build && node scripts/generate-sw.mjs",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@sqlite.org/sqlite-wasm": "^3.50.4-build1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "jsdom": "^26.0.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vitest": "^2.1.8"
+  }
+}
