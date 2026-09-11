@@ -62,6 +62,42 @@ describe("automatic sync coordinator", () => {
     coordinator.stop();
   });
 
+  it("refreshes pulled notes before surfacing a queued oversized change", async () => {
+    vi.useFakeTimers();
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const store = fakeStore();
+    store.pendingOperations = vi.fn(async (): Promise<SyncOperation[]> => [{
+      opId: "77777777-7777-4777-8777-777777777777",
+      entityType: "page",
+      entityId: "88888888-8888-4888-8888-888888888888",
+      baseRevision: 0,
+      action: "upsert",
+      payload: {},
+      createdAt: "2026-01-01T00:00:00Z",
+      state: "pending",
+    }]);
+    const report = { pushed: 0, pulled: 1, conflicts: 0, blockedReason: "A note change exceeds the 32 MiB server limit; it remains queued." };
+    const sync = vi.fn(async () => report);
+    const after = vi.fn();
+    const coordinator = new SyncCoordinator({
+      getStore: () => store,
+      getSession: () => session,
+      client: { sync } as unknown as SyncClient,
+      onAfterSync: after,
+    });
+
+    coordinator.start();
+    await settle();
+
+    expect(after).toHaveBeenCalledWith({ store, session, reason: "startup", report });
+    expect(coordinator.status.state).toBe("error");
+    expect(coordinator.status.error).toBe(report.blockedReason);
+    expect(coordinator.status.pending).toBe(1);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(sync).toHaveBeenCalledTimes(2);
+    coordinator.stop();
+  });
+
   it("debounces local writes and does not start a second request immediately", async () => {
     vi.useFakeTimers();
     localStorage.setItem("notepad.endpoint", "https://sync.example.test");

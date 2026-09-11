@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createNotebook, createPage, SyncOperation } from "../src/models";
+import { createNotebook, createPage, PullChange, SyncOperation } from "../src/models";
 import { SQLiteNoteStoreEngine } from "../src/storage";
 
 const pageID = "11111111-1111-4111-8111-111111111111";
@@ -26,7 +26,7 @@ describe("conflict recovery storage", () => {
     page.id = pageID;
     page.strokes = [{ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", color: 0xff000000, width: 2, points: [0, 30, 10].map((time, x) => ({ x, y: x * 2, pressure: 0.5, time, tiltX: null, tiltY: null })) }];
     const queueOperation = vi.fn(() => "queued");
-    const fake = { db: { exec: vi.fn() }, row: vi.fn(() => null), pageFromRow: vi.fn(() => null), queueOperation } as unknown as SQLiteNoteStoreEngine;
+    const fake = { db: { exec: vi.fn() }, row: vi.fn(() => null), pageFromRow: vi.fn(() => null), query: vi.fn(() => []), queueOperation } as unknown as SQLiteNoteStoreEngine;
     const method = (SQLiteNoteStoreEngine.prototype as unknown as {
       savePageRow: (this: SQLiteNoteStoreEngine, value: typeof page, queue: boolean) => unknown;
     }).savePageRow;
@@ -63,6 +63,7 @@ describe("conflict recovery storage", () => {
     const upsertPageDirect = vi.fn();
     const fake = {
       db: { exec: vi.fn() },
+      query: vi.fn(() => []),
       row: vi.fn(() => null),
       notebookFromRow: vi.fn(() => null),
       upsertNotebookDirect: vi.fn(),
@@ -89,6 +90,7 @@ describe("conflict recovery storage", () => {
     const upsertNotebookDirect = vi.fn();
     const fake = {
       db: { exec: vi.fn() },
+      query: vi.fn(() => []),
       upsertNotebookDirect,
       queueOperation,
     } as unknown as SQLiteNoteStoreEngine;
@@ -105,5 +107,86 @@ describe("conflict recovery storage", () => {
     const operation = operationCall[0];
     expect(operation).toMatchObject({ entityType: "notebook", baseRevision: 0, action: "upsert" });
     expect(operation.entityId).toBe(operation.payload.id);
+  });
+
+  it("ignores an acknowledged server echo while a newer local edit is pending", () => {
+    const current = createPage(notebookID, "First page");
+    current.id = pageID;
+    current.revision = 4;
+    const pending = pageOperation();
+    pending.baseRevision = current.revision;
+    pending.state = "pending";
+    const insertConflictDirect = vi.fn();
+    const applySnapshotDirect = vi.fn();
+    const fake = {
+      row: vi.fn(() => ({ revision: current.revision, json: JSON.stringify(current) })),
+      pendingForEntityDirect: vi.fn(() => [pending]),
+      insertConflictDirect,
+      applySnapshotDirect,
+    } as unknown as SQLiteNoteStoreEngine;
+    const method = (SQLiteNoteStoreEngine.prototype as unknown as {
+      applyRemoteDirect(this: SQLiteNoteStoreEngine, change: PullChange): void;
+    }).applyRemoteDirect;
+
+    method.call(fake, {
+      sequence: 9,
+      entityType: "page",
+      entityId: pageID,
+      revision: current.revision,
+      action: "upsert",
+      payload: current as unknown as Record<string, unknown>,
+    });
+
+    expect(insertConflictDirect).not.toHaveBeenCalled();
+    expect(applySnapshotDirect).not.toHaveBeenCalled();
+  });
+
+  it("keeps a newer remote edit as a conflict while local work is pending", () => {
+    const current = createPage(notebookID, "First page");
+    current.id = pageID;
+    current.revision = 4;
+    const pending = pageOperation();
+    pending.baseRevision = current.revision;
+    pending.state = "pending";
+    const insertConflictDirect = vi.fn();
+    const fake = {
+      row: vi.fn(() => ({ revision: current.revision, json: JSON.stringify(current) })),
+      pendingForEntityDirect: vi.fn(() => [pending]),
+      insertConflictDirect,
+      applySnapshotDirect: vi.fn(),
+    } as unknown as SQLiteNoteStoreEngine;
+    const method = (SQLiteNoteStoreEngine.prototype as unknown as {
+      applyRemoteDirect(this: SQLiteNoteStoreEngine, change: PullChange): void;
+    }).applyRemoteDirect;
+    const remote = { ...current, revision: current.revision + 1, text: "Remote edit" };
+
+    method.call(fake, {
+      sequence: 10,
+      entityType: "page",
+      entityId: pageID,
+      revision: remote.revision,
+      action: "upsert",
+      payload: remote as unknown as Record<string, unknown>,
+    });
+
+    expect(insertConflictDirect).toHaveBeenCalledWith("page", pageID, remote, "remote update while local edit is pending", 10);
+  });
+
+  it("does not create a second conflict copy when the same pull sequence is retried", () => {
+    const insert = vi.fn();
+    const fake = {
+      db: { exec: insert },
+      query: vi.fn(() => [{ id: "existing-conflict" }]),
+      upsertPageDirect: vi.fn(),
+      upsertNotebookDirect: vi.fn(),
+      notebookFromRow: vi.fn(() => null),
+    } as unknown as SQLiteNoteStoreEngine;
+    const method = (SQLiteNoteStoreEngine.prototype as unknown as {
+      insertConflictDirect(this: SQLiteNoteStoreEngine, entityType: "page" | "notebook", entityID: string, payload: Record<string, unknown>, reason: string, sequence: number): void;
+    }).insertConflictDirect;
+
+    method.call(fake, "page", pageID, pageOperation().payload, "remote update while local edit is pending", 10);
+
+    expect(insert).not.toHaveBeenCalled();
   });
 });

@@ -58,6 +58,26 @@ function page(pageId: string, notebookId: string, title = "Page"): Record<string
   };
 }
 
+function largePage(pageId: string, notebookId: string): Record<string, unknown> {
+  return {
+    ...page(pageId, notebookId, "Large page"),
+    text: "large page ".repeat(10_000),
+    strokes: [{
+      id: id(),
+      color: 0xff1b1b1f,
+      width: 2.5,
+      points: Array.from({ length: 35_000 }, (_, time) => ({
+        x: time % 1000,
+        y: (time * 3) % 1000,
+        pressure: 0.5,
+        time,
+        tiltX: null,
+        tiltY: null,
+      })),
+    }],
+  };
+}
+
 function operation(
   entityType: "notebook" | "page",
   entityId: string,
@@ -161,6 +181,106 @@ describe("native-notes Cloudflare Worker", () => {
       .first<{ request_hash: string }>();
     expect(row?.request_hash).toBe("JGgMdGiaJk2Ec31uNUn_sBgwSx0lf-M35NDuP-_9ado");
   });
+
+  it("stores and hydrates a large page without losing ink across retry, conflict, pull, or delete", async () => {
+    const { token } = await auth();
+    const notebookId = id();
+    const pageId = id();
+    const notebookOperation = operation("notebook", notebookId, notebook(notebookId));
+    expect((await push(token, [notebookOperation])).results[0]).toMatchObject({ status: "acked", revision: 1 });
+
+    const large = largePage(pageId, notebookId);
+    expect(new TextEncoder().encode(JSON.stringify(large)).byteLength).toBeGreaterThan(1_900_000);
+    const pageOperation = operation("page", pageId, large);
+    const first = await push(token, [pageOperation]);
+    expect(first.results[0]).toMatchObject({ status: "acked", revision: 1, sequence: 2 });
+
+    const documentRow = await env.DB.prepare("SELECT payload FROM documents WHERE entity_type = 'page' AND entity_id = ?")
+      .bind(pageId)
+      .first<{ payload: string }>();
+    expect(documentRow?.payload).toMatch(/^@payload:[A-Za-z0-9_-]{43}:/);
+    const chunkCount = await env.DB.prepare("SELECT COUNT(*) AS count FROM payload_chunks").first<{ count: number }>();
+    expect(Number(chunkCount?.count)).toBeGreaterThan(1);
+
+    const retry = await push(token, [pageOperation]);
+    expect(retry.results[0]).toEqual(first.results[0]);
+
+    const pulled = await request("/v1/sync/pull?cursor=1&limit=100", {
+      headers: { Origin: ORIGIN, Authorization: `Bearer ${token}` },
+    });
+    expect(pulled.status).toBe(200);
+    const pulledBody = await pulled.json() as { changes: Array<Record<string, unknown>> };
+    expect(pulledBody.changes).toHaveLength(1);
+    expect(pulledBody.changes[0]?.payload).toMatchObject({ id: pageId, text: large.text });
+    expect((pulledBody.changes[0]?.payload as { strokes: unknown[] }).strokes).toEqual(large.strokes);
+
+    const staleOperation = operation("page", pageId, page(pageId, notebookId), 0);
+    const conflict = await push(token, [staleOperation]);
+    expect(conflict.results[0]).toMatchObject({ status: "conflict", revision: 1 });
+    expect(conflict.results[0]?.serverPayload).toMatchObject({ id: pageId, text: large.text });
+    expect((conflict.results[0]?.serverPayload as { strokes: unknown[] }).strokes).toEqual(large.strokes);
+    const conflictRow = await env.DB.prepare("SELECT server_payload FROM sync_operations WHERE op_id = ?")
+      .bind(staleOperation.opId)
+      .first<{ server_payload: string }>();
+    expect(conflictRow?.server_payload).toMatch(/^@payload:[A-Za-z0-9_-]{43}:/);
+    const conflictRetry = await push(token, [staleOperation]);
+    expect(conflictRetry.results[0]).toEqual(conflict.results[0]);
+
+    const deleteOperation = operation("page", pageId, large, 1, "delete");
+    expect((await push(token, [deleteOperation])).results[0]).toMatchObject({ status: "acked", revision: 2, sequence: 3 });
+    const deletedPull = await request("/v1/sync/pull?cursor=2&limit=1", {
+      headers: { Origin: ORIGIN, Authorization: `Bearer ${token}` },
+    });
+    const deletedBody = await deletedPull.json() as { changes: Array<Record<string, unknown>> };
+    expect(deletedBody.changes[0]).toMatchObject({ action: "delete", payload: { id: pageId, text: large.text } });
+    expect((deletedBody.changes[0]?.payload as { strokes: unknown[] }).strokes).toEqual(large.strokes);
+  }, 30_000);
+
+  it("bounds pull batches by bytes and rejects a multi-large push before writing", async () => {
+    const { token } = await auth();
+    const notebookId = id();
+    expect((await push(token, [operation("notebook", notebookId, notebook(notebookId))])).results[0]).toMatchObject({ status: "acked", sequence: 1 });
+    const firstPage = largePage(id(), notebookId);
+    const secondPage = largePage(id(), notebookId);
+    expect((await push(token, [operation("page", firstPage.id as string, firstPage)])).results[0]).toMatchObject({ status: "acked", sequence: 2 });
+    expect((await push(token, [operation("page", secondPage.id as string, secondPage)])).results[0]).toMatchObject({ status: "acked", sequence: 3 });
+
+    const bounded = await request("/v1/sync/pull?cursor=1&limit=100", {
+      headers: { Origin: ORIGIN, Authorization: `Bearer ${token}` },
+    });
+    expect(bounded.status).toBe(200);
+    const boundedBody = await bounded.json() as { changes: Array<Record<string, unknown>>; nextCursor: number; hasMore: boolean };
+    expect(boundedBody.changes).toHaveLength(1);
+    expect(boundedBody.nextCursor).toBe(2);
+    expect(boundedBody.hasMore).toBe(true);
+    expect(boundedBody.changes[0]?.payload).toMatchObject({ id: firstPage.id, text: firstPage.text });
+
+    const remainder = await request("/v1/sync/pull?cursor=2&limit=100", {
+      headers: { Origin: ORIGIN, Authorization: `Bearer ${token}` },
+    });
+    const remainderBody = await remainder.json() as { changes: Array<Record<string, unknown>>; nextCursor: number; hasMore: boolean };
+    expect(remainderBody.changes).toHaveLength(1);
+    expect(remainderBody.nextCursor).toBe(3);
+    expect(remainderBody.hasMore).toBe(false);
+    expect(remainderBody.changes[0]?.payload).toMatchObject({ id: secondPage.id, text: secondPage.text });
+
+    const rejectedFirst = largePage(id(), notebookId);
+    const rejectedSecond = largePage(id(), notebookId);
+    const rejected = await request("/v1/sync/push", {
+      method: "POST",
+      headers: { ...jsonHeaders, Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ operations: [
+        operation("page", rejectedFirst.id as string, rejectedFirst),
+        operation("page", rejectedSecond.id as string, rejectedSecond),
+      ] }),
+    });
+    expect(rejected.status).toBe(413);
+    await expect(rejected.json()).resolves.toMatchObject({ error: { code: "too_many_operations" } });
+    const unchanged = await request("/v1/sync/pull?cursor=3&limit=100", {
+      headers: { Origin: ORIGIN, Authorization: `Bearer ${token}` },
+    });
+    await expect(unchanged.json()).resolves.toMatchObject({ changes: [], nextCursor: 3, hasMore: false });
+  }, 30_000);
 
   it("serializes concurrent CAS updates so only one wins", async () => {
     const { token } = await auth();

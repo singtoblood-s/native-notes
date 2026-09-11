@@ -42,9 +42,10 @@ budget is 32,000 UTF-8 bytes, below D1's hard 100,000-byte limit.
 This repository already has the `native-notes` D1 database configured in
 `cloudflare/wrangler.toml` with database ID
 `2f83358e-6bfd-4fe4-ad2b-688bd4eb577c`. Do not run `d1 create` for this
-migration. The schema is `cloudflare/migrations/0001_initial.sql`. Run the
-following commands from `cloudflare/`, applying that migration before the data
-file:
+migration. The schema is the complete set of files in
+`cloudflare/migrations/`, including `0002_payload_chunks.sql` for large note
+snapshots. Run the following commands from `cloudflare/`, applying all
+migrations before the data file:
 
 ```powershell
 Push-Location .\cloudflare
@@ -55,9 +56,11 @@ npx wrangler d1 execute native-notes --remote --file=..\.local\d1-export\d1-data
 
 The target should be a new, empty D1 database. If a non-empty database must be
 reused, stop and compare its schema and account ownership first; this data file
-does not merge accounts or reconcile existing rows. Do not blindly rerun a
-partially applied file because a chunked row starts with an empty payload and
-then appends its chunks.
+does not merge accounts or reconcile existing rows. Newly synced large
+snapshots are stored in `payload_chunks`; existing inline `documents.payload`,
+`changes.payload`, and `sync_operations.server_payload` values remain readable.
+The export SQL can still represent a long text value as an empty value followed
+by keyed `UPDATE` chunks; do not blindly rerun a partially applied export.
 
 Check counts and sequence state without returning note or credential values:
 
@@ -126,17 +129,22 @@ Cloudflare currently documents these D1 limits: 100,000 bytes per SQL
 statement, 100 bound parameters per query, 2,000,000 bytes per string/BLOB or
 table row, and a 5 GB maximum `d1 execute --file` import. The exporter keeps
 each generated statement under 32,000 bytes and uses no bound parameters in the
-file. The source server accepts payloads up to 2 MiB (2,097,152 bytes), which
-is larger than D1's row ceiling. The exporter therefore stops before writing
-the bundle when its conservative row estimate leaves less than a small safety
-margin below 2,000,000 bytes; SQL chunking cannot bypass the D1 row limit. Move
-such payloads to a separately designed object store or reduce the source
-payload before migrating.
+file. The Worker accepts note payloads up to 32 MiB and stores snapshots larger
+than the inline row budget in `payload_chunks`. The initial exporter still
+keeps its conservative row estimate below 2,000,000 bytes for imported legacy
+rows; newly synced large snapshots use the additive chunk table and remain
+readable through documents, changes, conflicts, and retries.
 
 See [D1 limits](https://developers.cloudflare.com/d1/platform/limits/),
 [D1 import/export](https://developers.cloudflare.com/d1/best-practices/import-export-data/),
 and [Wrangler D1 commands](https://developers.cloudflare.com/d1/wrangler-commands/)
 for current platform behavior.
+
+The Worker accepts HTTP sync requests up to 36 MiB. A multi-operation push is
+limited to 3 MiB so its D1 writes remain below the 50-query invocation
+allowance; a larger change must be sent as one operation. Pull responses target
+4 MiB and always include one change, so a single large snapshot can exceed that
+response budget while subsequent changes continue from the returned cursor.
 
 The Workers Free plan currently allows 100,000 Worker requests per day, 10 ms
 CPU time per request, 128 MB memory, and 50 subrequests per invocation. This
@@ -151,3 +159,11 @@ has no email recovery and is not end-to-end encrypted.
 See [Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
 and [Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/)
 before exposing the endpoint to more users.
+
+Run the large snapshot smoke check against the deployed Worker after migration
+and deployment. It creates disposable synthetic accounts and does not print
+tokens or note contents:
+
+```powershell
+python .\scripts\smoke-large-notes.py --url https://native-notes-api.<account>.workers.dev --origin https://singtoblood-s.github.io
+```
