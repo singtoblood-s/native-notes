@@ -201,6 +201,8 @@ try {
   await page.locator("#close-inspector").click();
   await page.locator("#next-page").click();
   await page.waitForFunction(() => document.querySelector("#page-position").textContent === "2 / 2");
+  await page.locator("#previous-page").click();
+  await page.waitForFunction(() => document.querySelector("#page-position").textContent === "1 / 2");
   await page.reload(); await page.locator("[data-open-book]").click();
   await page.waitForFunction(() => document.querySelector("#page-position").textContent === "1 / 2");
   assert.equal(await page.locator(".image-list-row").count(), 0, "Deleted images must stay deleted after reload");
@@ -248,11 +250,22 @@ try {
       const blob = await new Promise(resolve => source.toBlob(resolve, "image/png"));
       const canvas = await imageCanvas(new File([blob], "Large camera image.png", { type: "image/png" }));
       const encoded = await encodePageImage(canvas);
+      const files = new DataTransfer();
+      files.items.add(new File([blob], "Camera photo.png", { type: "image/png" }));
+      const input = document.querySelector("#image-input");
+      input.files = files.files;
+      input.dispatchEvent(new Event("change", { bubbles: true }));
       return { originalBytes: blob.size, compressedBytes: atob(encoded.split(",")[1]).length, width: canvas.width, height: canvas.height };
     });
     assert(compression.originalBytes > 12 * 1024 * 1024);
     assert(compression.compressedBytes <= 256 * 1024);
     assert.deepEqual([compression.width, compression.height], [1600, 960]);
+    await page.waitForFunction(() => document.querySelectorAll(".image-list-row").length === 3);
+    const insertedBytes = await page.locator(".image-select img").last().evaluate(image => atob(image.src.split(",")[1]).length);
+    assert(insertedBytes <= 256 * 1024, "The actual Insert flow must store the compressed photo");
+    await page.screenshot({ path: `${output}/compressed-photo.png` });
+    await page.locator(".image-delete-button").tap();
+    await page.waitForFunction(() => document.querySelectorAll(".image-list-row").length === 2);
     console.log("Large media compression:", JSON.stringify(compression));
   }
   assert.deepEqual(errors, []);
