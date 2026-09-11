@@ -89,6 +89,24 @@ describe("PaperCanvas pointer contract", () => {
     expect(transformOf(paper)).toEqual(before);
     canvasController.destroy();
   });
+  it.each(["continuous", "horizontal"] as const)("keeps shared zoom for mixed page sizes in %s mode", (mode) => {
+    const { canvasController, paper, canvas, viewport } = setup();
+    canvasController.setNavigationMode(mode);
+    canvasController.setPage("first", 1024, 1366, "blank", []);
+    canvasController.zoomBy(1.5);
+    const scale = canvasController.currentScale;
+    canvasController.setPage("landscape", 1366, 1024, "blank", []);
+    expect(canvasController.currentScale).toBe(scale);
+    expect(transformOf(paper)).toEqual({ x: 0, y: 0, scale });
+    canvasController.setTool({ kind: "hand" });
+    const top = viewport.scrollTop, left = viewport.scrollLeft;
+    canvas.dispatchEvent(pointer("pointerdown", { pointerType: "touch", clientX: 300, clientY: 300 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerType: "touch", clientX: 250, clientY: 200 }));
+    expect(viewport.scrollTop - top).toBe(100);
+    expect(viewport.scrollLeft - left).toBe(50);
+    expect(transformOf(paper)).toEqual({ x: 0, y: 0, scale });
+    canvasController.destroy();
+  });
   it("cancels native canvas touch moves without duplicate ink or blocking outside scrolling", () => {
     const { canvas, viewport, changes, canvasController } = setup();
     canvasController.setNavigationMode("continuous");

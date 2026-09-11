@@ -210,6 +210,7 @@ export class PaperCanvas {
   private images: CanvasImage[] = [];
   private imageCache = new Map<string, CachedImage>();
   private navigationMode: CanvasNavigationMode = "paged";
+  private needsFit = false;
 
   constructor(canvas: HTMLCanvasElement, paper: HTMLElement, viewport: HTMLElement, callbacks: CanvasCallbacks) {
     this.canvas = canvas;
@@ -269,7 +270,13 @@ export class PaperCanvas {
     this.paper.style.height = `${height}px`;
     if (dimensionsChanged || this.canvas.width !== Math.round(width * this.dpr)) this.resizeCanvas(false);
     this.setStrokes(strokes, newPage, false);
-    if (firstPage || dimensionsChanged || (newPage && this.navigationMode !== "paged")) this.fitToWidth();
+    if (firstPage || this.needsFit || (dimensionsChanged && this.navigationMode === "paged")) {
+      this.needsFit = false;
+      this.fitToWidth();
+    } else if (this.navigationMode !== "paged") {
+      this.updateTransform();
+      this.callbacks.onZoom(this.scale);
+    }
     this.render();
   }
 
@@ -285,8 +292,11 @@ export class PaperCanvas {
   setNavigationMode(mode: CanvasNavigationMode, scrollViewport?: HTMLElement): void {
     if (this.navigationMode === mode && (!scrollViewport || this.scrollViewport === scrollViewport)) return;
     this.navigationMode = mode;
+    this.needsFit = true;
     this.stopMomentum();
     if (scrollViewport) this.scrollViewport = scrollViewport;
+    this.resizeObserver?.disconnect();
+    this.resizeObserver?.observe(this.navigationMode === "paged" ? this.viewport : this.scrollViewport);
     this.clearTouchNavigation();
     this.updateTouchAction();
   }
@@ -348,17 +358,25 @@ export class PaperCanvas {
 
   zoomBy(factor: number): void {
     const rect = this.viewport.getBoundingClientRect();
-    this.zoomTo(this.scale * factor, { x: rect.width / 2, y: rect.height / 2 });
+    const visible = this.navigationMode === "paged" ? rect : this.scrollViewport.getBoundingClientRect();
+    this.zoomTo(this.scale * factor, { x: visible.left + visible.width / 2 - rect.left, y: visible.top + visible.height / 2 - rect.top });
   }
 
   /** Fit the page to the viewport width and leave vertical space pannable. */
   fitToWidth(): void {
     this.fitMode = "width";
+    if (this.navigationMode !== "paged") {
+      const rect = this.scrollViewport.getBoundingClientRect();
+      const gutter = this.scrollViewport === this.viewport ? 0 : this.navigationMode === "horizontal" ? 60 : 40;
+      const width = Math.min(rect.width - gutter, this.navigationMode === "horizontal" ? 900 : 1000);
+      if (width > 0) this.applyTransform(width / this.width, { x: 0, y: 0 }, true);
+      return;
+    }
     const rect = this.viewport.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
-    const gutter = this.navigationMode === "paged" ? viewportGutter(rect.width) : 0;
+    const gutter = viewportGutter(rect.width);
     const fit = (rect.width - gutter * 2) / this.width;
-    const nextScale = this.navigationMode === "paged" ? clamp(fit, this.minimumScale, FIT_MAX_SCALE) : fit;
+    const nextScale = clamp(fit, this.minimumScale, FIT_MAX_SCALE);
     this.scale = nextScale;
     const bounded = clampPan(
       (rect.width - this.width * this.scale) / 2,
@@ -379,11 +397,15 @@ export class PaperCanvas {
   /** Fit the complete page inside the viewport. Useful as an explicit view command. */
   fitToPage(): void {
     this.fitMode = "page";
-    const rect = this.viewport.getBoundingClientRect();
+    const rect = (this.navigationMode === "paged" ? this.viewport : this.scrollViewport).getBoundingClientRect();
     if (!rect.width || !rect.height) return;
     const gutter = viewportGutter(rect.width);
     const availableWidth = Math.max(1, rect.width - gutter * 2);
     const availableHeight = Math.max(1, rect.height - gutter * 2);
+    if (this.navigationMode !== "paged") {
+      this.applyTransform(Math.min(availableWidth / this.width, availableHeight / this.height), { x: 0, y: 0 }, true);
+      return;
+    }
     this.scale = clamp(Math.min(availableWidth / this.width, availableHeight / this.height), this.minimumScale, FIT_MAX_SCALE);
     const bounded = clampPan(
       (rect.width - this.width * this.scale) / 2,
@@ -430,6 +452,12 @@ export class PaperCanvas {
   }
 
   private readonly handleResize = (): void => {
+    if (this.navigationMode !== "paged") {
+      if (this.dpr !== this.rasterScale()) this.resizeCanvas();
+      if (this.pageKey && this.fitMode === "width") this.fitToWidth();
+      else if (this.pageKey && this.fitMode === "page") this.fitToPage();
+      return;
+    }
     const currentRect = this.viewport.getBoundingClientRect();
     if (this.lastViewportSize?.width === currentRect.width && this.lastViewportSize?.height === currentRect.height && this.dpr === this.rasterScale()) return;
     const previousSize = this.lastViewportSize ?? { width: currentRect.width, height: currentRect.height };
@@ -470,13 +498,13 @@ export class PaperCanvas {
   }
 
   private get minimumScale(): number {
-    const rect = this.viewport.getBoundingClientRect();
+    const rect = (this.navigationMode === "paged" ? this.viewport : this.scrollViewport).getBoundingClientRect();
     const gutter = viewportGutter(rect.width);
     return Math.max(.001, Math.min(MIN_CANVAS_SCALE, (rect.width - 2 * gutter) / this.width, (rect.height - 2 * gutter) / this.height));
   }
 
   private get maximumScale(): number {
-    return Math.max(MAX_CANVAS_SCALE, this.viewport.getBoundingClientRect().width / this.width);
+    return Math.max(MAX_CANVAS_SCALE, (this.navigationMode === "paged" ? this.viewport : this.scrollViewport).getBoundingClientRect().width / this.width);
   }
 
   private resizeCanvas(render = true): void {
@@ -573,7 +601,7 @@ export class PaperCanvas {
       if (values.length >= 2) {
         if (!this.pinchStart) this.beginPinch();
         this.updatePinch();
-      } else if (values.length === 1 && this.navigationMode !== "paged" && this.fitMode !== "custom") {
+      } else if (values.length === 1 && this.navigationMode !== "paged") {
         this.scrollWithTouch({ x: event.clientX, y: event.clientY });
       } else if (values.length === 1 && this.tool.kind === "hand" && this.panLast) {
         const point = values[0]!;
@@ -581,8 +609,6 @@ export class PaperCanvas {
         this.offsetY += point.y - this.panLast.y;
         this.panLast = point;
         this.applyPan();
-      } else if (values.length === 1 && this.navigationMode !== "paged") {
-        this.scrollWithTouch({ x: event.clientX, y: event.clientY });
       }
       return;
     }
@@ -602,7 +628,7 @@ export class PaperCanvas {
     this.lostCapturePointers.delete(event.pointerId);
     if (event.pointerType === "touch" || this.touchPointers.has(event.pointerId)) {
       if (this.active || this.eraserBefore) return;
-      if (this.touchPointers.size === 1 && this.navigationMode !== "paged" && this.fitMode !== "custom" && performance.now() - this.scrollTime < 100) this.startMomentum();
+      if (this.touchPointers.size === 1 && this.navigationMode !== "paged" && performance.now() - this.scrollTime < 100) this.startMomentum();
       this.endTouchPointer(event.pointerId);
       return;
     }
@@ -733,6 +759,7 @@ export class PaperCanvas {
   }
 
   private touchPoint(event: PointerEvent): TouchPointer {
+    if (this.navigationMode !== "paged") return { x: event.clientX, y: event.clientY };
     const rect = this.viewport.getBoundingClientRect();
     return { x: event.clientX - rect.left, y: event.clientY - rect.top };
   }
@@ -758,11 +785,12 @@ export class PaperCanvas {
     const [first, second] = [...this.touchPointers.values()].slice(0, 2);
     if (!first || !second) return;
     const center = midpoint(first, second);
+    const rect = this.viewport.getBoundingClientRect();
     this.pinchStart = {
       distance: Math.max(1, distance(first, second)),
       scale: this.scale,
-      offsetX: this.offsetX,
-      offsetY: this.offsetY,
+      offsetX: this.navigationMode === "paged" ? this.offsetX : rect.left,
+      offsetY: this.navigationMode === "paged" ? this.offsetY : rect.top,
       center,
     };
   }
@@ -776,6 +804,11 @@ export class PaperCanvas {
     const world = worldPointAt(start.center, start.scale, start.offsetX, start.offsetY);
     const nextScale = clamp(start.scale * (nextDistance / start.distance), this.minimumScale, this.maximumScale);
     const nextOffset = offsetAtAnchor(world, nextScale, nextCenter);
+    if (this.navigationMode !== "paged") {
+      const rect = this.viewport.getBoundingClientRect();
+      nextOffset.x -= rect.left;
+      nextOffset.y -= rect.top;
+    }
     this.fitMode = "custom";
     this.applyTransform(nextScale, nextOffset, true);
   }
@@ -814,8 +847,8 @@ export class PaperCanvas {
     const delta = this.navigationMode === "horizontal" ? deltaX : deltaY;
     this.scrollVelocity = -delta / Math.max(8, time - this.scrollTime);
     this.scrollTime = time;
-    if (this.navigationMode === "continuous") this.scrollViewport.scrollTop -= deltaY;
-    else if (this.navigationMode === "horizontal") this.scrollViewport.scrollLeft -= deltaX;
+    this.scrollViewport.scrollTop -= deltaY;
+    this.scrollViewport.scrollLeft -= deltaX;
   }
 
   private stopMomentum(): void {
@@ -841,6 +874,16 @@ export class PaperCanvas {
   private applyTransform(nextScale: number, nextOffset: CanvasPoint, notifyZoom: boolean): void {
     const scale = clamp(finite(nextScale) ? nextScale : this.scale, this.minimumScale, this.maximumScale);
     const rect = this.viewport.getBoundingClientRect();
+    if (this.navigationMode !== "paged") {
+      this.scale = scale;
+      this.updateTransform();
+      // Resize every sheet before adjusting scroll to keep the gesture anchor fixed.
+      this.callbacks.onZoom(this.scale);
+      const nextRect = this.viewport.getBoundingClientRect();
+      this.scrollViewport.scrollLeft += nextRect.left - rect.left - nextOffset.x;
+      this.scrollViewport.scrollTop += nextRect.top - rect.top - nextOffset.y;
+      return;
+    }
     const gutter = viewportGutter(rect.width);
     const bounded = clampPan(
       finite(nextOffset.x) ? nextOffset.x : this.offsetX,
@@ -1010,6 +1053,7 @@ export class PaperCanvas {
   }
 
   private updateTransform(): void {
+    if (this.navigationMode !== "paged") this.offsetX = this.offsetY = 0;
     this.paper.style.transform = `translate3d(${this.offsetX}px, ${this.offsetY}px, 0) scale(${this.scale})`;
     const rect = this.viewport.getBoundingClientRect();
     this.lastViewportSize = { width: rect.width, height: rect.height };

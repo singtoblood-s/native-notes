@@ -16,7 +16,7 @@ const pdfFile = (): File => {
 };
 
 beforeEach(() => {
-  vi.spyOn(HTMLCanvasElement.prototype, "toDataURL").mockReturnValue(`data:image/png;base64,${png}`);
+  vi.spyOn(HTMLCanvasElement.prototype, "toBlob").mockImplementation(callback => callback(new Blob([Uint8Array.from(atob(png), char => char.charCodeAt(0))], { type: "image/png" })));
 });
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -65,15 +65,30 @@ it("stops export when an image cannot render instead of delivering missing conte
   await expect(exportPages([createPage(notebookID)], "pdf", vi.fn(), new AbortController().signal)).rejects.toThrow("image could not be loaded");
 });
 
-it("reduces resolution when quality alone cannot meet the image budget, preserving source dimensions", () => {
+it("reduces resolution when quality alone cannot meet the image budget, preserving source dimensions", async () => {
   vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({ drawImage: vi.fn() } as unknown as CanvasRenderingContext2D);
-  vi.spyOn(HTMLCanvasElement.prototype, "toDataURL").mockImplementation(function (this: HTMLCanvasElement) {
-    return `data:image/png;base64,${"A".repeat(this.width > 1000 ? 200_000 : 40_000)}`;
+  vi.spyOn(HTMLCanvasElement.prototype, "toBlob").mockImplementation(function (this: HTMLCanvasElement, callback) {
+    // Also exercise browsers that fall back to PNG for unsupported WebP.
+    callback(new Blob([new Uint8Array(this.width > 1000 ? 150_000 : 30_000)], { type: "image/png" }));
   });
   const canvas = document.createElement("canvas"); canvas.width = 2000; canvas.height = 1500;
-  const src = encodePageImage(canvas, 64 * 1024);
+  const src = await encodePageImage(canvas, 64 * 1024);
   expect(pageImageDataBytes(src)).toBeLessThanOrEqual(64 * 1024);
   expect([canvas.width, canvas.height]).toEqual([2000, 1500]);
+});
+
+it("uses asynchronous photo compression within the default budget and reports encoder failures", async () => {
+  const syncEncode = vi.spyOn(HTMLCanvasElement.prototype, "toDataURL");
+  const encode = vi.spyOn(HTMLCanvasElement.prototype, "toBlob").mockImplementation((callback, type) => {
+    setTimeout(() => callback(new Blob([new Uint8Array(type === "image/webp" ? 200_000 : 900_000)], { type })), 0);
+  });
+  const canvas = document.createElement("canvas");
+  const src = await encodePageImage(canvas);
+  expect(src.startsWith("data:image/webp;base64,")).toBe(true);
+  expect(pageImageDataBytes(src)).toBeLessThanOrEqual(256 * 1024);
+  expect(syncEncode).not.toHaveBeenCalled();
+  encode.mockImplementation(callback => callback(null));
+  await expect(encodePageImage(canvas)).rejects.toThrow("Could not encode");
 });
 
 it("accepts PDFs above the former 50 MB ceiling without reading the entire file", async () => {

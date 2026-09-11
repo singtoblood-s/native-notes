@@ -213,7 +213,7 @@ class NotePadApp {
       onChange: (strokes) => this.handleCanvasChange(strokes),
       onZoom: (scale) => {
         byId("zoom-label").textContent = `${Math.round(scale * 100)}%`;
-        this.updateActiveFlowHeight(scale);
+        this.updateFlowScale(scale);
       },
     });
     this.bindEvents();
@@ -1103,12 +1103,23 @@ class NotePadApp {
       addPage.addEventListener("click", () => { void this.createNewPage(); });
       flow.append(addPage);
     }
+    this.updateFlowScale();
     addPage.disabled = this.showTrash || this.showRecovery;
     addPage.hidden = this.viewMode === "paged";
   }
 
-  private updateActiveFlowHeight(_scale = this.canvas?.currentScale): void {
-    // Page geometry stays fixed while zoom/pan happen inside its viewport.
+  private updateFlowScale(scale = this.canvas?.currentScale): void {
+    if (!scale) return;
+    const pages = new Map(this.editorPages().map(page => [page.id, page]));
+    let widest = 0;
+    for (const slot of byId("page-flow").querySelectorAll<HTMLElement>(":scope > [data-flow-page]")) {
+      const page = pages.get(slot.dataset.flowPage!);
+      if (!page) continue;
+      slot.style.width = this.viewMode === "paged" ? "" : `${page.width * scale}px`;
+      slot.style.height = this.viewMode === "paged" ? "" : `${page.height * scale}px`;
+      widest = Math.max(widest, page.width * scale);
+    }
+    byId("page-flow").style.width = this.viewMode === "continuous" ? `max(100%, ${widest + 40}px)` : "";
   }
 
   private scheduleFlowActivation(): void {
@@ -1302,10 +1313,21 @@ class NotePadApp {
       object.style.height = `${image.height}px`;
       const background = image.x === 0 && image.y === 0 && image.width === page.width && image.height === page.height;
       object.style.pointerEvents = this.selectedTool === "hand" && !this.showTrash && (!background || this.selectedImageID === image.id) ? "auto" : "none";
-      object.setAttribute("role", "img");
+      object.setAttribute("role", "group");
       object.setAttribute("aria-label", "Inserted image");
       object.tabIndex = 0;
       if (this.selectedImageID === image.id && !this.showTrash) {
+        const remove = document.createElement("button");
+        remove.className = "image-delete-button";
+        remove.type = "button";
+        remove.textContent = "×";
+        remove.setAttribute("aria-label", "Remove selected image");
+        remove.addEventListener("pointerdown", event => event.stopPropagation());
+        remove.addEventListener("click", event => {
+          event.stopPropagation();
+          void this.removeSelectedImage();
+        });
+        object.append(remove);
         const resize = document.createElement("button");
         resize.className = "image-resize-handle";
         resize.type = "button";
@@ -1330,8 +1352,10 @@ class NotePadApp {
         this.imageDrag = { pointerID: event.pointerId, pageID: page.id, imageID: image.id, startX: event.clientX, startY: event.clientY, originX: image.x, originY: image.y };
       });
       object.addEventListener("keydown", (event) => {
+        if (isTextEntryTarget(event.target) || document.querySelector("dialog[open]")) return;
         if (event.key === "Delete" || event.key === "Backspace") {
           event.preventDefault();
+          event.stopPropagation();
           this.selectedImageID = image.id;
           void this.removeSelectedImage();
         }
@@ -1367,6 +1391,7 @@ class NotePadApp {
     if (this.currentPage) {
       this.renderImageLayer(this.currentPage);
       this.renderImageInspector(this.currentPage);
+      byId("paper-image-layer").querySelector<HTMLElement>(`[data-image-id="${CSS.escape(imageID)}"]`)?.focus({ preventScroll: true });
     }
   }
 
@@ -1414,6 +1439,7 @@ class NotePadApp {
     const next = images.filter((image) => image.id !== this.selectedImageID);
     if (next.length === images.length) return;
     setPageImages(page, next);
+    this.imageDrag = this.imageResize = null;
     this.selectedImageID = null;
     this.markImageChanged(page);
     this.renderImageLayer(page);
@@ -2519,6 +2545,11 @@ class NotePadApp {
       return;
     }
     if (!event.metaKey && !event.ctrlKey && !event.altKey && !this.showTrash) {
+      if (this.selectedImageID && (event.key === "Delete" || event.key === "Backspace")) {
+        event.preventDefault();
+        void this.removeSelectedImage();
+        return;
+      }
       const shortcut = ({ p: "pen", h: "highlighter", e: "eraser", l: "line", v: "hand" } as const)[event.key.toLowerCase() as "p" | "h" | "e" | "l" | "v"];
       if (shortcut) { event.preventDefault(); this.selectTool(shortcut); return; }
       if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); void this.turnPage(event.key === "ArrowLeft" ? -1 : 1); return; }
@@ -2733,7 +2764,7 @@ function isTextEntryTarget(target: EventTarget | null): boolean {
 async function makePageImage(file: File, page: NotePage, index: number): Promise<PageImage> {
   const canvas = await imageCanvas(file);
   try {
-    const src = encodePageImage(canvas);
+    const src = await encodePageImage(canvas);
     const scale = Math.min(1, 640 / canvas.width, (page.width - 64) / canvas.width, (page.height - 64) / canvas.height);
     const width = canvas.width * scale;
     const height = canvas.height * scale;

@@ -1,4 +1,4 @@
-import { createPage, id, pageImageDataBytes, MAX_PAGE_IMAGE_BYTES, type NotePage } from "./models";
+import { createPage, id, MAX_PAGE_IMAGE_BYTES, type NotePage } from "./models";
 import { renderPageExport } from "./canvas";
 
 export const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -13,22 +13,32 @@ export function mediaType(file: File): string {
   return ({ png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", gif: "image/gif", pdf: "application/pdf" } as Record<string, string>)[extension ?? ""] ?? "";
 }
 
-export function canvasBlob(canvas: HTMLCanvasElement, type = "image/png"): Promise<Blob> {
-  return new Promise((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error("Could not encode this image.")), type));
+export function canvasBlob(canvas: HTMLCanvasElement, type = "image/png", quality?: number): Promise<Blob> {
+  return new Promise((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error("Could not encode this image.")), type, quality));
 }
 
-export function encodePageImage(canvas: HTMLCanvasElement, maxBytes = 512 * 1024): string {
+export async function encodePageImage(canvas: HTMLCanvasElement, maxBytes = 256 * 1024): Promise<string> {
   const budget = Math.min(MAX_PAGE_IMAGE_BYTES, Math.max(16 * 1024, maxBytes));
   // Keep lossless output when small; otherwise reduce quality before resolution.
   // Resize a separate canvas so the page's aspect ratio/physical size is unchanged.
   let current = canvas;
   try {
     while (true) {
-      let src = current.toDataURL("image/png");
-      if ((pageImageDataBytes(src) ?? Infinity) <= budget) return src;
-      for (const quality of [.9, .8, .65]) {
-        src = current.toDataURL("image/webp", quality);
-        if ((pageImageDataBytes(src) ?? Infinity) <= budget) return src;
+      // Encode asynchronously and inspect blob sizes before allocating base64.
+      let blob = await canvasBlob(current);
+      if (blob.size > budget) {
+        for (const quality of [.82, .65]) {
+          blob = await canvasBlob(current, "image/webp", quality);
+          if (blob.size <= budget || blob.type !== "image/webp") break;
+        }
+      }
+      if (blob.size <= budget) {
+        return await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = () => reject(new Error("Could not read the compressed image."));
+          reader.readAsDataURL(blob);
+        });
       }
       if (Math.max(current.width, current.height) <= 256) throw new Error("Could not compress this image. Try a different picture.");
       const smaller = document.createElement("canvas");
@@ -57,7 +67,7 @@ export async function imageCanvas(file: File): Promise<HTMLCanvasElement> {
       image.src = url;
     });
     if (!image.naturalWidth || !image.naturalHeight) throw new Error("Invalid image dimensions.");
-    const scale = Math.min(1, 2000 / Math.max(image.naturalWidth, image.naturalHeight));
+    const scale = Math.min(1, 1600 / Math.max(image.naturalWidth, image.naturalHeight));
     const canvas = document.createElement("canvas");
     canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
     canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
@@ -73,10 +83,11 @@ export async function importMediaPages(files: File[], notebookID: string, firstO
   if (!files.length || files.length > 100) throw new Error("Choose between 1 and 100 files.");
   const pages: NotePage[] = [];
   let bytes = 0;
-  const append = (canvas: HTMLCanvasElement, title: string, remaining: number, dimensions?: { width: number; height: number }): void => {
+  const append = async (canvas: HTMLCanvasElement, title: string, remaining: number, dimensions?: { width: number; height: number }): Promise<void> => {
     signal.throwIfAborted();
     if (pages.length >= 100) throw new Error("Import up to 100 pages at a time. Split this document first.");
-    const src = encodePageImage(canvas, Math.min(512 * 1024, Math.floor((IMPORT_IMAGE_BUDGET - bytes) * .75 / remaining)));
+    const src = await encodePageImage(canvas, Math.min(256 * 1024, Math.floor((IMPORT_IMAGE_BUDGET - bytes) * .75 / remaining)));
+    signal.throwIfAborted();
     bytes += src.length;
     if (bytes > 38 * 1024 * 1024) throw new Error("Imported pages exceed 38 MB. Split this document first.");
     const page = createPage(notebookID, title.slice(0, 500));
@@ -99,7 +110,7 @@ export async function importMediaPages(files: File[], notebookID: string, firstO
     if (mediaType(file) !== "application/pdf") {
       progress(`Opening ${file.name}…`);
       const canvas = await imageCanvas(file);
-      try { append(canvas, title, files.length - fileIndex); } finally { canvas.width = canvas.height = 1; }
+      try { await append(canvas, title, files.length - fileIndex); } finally { canvas.width = canvas.height = 1; }
       continue;
     }
     if (file.size > MAX_PDF_FILE_BYTES) throw new Error("PDF files must be 250 MB or smaller before compression.");
@@ -135,7 +146,7 @@ export async function importMediaPages(files: File[], notebookID: string, firstO
         canvas.height = Math.ceil(viewport.height);
         try {
           await page.render({ canvas, viewport }).promise;
-          append(canvas, `${title} · ${index}`, pdf.numPages - index + files.length - fileIndex, { width: natural.width / .75, height: natural.height / .75 });
+          await append(canvas, `${title} · ${index}`, pdf.numPages - index + files.length - fileIndex, { width: natural.width / .75, height: natural.height / .75 });
         } finally { page.cleanup(); canvas.width = canvas.height = 1; }
         await new Promise(resolve => setTimeout(resolve, 0));
       }

@@ -57,6 +57,62 @@ try {
   assert.equal(await page.locator("#page-position").textContent(), "1 / 2");
   await page.evaluate(() => { window.qaSlots = [...document.querySelectorAll(".flow-page")]; });
   const geometry = () => page.evaluate(() => [...document.querySelectorAll(".flow-page")].map(element => [element.dataset.flowPage, element.offsetWidth, element.offsetHeight]));
+  const checkDocumentZoom = async (mode) => {
+    await page.locator("#fit-button").click();
+    const original = await geometry();
+    const scrollSize = () => page.locator("#paper-scroll").evaluate((element, mode) => mode === "horizontal" ? element.scrollWidth : element.scrollHeight, mode);
+    const originalScroll = await scrollSize();
+    await page.locator("#zoom-in").click();
+    const zoomed = await geometry();
+    for (let i = 0; i < original.length; i++) {
+      assert(Math.abs(zoomed[i][1] / original[i][1] - 1.16) < .005, `${mode}: every page width must zoom`);
+      assert(Math.abs(zoomed[i][2] / original[i][2] - 1.16) < .005, `${mode}: every page height must zoom`);
+    }
+    assert(await scrollSize() > originalScroll, `${mode}: scrolling must include the enlarged pages`);
+    const scale = await page.locator("#zoom-label").textContent();
+    await page.locator("#next-page").click();
+    await page.waitForFunction(() => document.querySelector("#page-position").textContent === "2 / 2");
+    assert.deepEqual(await geometry(), zoomed, `${mode}: switching page must preserve all dimensions`);
+    assert.equal(await page.locator("#zoom-label").textContent(), scale);
+    const paper = await page.locator("#paper").boundingBox();
+    const slot = await page.locator("#active-page-slot").boundingBox();
+    assert(Math.abs(paper.width - slot.width) < 2 && Math.abs(paper.height - slot.height) < 2, `${mode}: the entire sheet must fit its scroll slot`);
+    assert(Math.abs(paper.x - slot.x) < 2 && Math.abs(paper.y - slot.y) < 2, `${mode}: ink must align with the preview`);
+    await page.locator("#previous-page").click();
+    await page.waitForFunction(() => document.querySelector("#page-position").textContent === "1 / 2");
+    const pinchGeometry = await geometry();
+    const pinchPaper = await page.locator("#paper").boundingBox();
+    const finger = { pointerType: "touch", clientY: 400, button: 0, buttons: 1 };
+    await page.locator("#ink-canvas").dispatchEvent("pointerdown", { ...finger, pointerId: 83, clientX: 300 });
+    await page.locator("#ink-canvas").dispatchEvent("pointerdown", { ...finger, pointerId: 84, clientX: 500 });
+    await page.locator("#ink-canvas").dispatchEvent("pointermove", { ...finger, pointerId: 83, clientX: 290 });
+    await page.locator("#ink-canvas").dispatchEvent("pointermove", { ...finger, pointerId: 84, clientX: 510 });
+    const pinched = await geometry();
+    for (let i = 0; i < pinched.length; i++) {
+      assert(Math.abs(pinched[i][1] / pinchGeometry[i][1] - 1.1) < .005, `${mode}: pinch must resize every sheet equally`);
+    }
+    const anchored = await page.locator("#paper").boundingBox();
+    assert(Math.abs(anchored.y + (400 - pinchPaper.y) * 1.1 - 400) < 2, `${mode}: pinch must preserve its vertical anchor`);
+    await page.locator("#ink-canvas").dispatchEvent("pointercancel", { ...finger, pointerId: 83, clientX: 290 });
+    await page.locator("#ink-canvas").dispatchEvent("pointercancel", { ...finger, pointerId: 84, clientX: 510 });
+    await page.locator("#ink-canvas").dispatchEvent("wheel", { ctrlKey: true, deltaY: -100, clientX: 400, clientY: 400 });
+    const wheeled = await geometry();
+    for (let i = 0; i < wheeled.length; i++) {
+      assert(Math.abs(wheeled[i][1] / pinched[i][1] - 1.08) < .005, `${mode}: wheel zoom must resize every sheet equally`);
+    }
+    await page.locator("#hand-tool").click();
+    const beforeDrag = await page.locator("#paper-scroll").evaluate((element, mode) => mode === "horizontal" ? element.scrollLeft : element.scrollTop, mode);
+    const contact = { pointerId: 81, pointerType: "touch", clientX: 450, clientY: 450, button: 0, buttons: 1 };
+    await page.locator("#ink-canvas").dispatchEvent("pointerdown", contact);
+    await page.locator("#ink-canvas").dispatchEvent("pointermove", { ...contact, clientX: mode === "horizontal" ? 350 : 450, clientY: mode === "continuous" ? 350 : 450 });
+    const afterDrag = await page.locator("#paper-scroll").evaluate((element, mode) => mode === "horizontal" ? element.scrollLeft : element.scrollTop, mode);
+    assert(Math.abs(afterDrag - beforeDrag - 100) < 2, `${mode}: hand dragging after zoom must scroll between sheets`);
+    await page.locator("#ink-canvas").dispatchEvent("pointercancel", contact);
+    await page.locator("#pen-tool").click();
+    await page.screenshot({ path: `${output}/${mode}-zoom.png` });
+    await page.locator("#fit-button").click();
+  };
+  await checkDocumentZoom("continuous");
   const before = await geometry();
   await page.locator("#next-page").click();
   await page.waitForFunction(() => document.querySelector("#page-position").textContent === "2 / 2");
@@ -113,6 +169,7 @@ try {
   await page.locator("#export-cancel").click();
   for (const mode of ["horizontal", "paged", "continuous"]) {
     await page.locator("#page-view-mode").selectOption(mode);
+    if (mode !== "paged") await checkDocumentZoom(mode);
     assert((await page.locator("#paper-viewport").boundingBox()).height > 100, `${mode} must have a usable writing viewport`);
     await page.locator("#next-page").click(); await page.waitForFunction(() => document.querySelector("#page-position").textContent === "2 / 2");
     await page.locator("#previous-page").click(); await page.waitForFunction(() => document.querySelector("#page-position").textContent === "1 / 2");
@@ -121,12 +178,39 @@ try {
   await page.waitForFunction(() => document.querySelector("#page-position").textContent === "1 / 2" && !document.querySelector("#editor-workspace").hidden);
   assert.equal(await page.locator("#page-text").inputValue(), "ทดสอบข้อความไทย — pasted text");
   assert.equal(await page.locator(".image-list-row").count(), 3);
+  // Touch removal must work on the selected image even with the pen active.
+  await page.locator("#text-toggle").click();
+  await page.locator("[data-image-select]").last().click();
+  await page.locator("#close-inspector").click();
+  await page.locator("#pen-tool").click();
+  await page.locator(".image-delete-button").tap();
+  await page.waitForFunction(() => document.querySelectorAll(".image-list-row").length === 2);
+  // Clicking an image in hand mode must retain focus for keyboard deletion.
+  await page.locator("#hand-tool").click();
+  await page.locator(".paper-image-object").last().click({ position: { x: 15, y: 15 } });
+  await page.keyboard.press("Delete");
+  await page.waitForFunction(() => document.querySelectorAll(".image-list-row").length === 1);
+  // Full-page imported images remain removable from Text, without deleting ink.
+  await page.locator("#text-toggle").click();
+  await page.locator("[data-image-select]").click();
+  await page.locator("#page-text").focus();
+  await page.keyboard.press("Backspace");
+  assert.equal(await page.locator(".image-list-row").count(), 1);
+  await page.locator("[data-image-remove]").click();
+  await page.waitForFunction(() => document.querySelectorAll(".image-list-row").length === 0);
+  await page.locator("#close-inspector").click();
+  await page.locator("#next-page").click();
+  await page.waitForFunction(() => document.querySelector("#page-position").textContent === "2 / 2");
+  await page.reload(); await page.locator("[data-open-book]").click();
+  await page.waitForFunction(() => document.querySelector("#page-position").textContent === "1 / 2");
+  assert.equal(await page.locator(".image-list-row").count(), 0, "Deleted images must stay deleted after reload");
   await page.setViewportSize({ width: 768, height: 1024 });
   await page.locator("#notebook-menu").click();
   const menu = page.locator("#notebook-menu-popup");
   assert.equal(await menu.locator("button").first().evaluate(element => getComputedStyle(element).color), "rgb(37, 36, 41)");
   await page.screenshot({ path: `${output}/tablet-menu.png` });
   await page.keyboard.press("Escape");
+  await checkDocumentZoom("continuous");
   // A corrupt PDF must leave the existing notebook intact.
   await page.locator("#toolbar-insert").click(); await page.locator("#insert-pdf").click();
   await page.locator("#media-input").setInputFiles({ name: "broken.pdf", mimeType: "application/pdf", buffer: Buffer.from("invalid PDF") });
@@ -163,12 +247,12 @@ try {
       context.putImageData(pixels, 0, 0);
       const blob = await new Promise(resolve => source.toBlob(resolve, "image/png"));
       const canvas = await imageCanvas(new File([blob], "Large camera image.png", { type: "image/png" }));
-      const encoded = encodePageImage(canvas);
+      const encoded = await encodePageImage(canvas);
       return { originalBytes: blob.size, compressedBytes: atob(encoded.split(",")[1]).length, width: canvas.width, height: canvas.height };
     });
     assert(compression.originalBytes > 12 * 1024 * 1024);
-    assert(compression.compressedBytes <= 512 * 1024);
-    assert.deepEqual([compression.width, compression.height], [2000, 1200]);
+    assert(compression.compressedBytes <= 256 * 1024);
+    assert.deepEqual([compression.width, compression.height], [1600, 960]);
     console.log("Large media compression:", JSON.stringify(compression));
   }
   assert.deepEqual(errors, []);
