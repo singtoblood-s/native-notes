@@ -21,16 +21,17 @@ GitHub Pages ให้บริการหน้าเว็บเท่าน�
 ต้องล็อกอินก่อนเปิดสมุด ไม่มีโหมด guest และเมื่อล็อกเอาต์หรือ session หมดอายุจะต้องล็อกอินใหม่
 เมื่อเปิดเวอร์ชันใหม่ แอปจะลบฐานข้อมูล guest เก่าในเบราว์เซอร์และไม่มีฟังก์ชันกู้คืนหรือส่งออก guest
 หาก session ยังใช้ได้ จะบันทึกในเครื่องขณะออฟไลน์และส่งเมื่อกลับมาออนไลน์
-หากใช้ backend ทดสอบบนพีซี sync จะหยุดเมื่อพีซีหรือ tunnel ปิด
+การทดสอบในเครื่องใช้ Cloudflare Worker/D1 ที่รันแยกจาก Vite; production ต้องชี้ไปยัง backend HTTPS ที่เปิดใช้งานจริง
 ไม่มีการซื้อ hosting หรือ Apple Developer Program สำหรับโครงการนี้
 
 เปิดแอปแล้วจะพบหน้า Documents เพื่อเลือกสมุดก่อนเข้าเขียน สร้างสมุดผ่าน New → Notebook → เลือกกระดาษ/ตั้งชื่อ → Create
 กดปกเพื่อเปิดสมุด และกด Documents ในหน้าจอเขียนเพื่อกลับคลัง มีค้นหา เรียงลำดับ มุมมองรายการ และ Favorites (บันทึกเฉพาะอุปกรณ์นี้)
 หน้าจอเขียนเปิดเต็มพื้นที่โดยซ่อนรายชื่อหน้าและแผงข้อความไว้ก่อน กดชื่อสมุดด้านบนเพื่อเปลี่ยนชื่อ
-กดชื่อหน้าเพื่อเปิดรายละเอียดหน้า ใช้นิ้วสองนิ้วซูมและหนึ่งนิ้วเลื่อนกระดาษ
+กดเมนู ⋯ ข้างชื่อสมุดหรือหน้าเพื่อ Rename, Duplicate และ Trash/Restore โดยไม่ต้องเปิด Text; กดชื่อหน้าเพื่อเปิดรายละเอียดหน้า ใช้นิ้วสองนิ้วซูมและหนึ่งนิ้วเลื่อนกระดาษ
 แถบเขียนมีปากกา Fountain/Ball, ไฮไลต์, ยางลบทั้งเส้น, เส้นตรง และโหมดอ่าน/เลื่อน
 สีและความหนาจำแยกตามเครื่องมือ ปุ่มลูกศรเปลี่ยนหน้า และปุ่ม ＋ เพิ่มหน้าด้วยกระดาษแบบเดิม
-เปิด Text เพื่อทำสำเนาหน้าพร้อมลายเส้นและข้อความ ดู [ผลวิจัย GoodNotes 5 และขอบเขตที่ทำแล้ว](docs/GOODNOTES5-RESEARCH.md)
+เปิด Text เพื่อเพิ่มรูปจากไฟล์หรือ clipboard, ย้าย/ย่อขยาย/ลบรูป และทำสำเนาหน้าพร้อมลายเส้น ข้อความ และรูป ดู [ผลวิจัย GoodNotes 5 และขอบเขตที่ทำแล้ว](docs/GOODNOTES5-RESEARCH.md)
+เลือก Continuous, Book scroll หรือ Page turn ในแถบหน้า; ค่าจะจำแยกตามบัญชีบนอุปกรณ์นั้น
 เมื่อเข้าสู่ระบบ แอปส่งข้อมูลหลังบันทึกและดึงข้อมูลเมื่อกลับมาเปิดแอป/กลับมาออนไลน์
 รวมถึงตรวจทุก 5 วินาทีขณะเปิดแอปอยู่เบื้องหน้า สถานะบันทึกในเครื่องยังไม่ใช่การยืนยันว่าส่งถึงเครื่องอื่นแล้ว
 
@@ -42,6 +43,7 @@ GitHub Pages ให้บริการหน้าเว็บเท่าน�
 | `shared/` | Kotlin JSON models shared with the server's tests |
 | `server/` | Authentication and SQLite revision-sync API |
 | `docs/CONTRACT.md` | Shared JSON format and API contract |
+| `docs/USER_REPAIR_2026-09-11.md` | User-facing repair behavior and device checks |
 | `PLAN.md` | Original architecture plan; see the change record below |
 
 ## Development
@@ -64,7 +66,7 @@ npm run dev
 
 On Windows use `gradlew.bat`. Set `JAVA_HOME` to your JDK 21 installation.
 
-See [server deployment](server/README.md) and [temporary testing](docs/TESTING.md) for persistent storage, TLS, origin
+See [server deployment](server/README.md) and [local testing](docs/TESTING.md) for persistent storage, TLS, origin
 configuration and backup. A static GitHub Pages deployment cannot run the API.
 Never commit real databases, note exports, session tokens, credentials or
 Android signing keys. The repository's ignore rules exclude local databases

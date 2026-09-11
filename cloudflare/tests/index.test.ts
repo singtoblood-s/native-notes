@@ -236,6 +236,57 @@ describe("native-notes Cloudflare Worker", () => {
     expect((deletedBody.changes[0]?.payload as { strokes: unknown[] }).strokes).toEqual(large.strokes);
   }, 30_000);
 
+  it("round-trips page images and metadata without allowing a legacy overwrite", async () => {
+    const { token } = await auth();
+    const notebookId = id();
+    const pageId = id();
+    expect((await push(token, [operation("notebook", notebookId, notebook(notebookId))])).results[0]).toMatchObject({ status: "acked", revision: 1 });
+
+    const image = {
+      id: id(),
+      src: "data:image/png;base64,AAAA",
+      x: 12,
+      y: 24,
+      width: 320,
+      height: 240,
+    };
+    const imagePage = { ...page(pageId, notebookId, "Image page"), formatVersion: 2, images: [image], order: 4, conflictOf: id() };
+    const stored = await push(token, [operation("page", pageId, imagePage)]);
+    expect(stored.results[0]).toMatchObject({ status: "acked", revision: 1, sequence: 2 });
+
+    const pulled = await request("/v1/sync/pull?cursor=1&limit=100", {
+      headers: { Origin: ORIGIN, Authorization: `Bearer ${token}` },
+    });
+    const pulledBody = await pulled.json() as { changes: Array<Record<string, unknown>> };
+    expect(pulledBody.changes[0]?.payload).toMatchObject({
+      id: pageId,
+      formatVersion: 2,
+      images: [image],
+      order: 4,
+      conflictOf: imagePage.conflictOf,
+    });
+
+    const legacyEdit = page(pageId, notebookId, "Legacy edit");
+    const rejected = await push(token, [operation("page", pageId, legacyEdit, 1)]);
+    expect(rejected.results[0]).toMatchObject({ status: "rejected", code: "legacy_format" });
+
+    const legacyPageId = id();
+    const legacyCreated = await push(token, [operation("page", legacyPageId, page(legacyPageId, notebookId, "Legacy page"))]);
+    expect(legacyCreated.results[0]).toMatchObject({ status: "acked", revision: 1, sequence: 3 });
+    const legacyPull = await request("/v1/sync/pull?cursor=2&limit=100", {
+      headers: { Origin: ORIGIN, Authorization: `Bearer ${token}` },
+    });
+    const legacyPayload = ((await legacyPull.json()) as { changes: Array<Record<string, unknown>> }).changes[0]?.payload as Record<string, unknown>;
+    expect(legacyPayload).not.toHaveProperty("images");
+    expect(legacyPayload).not.toHaveProperty("order");
+    expect(legacyPayload).not.toHaveProperty("conflictOf");
+
+    const unsafePageId = id();
+    const unsafe = { ...page(unsafePageId, notebookId, "Unsafe"), formatVersion: 2, images: [{ ...image, id: id(), src: "data:image/svg+xml;base64,AAAA" }] };
+    const unsafeResult = await push(token, [operation("page", unsafePageId, unsafe)]);
+    expect(unsafeResult.results[0]).toMatchObject({ status: "rejected", code: "invalid_image" });
+  });
+
   it("bounds pull batches by bytes and rejects a multi-large push before writing", async () => {
     const { token } = await auth();
     const notebookId = id();

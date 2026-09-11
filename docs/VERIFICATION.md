@@ -1,6 +1,22 @@
 # Release verification — 2026-09-11
 
-## Repair investigation
+## Current repair verification
+
+- Web: 93 tests pass across 14 files; TypeScript and the production Vite build
+  pass after the notebook/page menus, raster image persistence, ordered page
+  flow, and iPad pointer buffering changes.
+- Cloudflare Worker: 11 tests and TypeScript checks pass. Kotlin server and
+  shared model checks pass.
+- Browser smoke passes in Chromium at 1180 × 820 and WebKit at 820 × 1180,
+  using the isolated local Vite/Worker/D1 services and disposable accounts.
+  Both runs cover page flow, buffered preview pen input, raster upload and
+  paste, CRUD/trash restore, reload, two-context sync and conflict recovery;
+  neither run reported a page error. No production deployment is claimed here.
+
+The remaining sections preserve the original release record for context and
+are historical unless explicitly marked above.
+
+## Historical initial investigation
 
 The user's follow-up reproduced an undersized writing area, unstable pinch
 anchoring, missing notebook rename controls and unavailable cross-device sync.
@@ -14,11 +30,11 @@ workspace recovery exports. See [repair plan](REPAIR_PLAN.md) and
 [device regression checks](TESTING.md). Hosting availability remains separate
 from client behavior: a static Pages deployment cannot supply the sync API.
 
-The results below describe the original delivery; repair-specific results are
-recorded separately so the temporary backend's earlier success is not mistaken
-for a continuously available hosted service.
+The results below include historical checks from the original delivery;
+repair-specific behavior is documented separately. Local Worker/D1 checks do
+not imply that a production backend is continuously available.
 
-### Repair checks performed
+### Historical repair checks performed
 
 - Web: 38 passing tests across seven files; TypeScript and production Vite
   build pass. The unchanged server test suite and install distribution pass.
@@ -42,7 +58,7 @@ for a continuously available hosted service.
   and bounded history for large pages. Physical multi-touch/pen behavior still
   needs confirmation on the user's Safari/Chrome devices.
 
-## Automated
+## Historical automated checks
 
 - Web: 17 passing tests covering auth identity/logout/endpoint handling,
   drawing taps/cancellation/palm input, account namespaces, UUIDs, immutable
@@ -56,7 +72,7 @@ for a continuously available hosted service.
 - GitHub Actions web deployment and backend build/test both passed for the
   initial release commit `a80ce13`.
 
-## Browser and API checks actually performed
+## Historical browser and API checks
 
 - Thai text and drawing strokes survive local database close/reopen/reload.
 - Edits made immediately before switching pages stay on the correct page.
@@ -65,14 +81,14 @@ for a continuously available hosted service.
   the same account and exchange a note through the real HTTPS backend.
 - Concurrent edits of one page preserve the server text on the original page
   and the other text on a visible conflict copy.
-- The deployed GitHub Pages app loads its worker/WASM, logs into the real
-  backend, pulls the same note and signs out. Reload remains in guest mode.
+- The deployed GitHub Pages app loads its worker/WASM, logs into the configured
+  backend, pulls the same note and signs out. Reload returns to the login gate.
 - Responsive layouts were inspected at 430 × 932 and 834 × 1194. Tablet
   portrait uses a menu drawer and larger writing area.
 - HTTP smoke checks verify retry deduplication, stale-write conflicts,
   cross-account isolation, logout rejection and allowed-origin preflight.
 
-## Offline verification limit
+## Historical offline verification limit
 
 The production service worker reports **Offline cache ready** with an active
 controller. However, opening or reloading the app in the test in-app browser
@@ -88,5 +104,5 @@ Use both physical devices to check pressure, palm rejection, writing latency,
 rotation, virtual-keyboard behavior and suspend/resume. The browser's pen API
 has different capabilities from PencilKit and Samsung's native note editor.
 
-The temporary backend is hosted on the development PC. Its availability is
-not a guarantee of an ongoing hosted service. See [testing instructions](TESTING.md).
+The local Worker/D1 backend is for isolated verification and is not a guarantee
+of an ongoing hosted service. See [testing instructions](TESTING.md).

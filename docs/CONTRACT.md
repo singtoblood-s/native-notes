@@ -55,6 +55,28 @@ or `grid`; dimensions are logical points.
 }
 ```
 
+Pages that contain placement metadata use `formatVersion: 2` and add the
+following optional fields:
+
+```json
+{
+  "images": [
+    {"id":"uuid","src":"data:image/png;base64,...","x":64.0,"y":64.0,"width":320.0,"height":240.0}
+  ],
+  "order": 0,
+  "conflictOf": "uuid"
+}
+```
+
+`images` contains raster data URLs only (`image/png`, `image/jpeg`,
+`image/webp`, or `image/gif`). A page accepts at most 100 images, each at most
+2 MiB decoded and 10 MiB decoded in total. Coordinates and dimensions are
+finite bounded page values. `order` is a non-negative stable append order;
+legacy pages may omit it. `conflictOf` identifies a recovered copy. The
+server omits absent optional fields when it returns a legacy page. A client
+that only understands format 1 must refresh before editing a format 2 page;
+the server rejects that write instead of silently dropping images or order.
+
 `color` is unsigned 32-bit ARGB (`0xAARRGGBB`) represented as a JSON number.
 Each point's `time` is milliseconds relative to the first point in its stroke.
 `pressure` is normalized to 0..1; clients use 0.5 when the source device has
@@ -111,8 +133,8 @@ boundaries.
 
 When a conflict copy refers to a notebook that is missing or tombstoned in the
 local workspace, the client creates a new recovery notebook and queues its
-upsert before showing the recovered page. The recovered page remains local
-until it is edited, so its next queued edit has a server-side parent.
+upsert before showing the recovered page. The recovered notebook and page are
+both queued immediately, so every device can show the same recovery copy.
 
 ## Sync API
 
@@ -216,10 +238,11 @@ Login is local identifier/password with PBKDF2-HMAC-SHA256 on the server; it
 does not require Google provisioning. Transport must be TLS in deployment.
 The legacy Ktor server accepts at most 100 operations per push. The deployed
 Cloudflare D1 worker accepts at most 10 operations per push; the PWA drains a
-larger outbox through multiple requests. Both servers accept 4 MiB per HTTP
-request. The worker and PWA keep each operation payload below 1.9 MiB for its
-D1 row ceiling, and the PWA keeps each request below 3 MiB to leave room for
-JSON framing and proxies.
+larger outbox through multiple requests. Both servers accept sync requests up
+to 36 MiB and reject an individual note payload above 32 MiB. Cloudflare
+chunks payloads above its inline D1 row limit, while multi-operation pushes
+remain bounded separately so a large image operation is sent alone.
 The server can read note payloads; end-to-end encryption is a later contract.
 Sync is snapshot plus revision CAS, with conflict copies; there is no realtime
-collaboration or CRDT. Attachments and PDF backgrounds are outside v1.
+collaboration or CRDT. Embedded raster page images are bounded as described
+above; arbitrary attachments and PDF backgrounds are outside this contract.

@@ -4,8 +4,13 @@ import { resolveStorageAccountKey } from "./auth";
 import {
   ConflictCopy,
   INK_FORMAT_VERSION,
+  PAGE_METADATA_FORMAT_VERSION,
+  MAX_PAGE_IMAGES,
+  MAX_PAGE_IMAGE_BYTES,
+  MAX_PAGE_IMAGE_BYTES_TOTAL,
   NotePage,
   Notebook,
+  PageImage,
   PullChange,
   SaveResult,
   SyncAction,
@@ -16,7 +21,9 @@ import {
   id,
   isUUID,
   now,
+  pageImageDataBytes,
   requireUUID,
+  sanitizePageImage,
   sanitizeNotebook,
   sanitizePage,
   toWirePage,
@@ -37,6 +44,29 @@ const CONFLICT_SUFFIX = " · conflict";
 
 function conflictTitle(title: string, maxLength: number): string {
   return `${title.slice(0, Math.max(0, maxLength - CONFLICT_SUFFIX.length))}${CONFLICT_SUFFIX}`;
+}
+
+function compareNotebookOrder(left: Notebook, right: Notebook): number {
+  return compareStrings(left.createdAt, right.createdAt) || compareStrings(left.id, right.id);
+}
+
+function comparePageOrder(left: NotePage, right: NotePage): number {
+  if (left.order !== undefined && right.order !== undefined) return left.order - right.order || compareStrings(left.id, right.id);
+  // Legacy pages have no order. Keep them before newly-created ordered pages
+  // and use a stable natural title fallback.
+  if (left.order === undefined && right.order !== undefined) return -1;
+  if (left.order !== undefined && right.order === undefined) return 1;
+  const leftNumber = /^page\s+(\d+)$/i.exec(left.title)?.[1];
+  const rightNumber = /^page\s+(\d+)$/i.exec(right.title)?.[1];
+  if (leftNumber && rightNumber) {
+    const difference = Number(leftNumber) - Number(rightNumber);
+    if (difference) return difference;
+  }
+  return compareStrings(left.title, right.title) || compareStrings(left.id, right.id);
+}
+
+function compareStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 export interface Archive {
@@ -156,12 +186,13 @@ function validatePageSnapshot(value: unknown, expectedID?: string, expectedRevis
   const width = finiteNumber(raw.width, "Page width");
   const height = finiteNumber(raw.height, "Page height");
   if (width < 1 || width > 10_000 || height < 1 || height > 10_000) throw new Error("Page dimensions are invalid");
-  if (raw.formatVersion !== INK_FORMAT_VERSION) throw new Error("Unsupported ink format");
+  if (raw.formatVersion !== INK_FORMAT_VERSION && raw.formatVersion !== PAGE_METADATA_FORMAT_VERSION) throw new Error("Unsupported ink format");
   const revision = nonNegativeInteger(raw.revision, "Page revision");
   if (expectedRevision !== undefined && revision !== expectedRevision) throw new Error("Page payload revision does not match change revision");
+  if (raw.order !== undefined && raw.order !== null && (!Number.isSafeInteger(raw.order) || (raw.order as number) < 0)) throw new Error("Page order is invalid");
   requiredString(raw.updatedAt, "Page updatedAt");
   optionalString(raw.deletedAt, "Page deletedAt");
-  if (raw.conflictOf !== undefined && (!allowConflictOf || !isUUID(raw.conflictOf))) throw new Error("Page conflict ID is invalid");
+  if (raw.conflictOf !== undefined && raw.conflictOf !== null && (!allowConflictOf || !isUUID(raw.conflictOf))) throw new Error("Page conflict ID is invalid");
   if (!Array.isArray(raw.strokes) || raw.strokes.length > MAX_STROKES) throw new Error("Page strokes are invalid");
   const strokeIDs = new Set<string>();
   let pointCount = 0;
@@ -197,6 +228,33 @@ function validatePageSnapshot(value: unknown, expectedID?: string, expectedRevis
     });
     return { id: strokeID, color: color >>> 0, width: strokeWidth, points };
   });
+  const imageIDs = new Set<string>();
+  let imageBytes = 0;
+  const hasImages = raw.images !== undefined;
+  const rawImages = hasImages ? raw.images : [];
+  if (!Array.isArray(rawImages) || rawImages.length > MAX_PAGE_IMAGES) throw new Error("Page images are invalid");
+  const images: PageImage[] = rawImages.map((value, imageIndex) => {
+    const image = record(value, `Page image ${imageIndex + 1}`);
+    const imageID = requireUUID(image.id, "Image ID");
+    if (imageIDs.has(imageID)) throw new Error("Page contains duplicate image IDs");
+    imageIDs.add(imageID);
+    const src = requiredString(image.src, "Image source");
+    const bytes = pageImageDataBytes(src);
+    if (bytes === null || bytes > MAX_PAGE_IMAGE_BYTES) throw new Error("Page image data is invalid");
+    imageBytes += bytes;
+    if (imageBytes > MAX_PAGE_IMAGE_BYTES_TOTAL) throw new Error("Page images are too large");
+    const x = finiteNumber(image.x, "Image x");
+    const y = finiteNumber(image.y, "Image y");
+    const width = finiteNumber(image.width, "Image width");
+    const height = finiteNumber(image.height, "Image height");
+    if (width <= 0 || width > 10_000 || height <= 0 || height > 10_000 || x < -100_000 || x > 100_000 || y < -100_000 || y > 100_000) {
+      throw new Error("Page image bounds are invalid");
+    }
+    return sanitizePageImage({ id: imageID, src, x, y, width, height });
+  });
+  const hasPageMetadata = images.length > 0 || raw.order !== undefined && raw.order !== null || typeof raw.conflictOf === "string";
+  if (hasPageMetadata && raw.formatVersion !== PAGE_METADATA_FORMAT_VERSION && timing !== "local") throw new Error("Page images and order require the newer page format");
+  const formatVersion = hasPageMetadata ? PAGE_METADATA_FORMAT_VERSION : raw.formatVersion as number;
   return sanitizePage({
     id: pageID,
     notebookId: notebookID,
@@ -206,18 +264,20 @@ function validatePageSnapshot(value: unknown, expectedID?: string, expectedRevis
     width,
     height,
     strokes,
-    formatVersion: INK_FORMAT_VERSION,
+    images: hasImages ? images : undefined,
+    order: raw.order === null ? undefined : raw.order as number | undefined,
+    formatVersion,
     revision,
     updatedAt: raw.updatedAt as string,
     deletedAt: raw.deletedAt as string | null,
-    conflictOf: raw.conflictOf as string | undefined,
+    conflictOf: typeof raw.conflictOf === "string" ? raw.conflictOf : undefined,
   });
 }
 
 function validateSnapshotPayload(entityType: SyncEntityType, action: SyncAction, payload: unknown, entityID: string, revision?: number): Record<string, unknown> {
   void action;
   if (entityType === "notebook") return validateNotebookSnapshot(payload, entityID) as unknown as Record<string, unknown>;
-  return validatePageSnapshot(payload, entityID, revision, false) as unknown as Record<string, unknown>;
+  return validatePageSnapshot(payload, entityID, revision, true) as unknown as Record<string, unknown>;
 }
 
 function validatePullChange(change: PullChange): PullChange {
@@ -425,6 +485,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
 
       const store = new SQLiteNoteStoreEngine(sqlite, db, accountKey, persistence, namespace, lock);
       store.initializeSchema();
+      if (store.migrateUnqueuedConflictCopies() && persistence === "indexeddb") await store.persistSnapshot();
       return store;
     } catch (error) {
       lock.release();
@@ -478,6 +539,37 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     const outboxColumns = this.query<{ name: unknown }>("PRAGMA table_info(outbox)");
     if (!outboxColumns.some((column) => column.name === "state")) this.db.exec("ALTER TABLE outbox ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'");
     this.db.exec("CREATE INDEX IF NOT EXISTS outbox_entity_state_idx ON outbox(entity_type, entity_id, state, created_at)");
+  }
+
+  /** Queue pre-upgrade recovered pages once so they converge across devices. */
+  private migrateUnqueuedConflictCopies(): boolean {
+    let changed = false;
+    const rows = this.query<{ id: unknown; json: unknown }>("SELECT id, json FROM pages WHERE revision = 0 AND deleted_at IS NULL");
+    for (const row of rows) {
+      if (typeof row.id !== "string" || typeof row.json !== "string") continue;
+      let page: NotePage;
+      try {
+        const decoded = JSON.parse(row.json) as Partial<NotePage>;
+        if (!isUUID(decoded.conflictOf)) continue;
+        page = validatePageSnapshot(decoded, row.id, undefined, true, "local");
+      } catch {
+        continue;
+      }
+      const notebook = this.notebookFromRow(this.row(page.notebookId, "notebooks"));
+      if (!notebook) continue;
+      if (notebook.revision === 0) {
+        const parentQueued = this.query("SELECT 1 FROM outbox WHERE entity_type = 'notebook' AND entity_id = ? LIMIT 1", [notebook.id]).length === 0;
+        if (parentQueued) {
+          this.queueOperation({ entityType: "notebook", entityId: notebook.id, baseRevision: 0, action: "upsert", payload: notebook as unknown as Record<string, unknown> });
+          changed = true;
+        }
+      }
+      const queued = this.query("SELECT 1 FROM outbox WHERE entity_type = 'page' AND entity_id = ? LIMIT 1", [page.id]).length > 0;
+      if (queued) continue;
+      this.queueOperation({ entityType: "page", entityId: page.id, baseRevision: 0, action: "upsert", payload: toWirePage(page) as unknown as Record<string, unknown> });
+      changed = true;
+    }
+    return changed;
   }
 
   private query<T extends Record<string, unknown>>(sql: string, bind: unknown[] = []): T[] {
@@ -538,6 +630,23 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     catch (error) { throw new CorruptSnapshotError(`Page snapshot could not be decoded: ${error instanceof Error ? error.message : "invalid JSON"}`); }
   }
 
+  private nextPageOrderDirect(notebookID: string): number {
+    const rows = this.query<{ json: unknown }>("SELECT json FROM pages WHERE notebook_id = ?", [notebookID]);
+    let count = 0;
+    let maximum = -1;
+    for (const row of rows) {
+      count += 1;
+      if (typeof row.json !== "string") continue;
+      try {
+        const value = JSON.parse(row.json) as { order?: unknown };
+        if (Number.isSafeInteger(value.order) && (value.order as number) >= 0) maximum = Math.max(maximum, value.order as number);
+      } catch {
+        // The normal row decoder reports corrupt snapshots when the row is read.
+      }
+    }
+    return Math.max(count, maximum + 1);
+  }
+
   private notebookFromRow(row: Record<string, unknown> | null | undefined): Notebook | null {
     if (!row) return null;
     if (typeof row.json !== "string") throw new CorruptSnapshotError("Notebook row has no JSON payload");
@@ -589,7 +698,16 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     const existing = this.pageFromRow(this.row(normalized.id, "pages"));
     // Local edits do not mint server revisions. Keep the last acknowledged one.
     const baseRevision = existing?.revision ?? normalized.revision;
-    const saved: NotePage = { ...normalized, revision: baseRevision, updatedAt: now() };
+    // New local pages append after existing pages. Existing/remote order is
+    // preserved, including legacy rows that have no order field yet.
+    const pageOrder = existing ? existing.order : normalized.order ?? this.nextPageOrderDirect(normalized.notebookId);
+    const saved: NotePage = {
+      ...normalized,
+      order: pageOrder,
+      formatVersion: pageOrder !== undefined || (normalized.images?.length ?? 0) > 0 || normalized.conflictOf !== undefined ? PAGE_METADATA_FORMAT_VERSION : normalized.formatVersion,
+      revision: baseRevision,
+      updatedAt: now(),
+    };
     this.db.exec({
       sql: `INSERT INTO pages(id, notebook_id, revision, deleted_at, json) VALUES(?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET notebook_id=excluded.notebook_id, revision=excluded.revision,
@@ -630,7 +748,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
 
   async listNotebooks(includeDeleted = false): Promise<Notebook[]> {
     const clause = includeDeleted ? "" : " WHERE deleted_at IS NULL";
-    return this.query(`SELECT json FROM notebooks${clause} ORDER BY rowid`).map((row) => this.notebookFromRow(row)).filter((value): value is Notebook => value !== null);
+    return this.query(`SELECT json FROM notebooks${clause} ORDER BY id`).map((row) => this.notebookFromRow(row)).filter((value): value is Notebook => value !== null).sort(compareNotebookOrder);
   }
 
   async getNotebook(entityID: string): Promise<Notebook | null> { return this.notebookFromRow(this.row(entityID, "notebooks")); }
@@ -639,7 +757,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
 
   async listPages(notebookID: string, includeDeleted = false): Promise<NotePage[]> {
     const clause = includeDeleted ? "" : " AND deleted_at IS NULL";
-    return this.query(`SELECT json FROM pages WHERE notebook_id = ?${clause} ORDER BY rowid`, [notebookID]).map((row) => this.pageFromRow(row)).filter((value): value is NotePage => value !== null);
+    return this.query(`SELECT json FROM pages WHERE notebook_id = ?${clause} ORDER BY id`, [notebookID]).map((row) => this.pageFromRow(row)).filter((value): value is NotePage => value !== null).sort(comparePageOrder);
   }
 
   async getPage(entityID: string): Promise<NotePage | null> { return this.pageFromRow(this.row(entityID, "pages")); }
@@ -685,7 +803,9 @@ export class SQLiteNoteStoreEngine implements NoteStore {
 
   async createConflictCopy(page: NotePage, originalPageID: string): Promise<NotePage> {
     const copy = sanitizePage({ ...page, id: id(), title: conflictTitle(page.title, MAX_PAGE_TITLE), revision: 0, conflictOf: originalPageID, deletedAt: null });
-    await this.savePage(copy, false);
+    // Recovery copies are durable notebook pages. Queue them so another device
+    // sees the same recoverable note after the next sync.
+    await this.savePage(copy, true);
     return copy;
   }
 
@@ -713,6 +833,15 @@ export class SQLiteNoteStoreEngine implements NoteStore {
         }
         const copy = sanitizePage({ ...page, id: id(), notebookId: notebookID, title: conflictTitle(page.title, MAX_PAGE_TITLE), revision: 0, conflictOf: originalPageID, deletedAt: null });
         this.savePageRow(copy, false);
+        if (typeof this.queueOperation === "function") this.queueOperation({
+          entityType: "page",
+          entityId: copy.id,
+          baseRevision: 0,
+          action: "upsert",
+          // savePageRow assigns an append order to a newly recovered page;
+          // queue the persisted snapshot so every device gets that same order.
+          payload: toWirePage(this.pageFromRow(this.row(copy.id, "pages")) ?? copy) as unknown as Record<string, unknown>,
+        });
       } else if (operation.entityType === "notebook") {
         const notebook = validateNotebookSnapshot(operation.payload, operation.entityId);
         // The recovered notebook is a valid place for the user to create a new
@@ -1024,10 +1153,10 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       const current = this.pageFromRow(this.row(change.entityId, "pages"));
       if (current && current.revision >= change.revision) return;
       if (change.action === "delete") {
-        const source = validatePageSnapshot(change.payload, change.entityId, change.revision, false);
+        const source = validatePageSnapshot(change.payload, change.entityId, change.revision, true);
         this.upsertPageDirect({ ...source, revision: change.revision, deletedAt: source.deletedAt ?? now(), updatedAt: now() });
       } else {
-        this.upsertPageDirect(validatePageSnapshot(change.payload, change.entityId, change.revision, false));
+        this.upsertPageDirect(validatePageSnapshot(change.payload, change.entityId, change.revision, true));
       }
     } else {
       const current = this.notebookFromRow(this.row(change.entityId, "notebooks"));
@@ -1064,7 +1193,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       });
       return;
     }
-    const page = validatePageSnapshot(payload, entityID, undefined, false);
+    const page = validatePageSnapshot(payload, entityID, undefined, true);
     const notebook = this.notebookFromRow(this.row(page.notebookId, "notebooks"));
     let notebookID = page.notebookId;
     if (!notebook || notebook.deletedAt) {
@@ -1073,9 +1202,8 @@ export class SQLiteNoteStoreEngine implements NoteStore {
         : createNotebook("Recovered page");
       const savedNotebook = sanitizeNotebook(recoveredNotebook);
       this.upsertNotebookDirect(savedNotebook);
-      // Keep the recovery parent available to the normal sync drain. The
-      // conflict page itself stays local until the user edits it, but a later
-      // queued page edit can now safely reference this parent.
+      // Keep both the recovery parent and page in the normal sync drain so all
+      // devices expose the same recoverable copy.
       this.queueOperation({
         entityType: "notebook",
         entityId: savedNotebook.id,
@@ -1085,7 +1213,15 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       });
       notebookID = savedNotebook.id;
     }
-    this.upsertPageDirect({ ...page, id: id(), notebookId: notebookID, title: conflictTitle(page.title, MAX_PAGE_TITLE), revision: 0, deletedAt: null, conflictOf: entityID, updatedAt: now() });
+    const recoveredPage = sanitizePage({ ...page, id: id(), notebookId: notebookID, title: conflictTitle(page.title, MAX_PAGE_TITLE), revision: 0, deletedAt: null, conflictOf: entityID, updatedAt: now() });
+    this.upsertPageDirect(recoveredPage);
+    this.queueOperation({
+      entityType: "page",
+      entityId: recoveredPage.id,
+      baseRevision: 0,
+      action: "upsert",
+      payload: toWirePage(recoveredPage) as unknown as Record<string, unknown>,
+    });
   }
 
   private upsertPageDirect(page: NotePage): void {

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LEGACY_API_URL } from "../src/auth";
 import { accountNamespace } from "../src/storage";
-import { clonePage, createPage, createNotebook, isUUID, requireUUID } from "../src/models";
+import { clonePage, createPage, createNotebook, isUUID, pageImageDataBytes, requireUUID, toWirePage } from "../src/models";
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -41,5 +41,26 @@ describe("local identity and canonical models", () => {
     const copy = clonePage(page);
     copy.strokes[0]!.points[0]!.x = 9;
     expect(page.strokes[0]!.points[0]!.x).toBe(1);
+  });
+
+  it("clones safe page images and keeps legacy wire payloads byte stable", () => {
+    const notebook = createNotebook();
+    const page = createPage(notebook.id);
+    page.conflictOf = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    page.images = [{ id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", src: "data:image/png;base64,AAAA", x: 1, y: 2, width: 30, height: 40 }];
+    const copy = clonePage(page);
+    copy.images![0]!.x = 9;
+    expect(page.images![0]!.x).toBe(1);
+    expect(pageImageDataBytes(page.images![0]!.src)).toBe(3);
+    expect(pageImageDataBytes("data:image/svg+xml;base64,AAAA")).toBeNull();
+    expect(toWirePage(page)).toMatchObject({ conflictOf: page.conflictOf, images: page.images });
+
+    const legacy = { ...page };
+    delete legacy.images;
+    delete legacy.order;
+    delete legacy.conflictOf;
+    expect(JSON.stringify(toWirePage(legacy))).not.toContain("images");
+    expect(JSON.stringify(toWirePage(legacy))).not.toContain("order");
+    expect(JSON.stringify(toWirePage(legacy))).not.toContain("conflictOf");
   });
 });

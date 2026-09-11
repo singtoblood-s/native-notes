@@ -25,8 +25,16 @@ export async function removeGuestData(): Promise<void> {
       });
     }
     if (navigator.storage?.getDirectory) {
+      let root: FileSystemDirectoryHandle | null = null;
       try {
-        const root = await navigator.storage.getDirectory();
+        // OPFS can be present but unavailable in WebKit private/embedded
+        // contexts. IndexedDB cleanup above is authoritative; this optional
+        // cache cleanup must not block login when the root cannot be opened.
+        root = await navigator.storage.getDirectory();
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "NotFoundError") root = null;
+      }
+      if (root) try {
         const directory = await root.getDirectoryHandle("notepad");
         for (const suffix of ["", "-wal", "-shm", "-journal"]) {
           try { await directory.removeEntry(`${namespace}.sqlite3${suffix}`); }

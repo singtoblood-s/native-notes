@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getPanBounds, MAX_HISTORY_POINTS, MOBILE_FIT_GUTTER, PAN_MARGIN, PaperCanvas, worldPointAt } from "../src/canvas";
+import { getPanBounds, MAX_HISTORY_POINTS, MOBILE_FIT_GUTTER, PAN_MARGIN, PaperCanvas, renderPagePreview, worldPointAt } from "../src/canvas";
 
 function pointer(type: string, props: Record<string, unknown>): PointerEvent {
   const event = new Event(type, { bubbles: true, cancelable: true }) as PointerEvent;
@@ -51,16 +51,38 @@ beforeEach(() => {
 afterEach(() => { document.body.innerHTML = ""; vi.unstubAllGlobals(); });
 
 describe("PaperCanvas pointer contract", () => {
+  it("renders bounded page previews with the page aspect ratio and ink", () => {
+    const preview = document.createElement("canvas");
+    const context = {
+      setTransform: vi.fn(), clearRect: vi.fn(), fillRect: vi.fn(), save: vi.fn(), restore: vi.fn(),
+      beginPath: vi.fn(), moveTo: vi.fn(), lineTo: vi.fn(), stroke: vi.fn(), arc: vi.fn(), fill: vi.fn(),
+    } as unknown as CanvasRenderingContext2D;
+    Object.defineProperty(preview, "getContext", { configurable: true, value: () => context });
+    renderPagePreview(preview, {
+      width: 1024,
+      height: 1366,
+      background: "blank",
+      strokes: [{ id: "preview", color: 0xff252429, width: 3, points: [
+        { x: 10, y: 20, pressure: 0.5, time: 0, tiltX: null, tiltY: null },
+        { x: 50, y: 60, pressure: 0.5, time: 1, tiltX: null, tiltY: null },
+      ] }],
+    }, 256);
+    expect(preview.width).toBe(256);
+    expect(preview.height).toBe(342);
+    expect(preview.style.aspectRatio).toBe("1024 / 1366");
+    expect(context.stroke).toHaveBeenCalled();
+  });
+
   it("keeps point times monotonic across stale coalesced samples and pointerup", () => {
     const { canvas, changes, canvasController } = setup();
     canvas.dispatchEvent(pointer("pointerdown", { timeStamp: 100, clientX: 10 }));
-    canvas.dispatchEvent(pointer("pointermove", { timeStamp: 140, getCoalescedEvents: () => [
+    canvas.dispatchEvent(pointer("pointermove", { timeStamp: 140, clientX: 35, getCoalescedEvents: () => [
       pointer("pointermove", { timeStamp: 130, clientX: 20 }),
       pointer("pointermove", { timeStamp: 120, clientX: 30 }),
     ] }));
     canvas.dispatchEvent(pointer("pointerup", { timeStamp: 110, clientX: 40 }));
-    expect(changes.mock.lastCall![0][0].points.map((point: { time: number }) => point.time)).toEqual([0, 30, 30, 30]);
-    expect(changes.mock.lastCall![0][0].points.map((point: { x: number }) => point.x)).toEqual([20, 40, 60, 80]);
+    expect(changes.mock.lastCall![0][0].points.map((point: { time: number }) => point.time)).toEqual([0, 30, 30, 40, 40]);
+    expect(changes.mock.lastCall![0][0].points.map((point: { x: number }) => point.x)).toEqual([20, 40, 60, 70, 80]);
     canvasController.destroy();
   });
 
@@ -206,14 +228,15 @@ describe("PaperCanvas pointer contract", () => {
     expect(canvasController.hasUndo).toBe(false);
   });
 
-  it("drops a cancelled pen stroke without emitting a save", () => {
+  it("commits sampled ink when the browser cancels a pen contact", () => {
     const { canvas, changes, canvasController } = setup();
     canvas.dispatchEvent(pointer("pointerdown", { timeStamp: 10 }));
     expect(canvasController.isInputActive).toBe(true);
     canvas.dispatchEvent(pointer("pointermove", { timeStamp: 15, clientX: 120 }));
     canvas.dispatchEvent(pointer("pointercancel", { timeStamp: 16 }));
     expect(canvasController.isInputActive).toBe(false);
-    expect(changes).not.toHaveBeenCalled();
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(changes.mock.lastCall![0][0].points).toHaveLength(2);
   });
 
   it("ignores palm touch while a pen stroke is active", () => {
@@ -248,6 +271,32 @@ describe("PaperCanvas pointer contract", () => {
     canvasController.destroy();
   });
 
+  it("forwards one-finger flow touches to the page scroll axis while keeping pinch available", () => {
+    const { canvas, viewport, canvasController } = setup();
+    canvasController.setNavigationMode("continuous");
+    const down = pointer("pointerdown", { pointerId: 90, pointerType: "touch", clientX: 300, clientY: 300 });
+    canvas.dispatchEvent(down);
+    expect(down.defaultPrevented).toBe(true);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 90, pointerType: "touch", clientX: 300, clientY: 200 }));
+    expect(viewport.scrollTop).toBe(100);
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 90, pointerType: "touch", clientX: 300, clientY: 200 }));
+    canvasController.setNavigationMode("horizontal");
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 91, pointerType: "touch", clientX: 300, clientY: 300 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 91, pointerType: "touch", clientX: 200, clientY: 300 }));
+    expect(viewport.scrollLeft).toBe(100);
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 91, pointerType: "touch", clientX: 200, clientY: 300 }));
+
+    const outerFlow = document.createElement("div");
+    document.body.append(outerFlow);
+    canvasController.setNavigationMode("continuous", outerFlow);
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 92, pointerType: "touch", clientX: 300, clientY: 300 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 92, pointerType: "touch", clientX: 300, clientY: 200 }));
+    expect(outerFlow.scrollTop).toBe(100);
+    expect(viewport.scrollTop).toBe(100);
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 92, pointerType: "touch", clientX: 300, clientY: 200 }));
+    canvasController.destroy();
+  });
+
   it("gives pen hover and contact priority over pending and remaining palm touch", () => {
     const { canvas, paper, changes, canvasController } = setup();
     const before = transformOf(paper);
@@ -269,27 +318,49 @@ describe("PaperCanvas pointer contract", () => {
     canvasController.destroy();
   });
 
-  it("cancels input on lost capture, window blur, and hidden visibility", () => {
+  it("keeps a pen stroke through lost capture and finishes it on an outside pointerup", () => {
     const { canvas, paper, changes, canvasController } = setup();
     const before = transformOf(paper);
-    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 70, pointerType: "pen" }));
-    canvas.dispatchEvent(pointer("lostpointercapture", { pointerId: 70, pointerType: "pen" }));
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 70, pointerType: "pen", timeStamp: 10 }));
+    canvas.dispatchEvent(pointer("lostpointercapture", { pointerId: 70, pointerType: "pen", timeStamp: 11 }));
+    expect(canvasController.isInputActive).toBe(true);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 70, pointerType: "pen", timeStamp: 12, clientX: 500 }));
+    document.dispatchEvent(pointer("pointerup", { pointerId: 70, pointerType: "pen", timeStamp: 13, clientX: 500 }));
     expect(canvasController.isInputActive).toBe(false);
-    canvas.dispatchEvent(pointer("pointermove", { pointerId: 70, pointerType: "pen", clientX: 500 }));
-    canvas.dispatchEvent(pointer("pointerup", { pointerId: 70, pointerType: "pen", clientX: 500 }));
-    expect(changes).not.toHaveBeenCalled();
-    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 71, pointerType: "touch", clientX: 300, clientY: 300 }));
-    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 72, pointerType: "touch", clientX: 500, clientY: 300 }));
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(changes.mock.lastCall![0][0].points.length).toBeGreaterThan(1);
+    expect(transformOf(paper)).toEqual(before);
+    canvasController.destroy();
+  });
+
+  it("preserves sampled ink when focus or visibility interrupts a pen contact", () => {
+    const { canvas, changes, canvasController } = setup();
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 71, pointerType: "pen", timeStamp: 10 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 71, pointerType: "pen", timeStamp: 15, clientX: 150 }));
     window.dispatchEvent(new Event("blur"));
     expect(canvasController.isInputActive).toBe(false);
+    expect(changes).toHaveBeenCalledTimes(1);
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 71, pointerType: "touch", clientX: 300, clientY: 300 }));
     Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
-    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 73, pointerType: "pen" }));
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 73, pointerType: "pen", timeStamp: 20 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 73, pointerType: "pen", timeStamp: 25, clientX: 180 }));
     document.dispatchEvent(new Event("visibilitychange"));
     expect(canvasController.isInputActive).toBe(false);
-    canvas.dispatchEvent(pointer("pointermove", { pointerId: 73, pointerType: "pen", clientX: 500 }));
-    canvas.dispatchEvent(pointer("pointerup", { pointerId: 73, pointerType: "pen", clientX: 500 }));
-    expect(transformOf(paper)).toEqual(before);
+    expect(changes).toHaveBeenCalledTimes(2);
     Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    canvasController.destroy();
+  });
+
+  it("ignores a late pointerup after an iPad pointer id is reused", () => {
+    const { canvas, changes, canvasController } = setup();
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 80, pointerType: "pen", timeStamp: 100, clientX: 10 }));
+    canvas.dispatchEvent(pointer("lostpointercapture", { pointerId: 80, pointerType: "pen", timeStamp: 110 }));
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 80, pointerType: "pen", timeStamp: 200, clientX: 20 }));
+    expect(changes).toHaveBeenCalledTimes(1);
+    document.dispatchEvent(pointer("pointerup", { pointerId: 80, pointerType: "pen", timeStamp: 150, clientX: 30 }));
+    expect(changes).toHaveBeenCalledTimes(1);
+    document.dispatchEvent(pointer("pointerup", { pointerId: 80, pointerType: "pen", timeStamp: 220, clientX: 40 }));
+    expect(changes).toHaveBeenCalledTimes(2);
     canvasController.destroy();
   });
 

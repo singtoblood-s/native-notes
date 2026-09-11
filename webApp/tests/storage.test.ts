@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createNotebook, createPage, Notebook, PullChange, SyncOperation } from "../src/models";
+import { createNotebook, createPage, Notebook, PullChange, SyncOperation, toWirePayload } from "../src/models";
 import { SQLiteNoteStoreEngine } from "../src/storage";
 
 const pageID = "11111111-1111-4111-8111-111111111111";
@@ -25,8 +25,11 @@ describe("conflict recovery storage", () => {
     const page = createPage(notebookID);
     page.id = pageID;
     page.strokes = [{ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", color: 0xff000000, width: 2, points: [0, 30, 10].map((time, x) => ({ x, y: x * 2, pressure: 0.5, time, tiltX: null, tiltY: null })) }];
-    const queueOperation = vi.fn(() => "queued");
-    const fake = { db: { exec: vi.fn() }, row: vi.fn(() => null), pageFromRow: vi.fn(() => null), query: vi.fn(() => []), queueOperation } as unknown as SQLiteNoteStoreEngine;
+    const queueOperation = vi.fn((operation: { payload: typeof page }) => {
+      void operation;
+      return "queued";
+    });
+    const fake = { db: { exec: vi.fn() }, row: vi.fn(() => null), pageFromRow: vi.fn(() => null), query: vi.fn(() => []), nextPageOrderDirect: vi.fn(() => 0), queueOperation } as unknown as SQLiteNoteStoreEngine;
     const method = (SQLiteNoteStoreEngine.prototype as unknown as {
       savePageRow: (this: SQLiteNoteStoreEngine, value: typeof page, queue: boolean) => unknown;
     }).savePageRow;
@@ -179,6 +182,8 @@ describe("conflict recovery storage", () => {
     const parent = parentCall[0];
     expect(parent).toMatchObject({ entityType: "notebook", baseRevision: 0, action: "upsert" });
     expect(parent.entityId).toBe(parent.payload.id);
+    const pageCall = (queueOperation.mock.calls as unknown as Array<[{ entityType: string; entityId: string; payload: { formatVersion: number; conflictOf: string } }]>)[1]!;
+    expect(pageCall[0]).toMatchObject({ entityType: "page", payload: { formatVersion: 2, conflictOf: pageID } });
     const recoveredPage = (upsertPageDirect.mock.calls as unknown as Array<[{ notebookId: string }]>)[0]![0];
     expect(recoveredPage.notebookId).toBe(parent.entityId);
   });
@@ -286,5 +291,155 @@ describe("conflict recovery storage", () => {
     method.call(fake, "page", pageID, pageOperation().payload, "remote update while local edit is pending", 10);
 
     expect(insert).not.toHaveBeenCalled();
+  });
+
+  it("preserves embedded images and conflict metadata through local validation", () => {
+    const page = createPage(notebookID, "Image page");
+    page.id = pageID;
+    page.conflictOf = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    page.images = [{ id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", src: "data:image/png;base64,AAAA", x: 10, y: 20, width: 300, height: 200 }];
+    const queueOperation = vi.fn((operation: { payload: typeof page }) => {
+      void operation;
+      return "queued";
+    });
+    const dbExec = vi.fn();
+    const fake = { db: { exec: dbExec }, row: vi.fn(() => null), pageFromRow: vi.fn(() => null), query: vi.fn(() => []), nextPageOrderDirect: vi.fn(() => 0), queueOperation } as unknown as SQLiteNoteStoreEngine;
+    const method = (SQLiteNoteStoreEngine.prototype as unknown as { savePageRow: (this: SQLiteNoteStoreEngine, value: typeof page, queue: boolean) => unknown }).savePageRow;
+
+    method.call(fake, page, true);
+    const queued = queueOperation.mock.calls[0]![0] as { payload: typeof page };
+    expect(queued.payload.images).toEqual(page.images);
+    expect(queued.payload.conflictOf).toBe(page.conflictOf);
+    expect(queued.payload.formatVersion).toBe(2);
+    expect(() => method.call(fake, { ...page, images: [{ ...page.images![0]!, src: "data:image/svg+xml;base64,AAAA" }] }, true)).toThrow("Page image data is invalid");
+    expect(dbExec).toHaveBeenCalled();
+  });
+
+  it("does not rewrite an old sending payload when validating a retry", () => {
+    const page = createPage(notebookID, "Legacy");
+    page.id = pageID;
+    const raw = JSON.stringify({ ...page, images: undefined, order: undefined, conflictOf: undefined });
+    const operationFromRow = (SQLiteNoteStoreEngine.prototype as unknown as { operationFromRow: (this: SQLiteNoteStoreEngine, row: Record<string, unknown>) => SyncOperation | null }).operationFromRow;
+    const restored = operationFromRow.call({} as SQLiteNoteStoreEngine, {
+      op_id: "33333333-3333-4333-8333-333333333333",
+      entity_type: "page",
+      entity_id: pageID,
+      base_revision: 0,
+      action: "upsert",
+      payload: raw,
+      created_at: page.updatedAt,
+      state: "sending",
+    });
+    expect(restored).not.toBeNull();
+    expect(JSON.stringify(toWirePayload(restored!))).toBe(raw);
+  });
+
+  it("migrates an old local conflict page into one idempotent queued operation", () => {
+    const page = pageOperation().payload as unknown as ReturnType<typeof createPage>;
+    page.conflictOf = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    page.revision = 0;
+    const notebook = createNotebook("Recovered page");
+    notebook.id = notebookID;
+    const queued = new Set<string>();
+    const queueOperation = vi.fn((operation: { entityId: string }) => { queued.add(operation.entityId); return "queued"; });
+    const fake = Object.assign(Object.create(SQLiteNoteStoreEngine.prototype), {
+      query: vi.fn((sql: string, args?: unknown[]) => {
+        if (sql.includes("FROM pages WHERE revision")) return [{ id: page.id, json: JSON.stringify(page) }];
+        if (sql.includes("FROM outbox") && args?.[0]) return queued.has(String(args[0])) ? [{ value: 1 }] : [];
+        return [];
+      }),
+      row: vi.fn(() => ({ json: JSON.stringify(notebook), revision: notebook.revision })),
+      notebookFromRow: vi.fn(() => notebook),
+      queueOperation,
+    }) as SQLiteNoteStoreEngine;
+    const method = (SQLiteNoteStoreEngine.prototype as unknown as { migrateUnqueuedConflictCopies: (this: SQLiteNoteStoreEngine) => boolean }).migrateUnqueuedConflictCopies;
+
+    expect(method.call(fake)).toBe(true);
+    expect(method.call(fake)).toBe(false);
+    expect(queueOperation).toHaveBeenCalledTimes(2);
+    expect(queueOperation.mock.calls.map(([operation]) => operation.entityId)).toEqual([notebookID, page.id]);
+  });
+
+  it("appends new pages while preserving legacy order when an old page is edited", () => {
+    const legacy = createPage(notebookID, "Page 1");
+    legacy.id = pageID;
+    legacy.order = undefined;
+    const nextPageOrderDirect = vi.fn(() => 9);
+    const dbExec = vi.fn();
+    const row = vi.fn(() => ({ json: JSON.stringify(legacy), revision: legacy.revision }));
+    const pageFromRow = vi.fn(() => legacy);
+    const fake = {
+      db: { exec: dbExec },
+      row,
+      pageFromRow,
+      query: vi.fn(() => []),
+      nextPageOrderDirect,
+    } as unknown as SQLiteNoteStoreEngine;
+    const method = (SQLiteNoteStoreEngine.prototype as unknown as { savePageRow: (this: SQLiteNoteStoreEngine, value: typeof legacy, queue: boolean) => unknown }).savePageRow;
+
+    method.call(fake, { ...legacy, title: "Renamed" }, false);
+    const edited = JSON.parse((dbExec.mock.calls[0]![0] as { bind: unknown[] }).bind[4] as string) as typeof legacy;
+    expect(edited.order).toBeUndefined();
+    expect(nextPageOrderDirect).not.toHaveBeenCalled();
+
+    const fresh = createPage(notebookID, "Page 10");
+    fresh.id = "66666666-6666-4666-8666-666666666666";
+    row.mockReturnValue(null as never);
+    pageFromRow.mockReturnValue(null as never);
+    method.call(fake, fresh, false);
+    const appended = JSON.parse((dbExec.mock.calls[1]![0] as { bind: unknown[] }).bind[4] as string) as typeof fresh;
+    expect(appended.order).toBe(9);
+    expect(appended.formatVersion).toBe(2);
+  });
+
+  it("sorts pages deterministically without renaming tied pages", async () => {
+    const pages = [
+      { ...createPage(notebookID, "Page 10"), id: "77777777-7777-4777-8777-777777777777", order: undefined },
+      { ...createPage(notebookID, "Page 2"), id: "88888888-8888-4888-8888-888888888888", order: undefined },
+      { ...createPage(notebookID, "Renamed"), id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", order: 2 },
+      { ...createPage(notebookID, "Renamed again"), id: "99999999-9999-4999-8999-999999999999", order: 2 },
+    ];
+    const fake = {
+      query: vi.fn(() => pages.map((page) => ({ page }))),
+      pageFromRow: vi.fn((row: { page: typeof pages[number] }) => row.page),
+    } as unknown as SQLiteNoteStoreEngine;
+    const listed = await (SQLiteNoteStoreEngine.prototype.listPages.call(fake, notebookID));
+    expect(listed.map((page) => page.id)).toEqual([
+      "88888888-8888-4888-8888-888888888888",
+      "77777777-7777-4777-8777-777777777777",
+      "99999999-9999-4999-8999-999999999999",
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    ]);
+  });
+
+  it("keeps page images and order when importing an archive", async () => {
+    const notebook = createNotebook("Archive notebook");
+    const page = createPage(notebook.id, "Image page");
+    page.formatVersion = 2;
+    page.order = 3;
+    page.images = [{ id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", src: "data:image/png;base64,AAAA", x: 4, y: 8, width: 120, height: 90 }];
+    const saveNotebookRow = vi.fn();
+    const savePageRow = vi.fn();
+    const fake = {
+      accountKey: "guest",
+      query: vi.fn(() => []),
+      transaction: vi.fn(async (body: () => unknown) => body()),
+      saveNotebookRow,
+      savePageRow,
+    } as unknown as SQLiteNoteStoreEngine;
+    const imported = await SQLiteNoteStoreEngine.prototype.importArchive.call(fake, {
+      version: 1,
+      exportedAt: "2026-01-01T00:00:00Z",
+      account: "guest",
+      notebooks: [notebook],
+      pages: [page],
+    });
+    expect(imported).toEqual({ notebooks: 1, pages: 1 });
+    expect(savePageRow).toHaveBeenCalledWith(expect.objectContaining({
+      formatVersion: 2,
+      order: 3,
+      images: page.images,
+      conflictOf: undefined,
+    }), true);
   });
 });

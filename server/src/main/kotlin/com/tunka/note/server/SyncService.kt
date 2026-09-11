@@ -1,9 +1,11 @@
 package com.tunka.note.server
 
 import com.tunka.note.shared.INK_FORMAT_VERSION
+import com.tunka.note.shared.PAGE_METADATA_FORMAT_VERSION
 import com.tunka.note.shared.InkStroke
 import com.tunka.note.shared.NotePage
 import com.tunka.note.shared.Notebook
+import com.tunka.note.shared.PageImage
 import com.tunka.note.shared.PageBackground
 import com.tunka.note.shared.PushRequest
 import com.tunka.note.shared.PushResponse
@@ -18,14 +20,20 @@ import com.tunka.note.shared.PullResponse
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.jsonObject
 import java.time.Instant
 import java.util.UUID
 
 const val MAX_PUSH_OPERATIONS = 100
-const val MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
+const val MAX_PAYLOAD_BYTES = 32 * 1024 * 1024
 const val MAX_STROKES = 10_000
 const val MAX_POINTS = 200_000
+const val MAX_PAGE_IMAGES = 100
+const val MAX_PAGE_IMAGE_BYTES = 2 * 1024 * 1024
+const val MAX_PAGE_IMAGE_BYTES_TOTAL = 10 * 1024 * 1024
 
 data class HttpFailure(val status: Int, val code: String, override val message: String) : RuntimeException(message)
 
@@ -159,7 +167,21 @@ class SyncService(private val database: ServerDatabase) {
                 if (!UUID_PATTERN.matches(page.notebookId)) throw HttpFailure(400, "invalid_notebook_id", "Invalid notebook ID")
                 if (page.title.length > 500 || page.text.length > 1_000_000) throw HttpFailure(400, "page_too_large", "Page text or title is too large")
                 if (page.width !in 1.0..10_000.0 || page.height !in 1.0..10_000.0) throw HttpFailure(400, "invalid_page_size", "Page size is invalid")
-                if (page.formatVersion != INK_FORMAT_VERSION) throw HttpFailure(400, "unsupported_format", "Unsupported ink format")
+                if (page.formatVersion != INK_FORMAT_VERSION && page.formatVersion != PAGE_METADATA_FORMAT_VERSION) throw HttpFailure(400, "unsupported_format", "Unsupported ink format")
+                page.order?.let { if (it < 0) throw HttpFailure(400, "invalid_page_order", "Page order is invalid") }
+                page.conflictOf?.let {
+                    if (!UUID_PATTERN.matches(it)) throw HttpFailure(400, "invalid_conflict_id", "Invalid conflict page ID")
+                }
+                if ((page.images.isNotEmpty() || page.order != null || page.conflictOf != null) && page.formatVersion != PAGE_METADATA_FORMAT_VERSION) {
+                    throw HttpFailure(400, "unsupported_format", "Page images and order require the newer page format")
+                }
+                if (operation.action == SyncAction.UPSERT && page.formatVersion < PAGE_METADATA_FORMAT_VERSION) {
+                    val currentPage = connection.findDocument(userId, "page", operation.entityId)
+                        ?.let { decode<NotePage>(wireJson.parseToJsonElement(it.payload)) }
+                    if ((currentPage?.formatVersion ?: 0) >= PAGE_METADATA_FORMAT_VERSION) {
+                        throw HttpFailure(409, "legacy_format", "Refresh this page before editing it")
+                    }
+                }
                 val notebook = connection.findDocument(userId, "notebook", page.notebookId)
                 if (notebook == null) throw HttpFailure(400, "notebook_not_found", "Notebook does not exist")
                 if (notebook.deleted && operation.action == SyncAction.UPSERT) {
@@ -186,6 +208,14 @@ class SyncService(private val database: ServerDatabase) {
                     }
                 }
                 if (points > MAX_POINTS) throw HttpFailure(413, "too_many_points", "Page has too many points")
+                if (page.images.size > MAX_PAGE_IMAGES) throw HttpFailure(400, "invalid_images", "Page images are invalid")
+                val imageIds = HashSet<String>(page.images.size)
+                var imageBytes = 0
+                page.images.forEach { image ->
+                    validateImage(image, imageIds)
+                    imageBytes += pageImageDataBytes(image.src)
+                    if (imageBytes > MAX_PAGE_IMAGE_BYTES_TOTAL) throw HttpFailure(413, "images_too_large", "Page images are too large")
+                }
             }
         }
     }
@@ -209,9 +239,19 @@ class SyncService(private val database: ServerDatabase) {
                     updatedAt = now,
                     deletedAt = if (operation.action == SyncAction.DELETE) original.deletedAt ?: now else original.deletedAt,
                 )
-                Triple(wireJson.encodeToString(value), operation.action == SyncAction.DELETE || value.deletedAt != null, now)
+                Triple(canonicalPagePayload(value), operation.action == SyncAction.DELETE || value.deletedAt != null, now)
             }
         }
+    }
+
+    private fun canonicalPagePayload(value: NotePage): String {
+        val fields = wireJson.encodeToJsonElement(value).jsonObject.toMutableMap()
+        // Keep optional metadata absent for legacy pages. Older clients require
+        // that shape and would otherwise reject a normal page on pull.
+        if (value.images.isEmpty()) fields.remove("images")
+        if (value.order == null) fields.remove("order")
+        if (value.conflictOf == null) fields.remove("conflictOf")
+        return JsonObject(fields).toString()
     }
 
     private inline fun <reified T> decode(payload: JsonElement): T =
@@ -224,6 +264,26 @@ class SyncService(private val database: ServerDatabase) {
 
     private fun requireUuid(value: String) {
         if (!UUID_PATTERN.matches(value)) throw HttpFailure(400, "invalid_id", "Invalid stroke ID")
+    }
+
+    private fun validateImage(image: PageImage, ids: HashSet<String>) {
+        if (!UUID_PATTERN.matches(image.id) || !ids.add(image.id)) throw HttpFailure(400, "invalid_image_id", "Invalid image ID")
+        if (!image.x.isFinite() || !image.y.isFinite() || !image.width.isFinite() || !image.height.isFinite() ||
+            image.x !in -100_000.0..100_000.0 || image.y !in -100_000.0..100_000.0 ||
+            image.width <= 0.0 || image.width > 10_000.0 || image.height <= 0.0 || image.height > 10_000.0) {
+            throw HttpFailure(400, "invalid_image_bounds", "Page image bounds are invalid")
+        }
+        val bytes = pageImageDataBytes(image.src)
+        if (bytes <= 0 || bytes > MAX_PAGE_IMAGE_BYTES) throw HttpFailure(400, "invalid_image", "Page image data is invalid")
+    }
+
+    private fun pageImageDataBytes(value: String): Int {
+        val match = PAGE_IMAGE_DATA_URL.matchEntire(value) ?: return 0
+        val encoded = match.groupValues[2]
+        if (encoded.isEmpty() || encoded.length % 4 != 0) return 0
+        val padding = if (encoded.endsWith("==")) 2 else if (encoded.endsWith('=')) 1 else 0
+        val bytes = encoded.length / 4 * 3 - padding
+        return if (bytes > 0 && bytes <= Int.MAX_VALUE) bytes else 0
     }
 
     private fun entityType(value: String) = when (value) {
@@ -261,5 +321,6 @@ class SyncService(private val database: ServerDatabase) {
 
     companion object {
         private val UUID_PATTERN = Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}")
+        private val PAGE_IMAGE_DATA_URL = Regex("data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]*={0,2})", RegexOption.IGNORE_CASE)
     }
 }

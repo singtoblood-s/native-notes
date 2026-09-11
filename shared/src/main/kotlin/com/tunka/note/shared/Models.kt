@@ -6,6 +6,7 @@ import kotlinx.serialization.json.JsonElement
 import java.util.UUID
 
 const val INK_FORMAT_VERSION = 1
+const val PAGE_METADATA_FORMAT_VERSION = 2
 
 @Serializable
 data class Notebook(
@@ -43,6 +44,16 @@ data class InkStroke(
 )
 
 @Serializable
+data class PageImage(
+    val id: String,
+    val src: String,
+    val x: Double,
+    val y: Double,
+    val width: Double,
+    val height: Double,
+)
+
+@Serializable
 data class NotePage(
     val id: String,
     val notebookId: String,
@@ -56,6 +67,9 @@ data class NotePage(
     val revision: Long = 0,
     val updatedAt: String,
     val deletedAt: String? = null,
+    val images: List<PageImage> = emptyList(),
+    val order: Long? = null,
+    val conflictOf: String? = null,
 )
 
 @Serializable

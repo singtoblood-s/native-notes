@@ -5,6 +5,7 @@ import com.tunka.note.shared.AuthResponse
 import com.tunka.note.shared.InkStroke
 import com.tunka.note.shared.NotePage
 import com.tunka.note.shared.Notebook
+import com.tunka.note.shared.PageImage
 import com.tunka.note.shared.PushRequest
 import com.tunka.note.shared.PushStatus
 import com.tunka.note.shared.SyncAction
@@ -164,6 +165,59 @@ class ServerTest {
     }
 
     @Test
+    fun pageImagesRoundTripAndLegacyEditsCannotDropMetadata() {
+        val directory = createTempDirectory("inknote-images")
+        val path = directory.resolve("notes.db")
+        try {
+            ServerDatabase(path).use { database ->
+                val auth = AuthService(database)
+                val user = auth.register(AuthRequest("images@example.com", "images-strong"), "client")
+                val sync = SyncService(database)
+                val notebookId = "00000000-0000-4000-8000-000000000030"
+                val pageId = "00000000-0000-4000-8000-000000000031"
+                val stamp = "2026-01-01T00:00:00Z"
+                val notebook = Notebook(notebookId, "Notebook", stamp, stamp)
+                sync.push(user.user.id, PushRequest(listOf(operation("00000000-0000-4000-8000-000000000032", SyncEntityType.NOTEBOOK, notebookId, 0, notebook))))
+                val image = PageImage("00000000-0000-4000-8000-000000000033", "data:image/png;base64,AAAA", 12.0, 24.0, 320.0, 240.0)
+                val page = NotePage(
+                    id = pageId,
+                    notebookId = notebookId,
+                    title = "Image page",
+                    text = "",
+                    formatVersion = 2,
+                    updatedAt = stamp,
+                    images = listOf(image),
+                    order = 4,
+                    conflictOf = "00000000-0000-4000-8000-000000000034",
+                )
+                val created = sync.push(user.user.id, PushRequest(listOf(operation("00000000-0000-4000-8000-000000000035", SyncEntityType.PAGE, pageId, 0, page))))
+                assertEquals(PushStatus.ACKED, created.results.single().status)
+                val pulled = sync.pull(user.user.id, 1, 100).changes.single().payload.let { json.decodeFromJsonElement<NotePage>(it) }
+                assertEquals(listOf(image), pulled.images)
+                assertEquals(4, pulled.order)
+                assertEquals(page.conflictOf, pulled.conflictOf)
+
+                val legacyEdit = NotePage(pageId, notebookId, "Legacy edit", "", updatedAt = stamp)
+                val legacyResult = sync.push(user.user.id, PushRequest(listOf(operation("00000000-0000-4000-8000-000000000036", SyncEntityType.PAGE, pageId, 1, legacyEdit)))).results.single()
+                assertEquals(PushStatus.REJECTED, legacyResult.status)
+                assertEquals("legacy_format", legacyResult.code)
+
+                val legacyPageId = "00000000-0000-4000-8000-000000000037"
+                val legacyPage = NotePage(legacyPageId, notebookId, "Legacy", "", updatedAt = stamp)
+                val legacyCreated = sync.push(user.user.id, PushRequest(listOf(operation("00000000-0000-4000-8000-000000000038", SyncEntityType.PAGE, legacyPageId, 0, legacyPage)))).results.single()
+                assertEquals(PushStatus.ACKED, legacyCreated.status)
+                val legacyPayload = sync.pull(user.user.id, 2, 100).changes.single().payload.jsonObject
+                assertTrue("images" !in legacyPayload)
+                assertTrue("order" !in legacyPayload)
+                assertTrue("conflictOf" !in legacyPayload)
+            }
+        } finally {
+            path.deleteIfExists()
+            directory.deleteIfExists()
+        }
+    }
+
+    @Test
     fun httpRoutesReturnCorsAndBoundedErrorEnvelope() {
         val directory = createTempDirectory("inknote-http")
         val path = directory.resolve("notes.db")
@@ -184,7 +238,7 @@ class ServerTest {
                 }
                 assertEquals(HttpStatusCode.BadRequest, invalid.status)
                 assertTrue(invalid.bodyAsText().contains("invalid_password"))
-                val oversized = "{\"operations\":[]}" + " ".repeat(4 * 1024 * 1024)
+                val oversized = "{\"operations\":[]}" + " ".repeat(36 * 1024 * 1024)
                 val bounded = client.post("/v1/sync/push") {
                     header(HttpHeaders.Authorization, "Bearer ${session.sessionToken}")
                     contentType(ContentType.Application.Json)

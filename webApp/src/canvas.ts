@@ -5,6 +5,8 @@ export type CanvasTool =
   | { kind: "eraser"; width: number }
   | { kind: "hand" };
 
+export type CanvasNavigationMode = "continuous" | "horizontal" | "paged";
+
 interface ActiveStroke {
   pointerID: number;
   stroke: InkStroke;
@@ -13,7 +15,32 @@ interface ActiveStroke {
 
 export interface CanvasPoint { x: number; y: number; }
 
+/** An image positioned in page coordinates, rendered below ink. */
+export interface CanvasImage {
+  id: string;
+  src: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface CanvasPreviewPage {
+  width: number;
+  height: number;
+  background: PageBackground;
+  strokes: readonly InkStroke[];
+  images?: readonly CanvasImage[];
+}
+
 interface TouchPointer extends CanvasPoint {}
+
+interface CachedImage {
+  src: string;
+  element: HTMLImageElement;
+  ready: boolean;
+  failed: boolean;
+}
 
 export interface PanBounds {
   minX: number;
@@ -98,11 +125,38 @@ export interface CanvasCallbacks {
   onZoom: (scale: number) => void;
 }
 
+const previewStates = new WeakMap<HTMLCanvasElement, PreviewState>();
+
+interface PreviewState extends CanvasPreviewPage {
+  images: CanvasImage[];
+  maxWidth: number;
+  imageCache: Map<string, CachedImage>;
+}
+
+/** Render a bounded, non-interactive page thumbnail for continuous/book views. */
+export function renderPagePreview(canvas: HTMLCanvasElement, page: CanvasPreviewPage, maxWidth = 320): void {
+  const width = finite(page.width) && page.width > 0 ? page.width : 1;
+  const height = finite(page.height) && page.height > 0 ? page.height : 1;
+  const state: PreviewState = {
+    width,
+    height,
+    background: page.background,
+    strokes: page.strokes,
+    images: normalizeCanvasImages(page.images ?? []),
+    maxWidth: finite(maxWidth) && maxWidth > 0 ? maxWidth : 320,
+    imageCache: new Map(),
+  };
+  previewStates.set(canvas, state);
+  drawPagePreview(canvas, state);
+}
+
 /** A page-coordinate Pencil/pen canvas with high-DPI rendering and touch pan. */
 export class PaperCanvas {
   private readonly canvas: HTMLCanvasElement;
   private readonly paper: HTMLElement;
   private readonly viewport: HTMLElement;
+  /** The outer flow container used for one-finger continuous/book scrolling. */
+  private scrollViewport: HTMLElement;
   private readonly context: CanvasRenderingContext2D;
   private readonly staticCanvas: HTMLCanvasElement;
   private readonly staticContext: CanvasRenderingContext2D;
@@ -117,6 +171,8 @@ export class PaperCanvas {
   private eraserPointerID: number | null = null;
   private renderedPointCount = 0;
   private touchPointers = new Map<number, TouchPointer>();
+  /** Some browsers can lose capture before dispatching the matching pointerup. */
+  private lostCapturePointers = new Set<number>();
   /** Pen hover/contact takes priority over touch navigation on writing tools. */
   private penPointers = new Set<number>();
   private panLast: TouchPointer | null = null;
@@ -138,11 +194,15 @@ export class PaperCanvas {
   private lastViewportSize: { width: number; height: number } | null = null;
   private activeFrame: number | null = null;
   private resizeObserver: ResizeObserver | null = null;
+  private images: CanvasImage[] = [];
+  private imageCache = new Map<string, CachedImage>();
+  private navigationMode: CanvasNavigationMode = "paged";
 
   constructor(canvas: HTMLCanvasElement, paper: HTMLElement, viewport: HTMLElement, callbacks: CanvasCallbacks) {
     this.canvas = canvas;
     this.paper = paper;
     this.viewport = viewport;
+    this.scrollViewport = viewport;
     this.callbacks = callbacks;
     const context = canvas.getContext("2d");
     if (!context) throw new Error("This browser cannot create a 2D canvas.");
@@ -153,14 +213,14 @@ export class PaperCanvas {
     this.staticContext = staticContext;
     // The canvas owns all touch gestures. This also prevents browser navigation
     // and native page scrolling from stealing a pen/pinch sequence.
-    this.viewport.style.touchAction = "none";
-    this.paper.style.touchAction = "none";
-    this.canvas.style.touchAction = "none";
+    this.updateTouchAction();
     this.canvas.addEventListener("pointerdown", this.handlePointerDown, { passive: false });
     this.canvas.addEventListener("pointermove", this.handlePointerMove, { passive: false });
     this.canvas.addEventListener("pointerup", this.handlePointerUp, { passive: false });
     this.canvas.addEventListener("pointercancel", this.handlePointerCancel, { passive: false });
-    this.canvas.addEventListener("lostpointercapture", this.handlePointerCancel);
+    this.canvas.addEventListener("lostpointercapture", this.handleLostPointerCapture);
+    document.addEventListener("pointerup", this.handleDocumentPointerUp, { passive: false });
+    document.addEventListener("pointercancel", this.handleDocumentPointerCancel, { passive: false });
     this.canvas.addEventListener("pointerover", this.handlePenPresence);
     this.canvas.addEventListener("pointerenter", this.handlePenPresence);
     this.canvas.addEventListener("pointerout", this.handlePointerOut);
@@ -177,20 +237,37 @@ export class PaperCanvas {
     }
   }
 
-  setPage(pageID: string, width: number, height: number, background: PageBackground, strokes: InkStroke[]): void {
-    this.cancelActiveInput(false);
+  setPage(pageID: string, width: number, height: number, background: PageBackground, strokes: InkStroke[], images: readonly CanvasImage[] = []): void {
+    // Navigating to another page intentionally abandons the old page's live
+    // contact; normal interruptions preserve any sampled ink.
+    this.cancelActiveInput(false, false);
     const dimensionsChanged = this.width !== width || this.height !== height;
     const newPage = pageID !== this.pageKey;
     this.pageKey = pageID;
     this.width = width;
     this.height = height;
     this.background = background;
+    this.replaceImages(images);
     this.paper.style.width = `${width}px`;
     this.paper.style.height = `${height}px`;
     if (dimensionsChanged || newPage) this.resizeCanvas(false);
     this.setStrokes(strokes, newPage, false);
     if (newPage || dimensionsChanged) this.fitToWidth();
     this.render();
+  }
+
+  /** Replace page images without changing the ink or page navigation state. */
+  setImages(images: readonly CanvasImage[]): void {
+    this.replaceImages(images);
+    this.render();
+  }
+
+  /** Route one-finger flow touches to the surrounding scroll container. */
+  setNavigationMode(mode: CanvasNavigationMode, scrollViewport?: HTMLElement): void {
+    this.navigationMode = mode;
+    if (scrollViewport) this.scrollViewport = scrollViewport;
+    this.clearTouchNavigation();
+    this.updateTouchAction();
   }
 
   setStrokes(strokes: InkStroke[], resetHistory = false, render = true): void {
@@ -208,7 +285,7 @@ export class PaperCanvas {
   }
 
   setTool(tool: CanvasTool): void {
-    if (this.isInputActive || this.touchPointers.size > 0) this.cancelActiveInput();
+    if (this.isInputActive || this.touchPointers.size > 0) this.cancelActiveInput(true, true);
     this.tool = tool;
     this.canvas.style.cursor = tool.kind === "hand" ? "grab" : "crosshair";
   }
@@ -306,7 +383,7 @@ export class PaperCanvas {
   fitToViewport(): void { this.fitToWidth(); }
 
   destroy(): void {
-    this.cancelActiveInput();
+    this.cancelActiveInput(false, false);
     window.removeEventListener("resize", this.handleResize);
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
@@ -314,7 +391,9 @@ export class PaperCanvas {
     this.canvas.removeEventListener("pointermove", this.handlePointerMove);
     this.canvas.removeEventListener("pointerup", this.handlePointerUp);
     this.canvas.removeEventListener("pointercancel", this.handlePointerCancel);
-    this.canvas.removeEventListener("lostpointercapture", this.handlePointerCancel);
+    this.canvas.removeEventListener("lostpointercapture", this.handleLostPointerCapture);
+    document.removeEventListener("pointerup", this.handleDocumentPointerUp);
+    document.removeEventListener("pointercancel", this.handleDocumentPointerCancel);
     this.canvas.removeEventListener("pointerover", this.handlePenPresence);
     this.canvas.removeEventListener("pointerenter", this.handlePenPresence);
     this.canvas.removeEventListener("pointerout", this.handlePointerOut);
@@ -376,6 +455,10 @@ export class PaperCanvas {
   private readonly handlePointerDown = (event: PointerEvent): void => {
     event.preventDefault();
     this.markPenPointer(event);
+    // A browser can report a new contact after losing capture on the previous
+    // one without sending its pointerup. Preserve that partial stroke before
+    // accepting the new contact, including a touch used to resume page flow.
+    if (this.active && this.tool.kind !== "hand" && this.lostCapturePointers.has(this.active.pointerID)) this.commitActiveStroke();
     if (event.pointerType === "touch" || this.tool.kind === "hand") {
       if (this.active || this.eraserBefore) return;
       if (event.pointerType === "mouse" && event.button !== 0) return;
@@ -411,6 +494,11 @@ export class PaperCanvas {
   private readonly handlePointerMove = (event: PointerEvent): void => {
     event.preventDefault();
     this.markPenPointer(event);
+    if (this.active?.pointerID === event.pointerId && isStalePointerEvent(event, this.active.startedAt)) return;
+    if (this.active?.pointerID === event.pointerId) {
+      this.addPoints(event);
+      return;
+    }
     if (event.pointerType === "touch" || this.touchPointers.has(event.pointerId)) {
       if (this.active || this.eraserBefore) return;
       if (!this.touchPointers.has(event.pointerId)) return;
@@ -425,20 +513,25 @@ export class PaperCanvas {
         this.offsetY += point.y - this.panLast.y;
         this.panLast = point;
         this.applyPan();
+      } else if (values.length === 1 && this.navigationMode !== "paged") {
+        this.scrollWithTouch(values[0]!);
       }
       return;
     }
-    if (!this.active || this.active.pointerID !== event.pointerId) {
-      if (this.eraserPointerID === event.pointerId) this.eraseAt(this.pagePoint(event));
-      return;
-    }
-    this.addPoints(event);
+    if (this.eraserPointerID === event.pointerId) this.eraseAt(this.pagePoint(event));
   };
 
   private readonly handlePointerUp = (event: PointerEvent): void => {
     event.preventDefault();
+    if (this.active?.pointerID === event.pointerId && isStalePointerEvent(event, this.active.startedAt)) return;
+    if (this.active?.pointerID === event.pointerId) {
+      this.addPoints(event);
+      this.commitActiveStroke();
+      return;
+    }
     const penPointer = event.pointerType === "pen" || this.penPointers.has(event.pointerId);
     if (penPointer) this.penPointers.delete(event.pointerId);
+    this.lostCapturePointers.delete(event.pointerId);
     if (event.pointerType === "touch" || this.touchPointers.has(event.pointerId)) {
       if (this.active || this.eraserBefore) return;
       this.endTouchPointer(event.pointerId);
@@ -457,31 +550,61 @@ export class PaperCanvas {
       this.render();
       return;
     }
-    if (!this.active || this.active.pointerID !== event.pointerId) return;
-    this.addPoints(event);
-    const before = cloneStrokes(this.strokes);
-    this.strokes.push(this.active.stroke);
-    // Capture before mutating so undo restores the exact page, including a
-    // single-point tap or an empty stroke.
-    this.pushUndo(before);
-    this.redoStack = [];
-    // Commit just this stroke to the cached page, independent of page length.
-    this.renderStroke(this.staticContext, this.active.stroke);
-    this.active = null;
-    this.renderVisible();
-    this.callbacks.onChange(cloneStrokes(this.strokes));
   };
 
   private readonly handlePointerCancel = (event: Event): void => {
     const pointerEvent = event as PointerEvent;
+    if (this.active?.pointerID === pointerEvent.pointerId && isStalePointerEvent(pointerEvent, this.active.startedAt)) return;
+    if (this.active?.pointerID === pointerEvent.pointerId) {
+      this.cancelActiveInput(true, true);
+      return;
+    }
     const penPointer = pointerEvent.pointerType === "pen" || this.penPointers.has(pointerEvent.pointerId);
     if (penPointer) this.penPointers.delete(pointerEvent.pointerId);
     if (this.touchPointers.has(pointerEvent.pointerId) || pointerEvent.pointerType === "touch") {
       this.endTouchPointer(pointerEvent.pointerId);
       return;
     }
-    if (this.active?.pointerID === pointerEvent.pointerId || this.eraserPointerID === pointerEvent.pointerId) this.cancelActiveInput();
+    if (this.eraserPointerID === pointerEvent.pointerId) this.cancelActiveInput();
   };
+
+  /**
+   * Losing capture is not itself a cancelled stylus stroke. A browser can
+   * happen just before pointerup while the Pencil is still down; cancelling
+   * here drops the whole character. A later pointerdown recovers a genuinely
+   * orphaned stroke, while explicit page replacement and teardown still discard input.
+   */
+  private readonly handleLostPointerCapture = (event: Event): void => {
+    const pointerEvent = event as PointerEvent;
+    if (this.active?.pointerID === pointerEvent.pointerId && isStalePointerEvent(pointerEvent, this.active.startedAt)) return;
+    if (this.active?.pointerID === pointerEvent.pointerId) {
+      this.lostCapturePointers.add(pointerEvent.pointerId);
+      return;
+    }
+    if (this.touchPointers.has(pointerEvent.pointerId) || pointerEvent.pointerType === "touch") {
+      this.endTouchPointer(pointerEvent.pointerId);
+      return;
+    }
+    if (this.eraserPointerID === pointerEvent.pointerId) this.cancelActiveInput();
+  };
+
+  private readonly handleDocumentPointerUp = (event: Event): void => {
+    const pointerEvent = event as PointerEvent;
+    if (event.target instanceof Node && this.canvas.contains(event.target)) return;
+    if (!this.ownsPointer(pointerEvent.pointerId)) return;
+    this.handlePointerUp(pointerEvent);
+  };
+
+  private readonly handleDocumentPointerCancel = (event: Event): void => {
+    if (event.target instanceof Node && this.canvas.contains(event.target)) return;
+    const pointerEvent = event as PointerEvent;
+    if (!this.ownsPointer(pointerEvent.pointerId)) return;
+    this.handlePointerCancel(event);
+  };
+
+  private ownsPointer(pointerID: number): boolean {
+    return this.active?.pointerID === pointerID || this.eraserPointerID === pointerID || this.touchPointers.has(pointerID);
+  }
 
   private readonly handlePointerOut = (event: Event): void => {
     const pointerEvent = event as PointerEvent;
@@ -490,10 +613,10 @@ export class PaperCanvas {
 
   private readonly handlePenPresence = (event: Event): void => { this.markPenPointer(event as PointerEvent); };
 
-  private readonly handleWindowBlur = (): void => { this.cancelActiveInput(); };
+  private readonly handleWindowBlur = (): void => { this.cancelActiveInput(true, true); };
 
   private readonly handleVisibilityChange = (): void => {
-    if (document.visibilityState === "hidden") this.cancelActiveInput();
+    if (document.visibilityState === "hidden") this.cancelActiveInput(true, true);
   };
 
   private readonly handleContextMenu = (event: MouseEvent): void => {
@@ -508,6 +631,25 @@ export class PaperCanvas {
     if (event.pointerType !== "pen") return;
     this.penPointers.add(event.pointerId);
     if (this.tool.kind !== "hand") this.blockTouchNavigation();
+  }
+
+  private updateTouchAction(): void {
+    // Keep capture deterministic for Pencil input. In flow modes one-finger
+    // touch deltas are forwarded to the scroll container below instead of
+    // relying on browser-specific touch-action negotiation.
+    this.viewport.style.touchAction = "none";
+    this.paper.style.touchAction = "none";
+    this.canvas.style.touchAction = "none";
+  }
+
+  private clearTouchNavigation(): void {
+    const pointers = [...this.touchPointers.keys()];
+    this.touchPointers.clear();
+    this.panLast = null;
+    this.pinchStart = null;
+    for (const pointerID of pointers) {
+      try { this.canvas.releasePointerCapture(pointerID); } catch { /* capture may already be gone */ }
+    }
   }
 
   private blockTouchNavigation(): void {
@@ -592,6 +734,16 @@ export class PaperCanvas {
     this.updateTransform();
   }
 
+  private scrollWithTouch(point: TouchPointer): void {
+    const previous = this.panLast;
+    if (!previous) return;
+    const deltaX = point.x - previous.x;
+    const deltaY = point.y - previous.y;
+    if (this.navigationMode === "continuous") this.scrollViewport.scrollTop -= deltaY;
+    else if (this.navigationMode === "horizontal") this.scrollViewport.scrollLeft -= deltaX;
+    this.panLast = point;
+  }
+
   private applyTransform(nextScale: number, nextOffset: CanvasPoint, notifyZoom: boolean): void {
     const scale = clamp(finite(nextScale) ? nextScale : this.scale, MIN_CANVAS_SCALE, MAX_CANVAS_SCALE);
     const rect = this.viewport.getBoundingClientRect();
@@ -613,11 +765,13 @@ export class PaperCanvas {
     if (notifyZoom) this.callbacks.onZoom(this.scale);
   }
 
-  private cancelActiveInput(render = true): void {
+  private cancelActiveInput(render = true, preserveActiveStroke = false): void {
     const pointers = [...this.touchPointers.keys()];
     if (this.active) pointers.push(this.active.pointerID);
     if (this.eraserPointerID !== null) pointers.push(this.eraserPointerID);
+    const active = this.active;
     this.active = null;
+    this.lostCapturePointers.clear();
     if (this.eraserBefore) this.strokes = cloneStrokes(this.eraserBefore);
     this.eraserBefore = null;
     this.eraserPointerID = null;
@@ -632,6 +786,7 @@ export class PaperCanvas {
       cancelAnimationFrame(this.activeFrame);
       this.activeFrame = null;
     }
+    if (preserveActiveStroke && active?.stroke.points.length) this.commitActiveStroke(active);
     if (render) this.render();
   }
 
@@ -662,7 +817,16 @@ export class PaperCanvas {
     event.preventDefault();
     if (this.isInputActive) return;
     if (!event.ctrlKey && !event.metaKey) {
-      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? this.viewport.clientHeight : 1;
+      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? this.scrollViewport.clientHeight : 1;
+      if (this.navigationMode === "continuous") {
+        this.scrollViewport.scrollLeft += event.deltaX * unit;
+        this.scrollViewport.scrollTop += event.deltaY * unit;
+        return;
+      }
+      if (this.navigationMode === "horizontal") {
+        this.scrollViewport.scrollLeft += (event.deltaX || event.deltaY) * unit;
+        return;
+      }
       this.offsetX -= event.deltaX * unit;
       this.offsetY -= event.deltaY * unit;
       this.applyPan();
@@ -674,8 +838,13 @@ export class PaperCanvas {
 
   private addPoints(event: PointerEvent): void {
     if (!this.active) return;
-    const coalesced = typeof event.getCoalescedEvents === "function" ? event.getCoalescedEvents() : [];
-    const events = coalesced.length > 0 ? coalesced : [event];
+    let coalesced: PointerEvent[] = [];
+    if (typeof event.getCoalescedEvents === "function") {
+      try { coalesced = event.getCoalescedEvents(); } catch { /* A browser can reject after capture changes. */ }
+    }
+    // getCoalescedEvents contains historical samples; the dispatched event is
+    // the newest sample and must be retained for fast Pencil strokes.
+    const events = coalesced.length > 0 ? [...coalesced, event] : [event];
     const rect = this.canvas.getBoundingClientRect();
     for (const sample of events) {
       const position = this.pagePoint(sample, rect);
@@ -701,6 +870,23 @@ export class PaperCanvas {
       }
     }
     this.scheduleActiveRender();
+  }
+
+  private commitActiveStroke(active = this.active): void {
+    if (!active) return;
+    const before = cloneStrokes(this.strokes);
+    this.strokes.push(active.stroke);
+    // Capture before mutating so undo restores the exact page, including a
+    // single-point tap or an empty stroke.
+    this.pushUndo(before);
+    this.redoStack = [];
+    // Commit just this stroke to the cached page, independent of page length.
+    this.renderStroke(this.staticContext, active.stroke);
+    if (this.active === active) this.active = null;
+    this.lostCapturePointers.delete(active.pointerID);
+    this.penPointers.delete(active.pointerID);
+    this.renderVisible();
+    this.callbacks.onChange(cloneStrokes(this.strokes));
   }
 
   private eraseAt(point: { x: number; y: number }): void {
@@ -741,26 +927,42 @@ export class PaperCanvas {
     const ctx = this.staticContext;
     ctx.save();
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    ctx.clearRect(0, 0, this.width, this.height);
-    ctx.fillStyle = "#fffdf7";
-    ctx.fillRect(0, 0, this.width, this.height);
-    ctx.strokeStyle = this.background === "grid" ? "rgba(125, 106, 82, .16)" : "rgba(176, 82, 59, .16)";
-    ctx.lineWidth = 1;
-    const spacing = 36;
-    if (this.background === "ruled") {
-      for (let y = spacing; y < this.height; y += spacing) {
-        ctx.beginPath(); ctx.moveTo(0, y + 0.5); ctx.lineTo(this.width, y + 0.5); ctx.stroke();
-      }
-    } else if (this.background === "grid") {
-      for (let x = spacing; x < this.width; x += spacing) {
-        ctx.beginPath(); ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, this.height); ctx.stroke();
-      }
-      for (let y = spacing; y < this.height; y += spacing) {
-        ctx.beginPath(); ctx.moveTo(0, y + 0.5); ctx.lineTo(this.width, y + 0.5); ctx.stroke();
-      }
+    renderPaperBackground(ctx, this.width, this.height, this.background);
+    for (const image of this.images) {
+      const cached = this.ensureImage(image);
+      if (!cached?.ready) continue;
+      try { ctx.drawImage(cached.element, image.x, image.y, image.width, image.height); } catch { /* an image can be invalidated while loading */ }
     }
-    for (const stroke of this.strokes) this.renderStroke(ctx, stroke);
+    for (const stroke of this.strokes) drawInkStroke(ctx, stroke);
     ctx.restore();
+  }
+
+  private replaceImages(images: readonly CanvasImage[]): void {
+    const next = normalizeCanvasImages(images);
+    this.images = next;
+    const activeIDs = new Set(next.map((image) => image.id));
+    for (const [imageID] of this.imageCache) {
+      if (!activeIDs.has(imageID)) this.imageCache.delete(imageID);
+    }
+  }
+
+  private ensureImage(image: CanvasImage): CachedImage | null {
+    const current = this.imageCache.get(image.id);
+    if (current?.src === image.src) return current;
+    if (typeof Image === "undefined") return null;
+    const element = new Image();
+    const cached: CachedImage = { src: image.src, element, ready: false, failed: false };
+    element.onload = (): void => {
+      cached.ready = true;
+      if (this.imageCache.get(image.id) === cached) this.render();
+    };
+    element.onerror = (): void => {
+      cached.failed = true;
+    };
+    this.imageCache.set(image.id, cached);
+    element.src = image.src;
+    if (element.complete && element.naturalWidth > 0) cached.ready = true;
+    return cached;
   }
 
   private renderVisible(): void {
@@ -790,44 +992,106 @@ export class PaperCanvas {
   }
 
   private renderStroke(context: CanvasRenderingContext2D, stroke: InkStroke): void {
-    const points = stroke.points;
-    const color = stroke.color >>> 0;
-    const alpha = ((color >>> 24) & 0xff) / 255;
-    context.strokeStyle = `rgba(${(color >>> 16) & 0xff}, ${(color >>> 8) & 0xff}, ${color & 0xff}, ${alpha})`;
-    context.fillStyle = context.strokeStyle;
-    context.lineCap = "round";
-    context.lineJoin = "round";
-    if (points.length === 0) return;
-    if (points.length === 1) {
-      const point = points[0]!;
-      context.beginPath();
-      context.arc(point.x, point.y, Math.max(0.25, stroke.width * (0.65 + point.pressure * 0.35) / 2), 0, Math.PI * 2);
-      context.fill();
-      return;
+    drawInkStroke(context, stroke);
+  }
+}
+
+function drawPagePreview(canvas: HTMLCanvasElement, state: PreviewState): void {
+  const scale = Math.min(1, state.maxWidth / state.width);
+  const dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+  canvas.width = Math.max(1, Math.round(state.width * scale * dpr));
+  canvas.height = Math.max(1, Math.round(state.height * scale * dpr));
+  canvas.style.aspectRatio = `${state.width} / ${state.height}`;
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  context.save();
+  context.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+  renderPaperBackground(context, state.width, state.height, state.background);
+  for (const image of state.images) {
+    const cached = ensurePreviewImage(canvas, state, image);
+    if (!cached?.ready) continue;
+    try { context.drawImage(cached.element, image.x, image.y, image.width, image.height); } catch { /* An image may be invalidated while loading. */ }
+  }
+  for (const stroke of state.strokes) drawInkStroke(context, stroke);
+  context.restore();
+}
+
+function ensurePreviewImage(canvas: HTMLCanvasElement, state: PreviewState, image: CanvasImage): CachedImage | null {
+  const current = state.imageCache.get(image.id);
+  if (current?.src === image.src) return current;
+  if (typeof Image === "undefined") return null;
+  const element = new Image();
+  const cached: CachedImage = { src: image.src, element, ready: false, failed: false };
+  element.onload = (): void => {
+    cached.ready = true;
+    if (state.imageCache.get(image.id) === cached && previewStates.get(canvas) === state) drawPagePreview(canvas, state);
+  };
+  element.onerror = (): void => { cached.failed = true; };
+  state.imageCache.set(image.id, cached);
+  element.src = image.src;
+  if (element.complete && element.naturalWidth > 0) cached.ready = true;
+  return cached;
+}
+
+function renderPaperBackground(context: CanvasRenderingContext2D, width: number, height: number, background: PageBackground): void {
+  context.clearRect(0, 0, width, height);
+  context.fillStyle = "#fffdf7";
+  context.fillRect(0, 0, width, height);
+  context.strokeStyle = background === "grid" ? "rgba(125, 106, 82, .16)" : "rgba(176, 82, 59, .16)";
+  context.lineWidth = 1;
+  const spacing = 36;
+  if (background === "ruled") {
+    for (let y = spacing; y < height; y += spacing) {
+      context.beginPath(); context.moveTo(0, y + 0.5); context.lineTo(width, y + 0.5); context.stroke();
     }
-    // One path gives translucent ink uniform opacity at segment joins.
-    // ARGB is already part of the archive and sync format; no schema change.
-    if (alpha < 1) {
-      context.lineWidth = stroke.width;
-      context.beginPath();
-      context.moveTo(points[0]!.x, points[0]!.y);
-      for (const point of points.slice(1)) context.lineTo(point.x, point.y);
-      context.stroke();
-      return;
+  } else if (background === "grid") {
+    for (let x = spacing; x < width; x += spacing) {
+      context.beginPath(); context.moveTo(x + 0.5, 0); context.lineTo(x + 0.5, height); context.stroke();
     }
-    for (let index = 1; index < points.length; index += 1) {
-      const from = points[index - 1]!;
-      const to = points[index]!;
-      context.lineWidth = Math.max(0.5, stroke.width * (0.65 + ((from.pressure + to.pressure) / 2) * 0.35));
-      context.beginPath();
-      context.moveTo(from.x, from.y);
-      context.lineTo(to.x, to.y);
-      context.stroke();
+    for (let y = spacing; y < height; y += spacing) {
+      context.beginPath(); context.moveTo(0, y + 0.5); context.lineTo(width, y + 0.5); context.stroke();
     }
   }
 }
 
-const CANVAS_CHROME_SELECTOR = ".library, .topbar, .editor-toolbar, .page-bar, .stage-foot, .sidebar, .drawer-backdrop, .inspector, .dialog, .paper-viewport, .paper, #ink-canvas, canvas";
+function drawInkStroke(context: CanvasRenderingContext2D, stroke: InkStroke): void {
+  const points = stroke.points;
+  const color = stroke.color >>> 0;
+  const alpha = ((color >>> 24) & 0xff) / 255;
+  context.strokeStyle = `rgba(${(color >>> 16) & 0xff}, ${(color >>> 8) & 0xff}, ${color & 0xff}, ${alpha})`;
+  context.fillStyle = context.strokeStyle;
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  if (points.length === 0) return;
+  if (points.length === 1) {
+    const point = points[0]!;
+    context.beginPath();
+    context.arc(point.x, point.y, Math.max(0.25, stroke.width * (0.65 + point.pressure * 0.35) / 2), 0, Math.PI * 2);
+    context.fill();
+    return;
+  }
+  // One path gives translucent ink uniform opacity at segment joins.
+  // ARGB is already part of the archive and sync format; no schema change.
+  if (alpha < 1) {
+    context.lineWidth = stroke.width;
+    context.beginPath();
+    context.moveTo(points[0]!.x, points[0]!.y);
+    for (const point of points.slice(1)) context.lineTo(point.x, point.y);
+    context.stroke();
+    return;
+  }
+  for (let index = 1; index < points.length; index += 1) {
+    const from = points[index - 1]!;
+    const to = points[index]!;
+    context.lineWidth = Math.max(0.5, stroke.width * (0.65 + ((from.pressure + to.pressure) / 2) * 0.35));
+    context.beginPath();
+    context.moveTo(from.x, from.y);
+    context.lineTo(to.x, to.y);
+    context.stroke();
+  }
+}
+
+const CANVAS_CHROME_SELECTOR = ".library, .topbar, .editor-toolbar, .page-bar, .stage-foot, .sidebar, .drawer-backdrop, .inspector, .dialog, .paper-viewport, .paper-scroll, .page-flow, .flow-page, .paper, #ink-canvas, canvas";
 const TEXT_SELECTION_SELECTOR = "input, textarea, select, [contenteditable]:not([contenteditable=\"false\"])";
 
 function isCanvasChromeTarget(target: EventTarget | null): boolean {
@@ -836,6 +1100,15 @@ function isCanvasChromeTarget(target: EventTarget | null): boolean {
 
 function isTextSelectionTarget(target: EventTarget | null): boolean {
   return target instanceof Element && target.closest(TEXT_SELECTION_SELECTOR) !== null;
+}
+
+function normalizeCanvasImages(images: readonly CanvasImage[]): CanvasImage[] {
+  return images.filter((image) => (
+    typeof image.id === "string" && image.id.length > 0
+    && typeof image.src === "string" && image.src.length > 0
+    && [image.x, image.y, image.width, image.height].every(finite)
+    && image.width > 0 && image.height > 0
+  )).map((image) => ({ ...image }));
 }
 
 function cloneStrokes(strokes: InkStroke[]): InkStroke[] {
@@ -874,6 +1147,9 @@ function segmentDistance(point: { x: number; y: number }, first: StrokePoint, se
 function distance(first: TouchPointer, second: TouchPointer): number { return Math.hypot(first.x - second.x, first.y - second.y); }
 function midpoint(first: TouchPointer, second: TouchPointer): TouchPointer { return { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 }; }
 function finite(value: number): boolean { return Number.isFinite(value); }
+function isStalePointerEvent(event: PointerEvent, startedAt: number): boolean {
+  return finite(event.timeStamp) && event.timeStamp < startedAt;
+}
 function roundTo(value: number, places: number): number {
   const factor = 10 ** places;
   return Math.round(value * factor) / factor;

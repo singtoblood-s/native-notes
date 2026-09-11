@@ -48,6 +48,15 @@ interface InkStroke {
   points: StrokePoint[];
 }
 
+interface PageImage {
+  id: string;
+  src: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 interface PagePayload {
   id: string;
   notebookId: string;
@@ -57,6 +66,9 @@ interface PagePayload {
   width: number;
   height: number;
   strokes: InkStroke[];
+  images: PageImage[];
+  order: number | null;
+  conflictOf: string | null;
   formatVersion: number;
   revision: number;
   updatedAt: string;
@@ -167,6 +179,11 @@ const PULL_CHANGE_OVERHEAD_BYTES = 8 * 1024;
 const MAX_MULTI_OPERATION_BYTES = 3 * 1024 * 1024;
 const MAX_STROKES = 10_000;
 const MAX_POINTS = 200_000;
+const INK_FORMAT_VERSION = 1;
+const PAGE_METADATA_FORMAT_VERSION = 2;
+const MAX_PAGE_IMAGES = 100;
+const MAX_PAGE_IMAGE_BYTES = 2 * 1024 * 1024;
+const MAX_PAGE_IMAGE_BYTES_TOTAL = 10 * 1024 * 1024;
 const MAX_BATCH_STATEMENTS = 45;
 const MAX_SQL_PARAMETERS = 100;
 const MAX_CHUNKS_PER_STATEMENT = Math.floor((MAX_SQL_PARAMETERS - 3) / 4);
@@ -619,7 +636,7 @@ function parseNotebook(value: unknown, expectedId: string): NotebookPayload {
 }
 
 function parsePage(value: unknown, expectedId: string): PagePayload {
-  if (!isRecord(value) || !keysIn(value, ["id", "notebookId", "title", "text", "background", "width", "height", "strokes", "formatVersion", "revision", "updatedAt", "deletedAt"]) ||
+  if (!isRecord(value) || !keysIn(value, ["id", "notebookId", "title", "text", "background", "width", "height", "strokes", "images", "order", "conflictOf", "formatVersion", "revision", "updatedAt", "deletedAt"]) ||
       !hasKeys(value, ["id", "notebookId", "title", "text", "updatedAt"]) ||
       typeof value.id !== "string" || typeof value.notebookId !== "string" || typeof value.title !== "string" ||
       typeof value.text !== "string" || typeof value.updatedAt !== "string") {
@@ -634,10 +651,13 @@ function parsePage(value: unknown, expectedId: string): PagePayload {
   const width = optionalNumber(value.width, 1024);
   const height = optionalNumber(value.height, 1366);
   if (width < 1 || width > 10_000 || height < 1 || height > 10_000) throw new ApiFailure(400, "invalid_page_size", "Page size is invalid");
-  const formatVersion = optionalInteger(value.formatVersion, 1);
-  if (formatVersion !== 1) throw new ApiFailure(400, "unsupported_format", "Unsupported ink format");
+  const formatVersion = optionalInteger(value.formatVersion, INK_FORMAT_VERSION);
+  if (formatVersion !== INK_FORMAT_VERSION && formatVersion !== PAGE_METADATA_FORMAT_VERSION) throw new ApiFailure(400, "unsupported_format", "Unsupported ink format");
   const revision = optionalInteger(value.revision, 0);
   const deletedAt = optionalString(value.deletedAt);
+  const order = value.order === undefined || value.order === null ? null : optionalInteger(value.order);
+  if (order !== null && order < 0) throw new ApiFailure(400, "invalid_page_order", "Page order is invalid");
+  const conflictOf = optionalUUID(value.conflictOf);
   const strokesValue = value.strokes === undefined ? [] : value.strokes;
   if (!Array.isArray(strokesValue)) throw new ApiFailure(400, "invalid_payload", "Note payload is invalid");
   if (strokesValue.length > MAX_STROKES) throw new ApiFailure(413, "too_many_strokes", "Page has too many strokes");
@@ -680,6 +700,33 @@ function parsePage(value: unknown, expectedId: string): PagePayload {
     if (points > MAX_POINTS) throw new ApiFailure(413, "too_many_points", "Page has too many points");
     strokes.push({ id: rawStroke.id, color: rawStroke.color, width: rawStroke.width, points: normalizedPoints });
   }
+  const imagesValue = value.images === undefined ? [] : value.images;
+  if (!Array.isArray(imagesValue) || imagesValue.length > MAX_PAGE_IMAGES) throw new ApiFailure(400, "invalid_images", "Page images are invalid");
+  const imageIds = new Set<string>();
+  let imageBytes = 0;
+  const images: PageImage[] = imagesValue.map((rawImage) => {
+    if (!isRecord(rawImage) || !keysIn(rawImage, ["id", "src", "x", "y", "width", "height"]) ||
+        !hasKeys(rawImage, ["id", "src", "x", "y", "width", "height"]) || typeof rawImage.id !== "string" ||
+        typeof rawImage.src !== "string") {
+      throw new ApiFailure(400, "invalid_image", "Page image is invalid");
+    }
+    if (!UUID_RE.test(rawImage.id) || imageIds.has(rawImage.id)) throw new ApiFailure(400, "invalid_image_id", "Invalid image ID");
+    imageIds.add(rawImage.id);
+    const bytes = pageImageDataBytes(rawImage.src);
+    if (bytes === null || bytes > MAX_PAGE_IMAGE_BYTES) throw new ApiFailure(400, "invalid_image", "Page image data is invalid");
+    imageBytes += bytes;
+    if (imageBytes > MAX_PAGE_IMAGE_BYTES_TOTAL) throw new ApiFailure(413, "images_too_large", "Page images are too large");
+    if (typeof rawImage.x !== "number" || typeof rawImage.y !== "number" || typeof rawImage.width !== "number" || typeof rawImage.height !== "number" ||
+        !Number.isFinite(rawImage.x) || !Number.isFinite(rawImage.y) || !Number.isFinite(rawImage.width) || !Number.isFinite(rawImage.height) ||
+        rawImage.width <= 0 || rawImage.width > 10_000 || rawImage.height <= 0 || rawImage.height > 10_000 ||
+        rawImage.x < -100_000 || rawImage.x > 100_000 || rawImage.y < -100_000 || rawImage.y > 100_000) {
+      throw new ApiFailure(400, "invalid_image_bounds", "Page image bounds are invalid");
+    }
+    return { id: rawImage.id, src: rawImage.src, x: rawImage.x, y: rawImage.y, width: rawImage.width, height: rawImage.height };
+  });
+  if ((images.length > 0 || order !== null || conflictOf !== null) && formatVersion !== PAGE_METADATA_FORMAT_VERSION) {
+    throw new ApiFailure(400, "unsupported_format", "Page images and order require the newer page format");
+  }
   return {
     id: value.id,
     notebookId: value.notebookId,
@@ -689,6 +736,9 @@ function parsePage(value: unknown, expectedId: string): PagePayload {
     width,
     height,
     strokes,
+    images,
+    order,
+    conflictOf,
     formatVersion,
     revision,
     updatedAt: value.updatedAt,
@@ -709,6 +759,25 @@ function optionalString(value: unknown): string | null {
   if (value === undefined || value === null) return null;
   if (typeof value !== "string") throw new ApiFailure(400, "invalid_payload", "Note payload is invalid");
   return value;
+}
+
+function optionalUUID(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || !UUID_RE.test(value)) throw new ApiFailure(400, "invalid_conflict_id", "Invalid conflict page ID");
+  return value;
+}
+
+const PAGE_IMAGE_DATA_URL = /^data:(image\/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]*={0,2})$/i;
+
+function pageImageDataBytes(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const match = PAGE_IMAGE_DATA_URL.exec(value);
+  if (!match) return null;
+  const encoded = match[2]!;
+  if (encoded.length === 0 || encoded.length % 4 !== 0) return null;
+  const padding = encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0;
+  const bytes = encoded.length / 4 * 3 - padding;
+  return bytes > 0 && Number.isSafeInteger(bytes) ? bytes : null;
 }
 
 function optionalNumber(value: unknown, fallback?: number): number {
@@ -735,7 +804,7 @@ function documentKey(entityType: EntityType, entityId: string): string {
 function canonicalPayload(value: NotebookPayload | PagePayload, action: SyncAction, revision: number): { payload: string; deleted: boolean; updatedAt: string } {
   const updatedAt = new Date().toISOString();
   const deletedAt = action === "delete" ? (value.deletedAt ?? updatedAt) : value.deletedAt;
-  const canonical = "notebookId" in value
+  const canonical: JsonRecord = "notebookId" in value
     ? {
         id: value.id,
         notebookId: value.notebookId,
@@ -770,6 +839,18 @@ function canonicalPayload(value: NotebookPayload | PagePayload, action: SyncActi
         deletedAt,
         revision,
       };
+  if ("notebookId" in value) {
+    if (value.images.length > 0) canonical.images = value.images.map((image) => ({
+      id: image.id,
+      src: image.src,
+      x: image.x,
+      y: image.y,
+      width: image.width,
+      height: image.height,
+    }));
+    if (value.order !== null) canonical.order = value.order;
+    if (value.conflictOf !== null) canonical.conflictOf = value.conflictOf;
+  }
   const payload = JSON.stringify(canonical);
   if (textEncoder.encode(payload).byteLength > MAX_PAYLOAD_BYTES) throw new ApiFailure(413, "payload_too_large", "Note payload is too large");
   return { payload, deleted: action === "delete" || deletedAt !== null, updatedAt };
@@ -988,6 +1069,22 @@ async function push(db: D1Database, userId: string, operations: Operation[]): Pr
       plans.push({ kind: "final", operation, requestHash, serverPayloadStorage: current?.storedPayload ?? null, result });
       results.push(result);
       continue;
+    }
+
+    // A pre-image client cannot round-trip image/order metadata it does not
+    // understand. Reject that downgrade before it can overwrite the server
+    // snapshot; format 2 clients can deliberately remove images by sending an
+    // explicit format-2 payload with an empty image list.
+    if (operation.entityType === "page" && operation.action === "upsert" && current && Number((operation.payload as JsonRecord).formatVersion ?? INK_FORMAT_VERSION) < PAGE_METADATA_FORMAT_VERSION) {
+      if (current.payload === null) storedHydrationQueries += 1;
+      const currentPayload = await hydrateDocument(db, userId, current);
+      if (Number(parseStoredPayload(currentPayload).formatVersion ?? INK_FORMAT_VERSION) >= PAGE_METADATA_FORMAT_VERSION) {
+        const result = toPushResult(operation.opId, "rejected", currentRevision, null, null, "legacy_format");
+        plannedByOperation.set(operation.opId, { requestHash, result });
+        plans.push({ kind: "final", operation, requestHash, serverPayloadStorage: null, result });
+        results.push(result);
+        continue;
+      }
     }
 
     const canonical = canonicalPayload(validated.value, operation.action, currentRevision + 1);

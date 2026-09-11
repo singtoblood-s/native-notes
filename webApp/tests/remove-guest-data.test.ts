@@ -49,3 +49,23 @@ it("does not delete anything while an older tab owns the guest database", async 
   await expect(removeGuestData()).rejects.toThrow("Close other NotePad tabs");
   expect(open).not.toHaveBeenCalled();
 });
+
+it("still clears guest preferences when optional OPFS cleanup is unavailable", async () => {
+  const snapshots = new Set(["guest-hash"]);
+  const transaction = { oncomplete: null as null | (() => void), objectStore: () => ({ delete: (key: string) => {
+    snapshots.delete(key);
+    queueMicrotask(() => transaction.oncomplete?.());
+  } }) };
+  vi.stubGlobal("indexedDB", { open: vi.fn(() => {
+    const request = { onsuccess: null as null | (() => void), result: { transaction: () => transaction, close: vi.fn() } };
+    queueMicrotask(() => request.onsuccess?.());
+    return request;
+  }) });
+  vi.stubGlobal("navigator", { locks: { request: async (_name: string, _options: unknown, callback: (lock: object) => Promise<void>) => callback({}) }, storage: {
+    getDirectory: async () => { throw new Error("WebKit OPFS unavailable"); },
+  } });
+  localStorage.setItem("notepad.selection:guest", "old");
+  await expect(removeGuestData()).resolves.toBeUndefined();
+  expect(snapshots).toEqual(new Set());
+  expect(localStorage.getItem("notepad.selection:guest")).toBeNull();
+});

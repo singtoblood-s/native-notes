@@ -36,7 +36,7 @@ import io.ktor.utils.io.readRemaining
 import java.nio.file.Path
 
 private const val MAX_AUTH_BODY = 64 * 1024
-private const val MAX_SYNC_BODY = 4 * 1024 * 1024
+private const val MAX_SYNC_BODY = 36 * 1024 * 1024
 
 private val appJson = Json {
     ignoreUnknownKeys = false

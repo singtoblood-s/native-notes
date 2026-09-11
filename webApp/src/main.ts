@@ -1,15 +1,17 @@
 import "./styles.css";
 import { AuthClient, AuthSession, getEndpoint, setEndpoint, workspaceAccountKey } from "./auth";
-import { PaperCanvas, CanvasTool } from "./canvas";
+import { PaperCanvas, CanvasTool, renderPagePreview } from "./canvas";
 import {
   InkStroke,
   NotePage,
   Notebook,
+  PageImage,
   PageBackground,
   SyncState,
   clonePage,
   createPage,
   createNotebook,
+  id,
   isUUID,
   now,
 } from "./models";
@@ -19,8 +21,13 @@ import { SyncClient } from "./sync";
 import { removeGuestData } from "./remove-guest-data";
 
 const BASE = import.meta.env.BASE_URL;
+const APP_BUILD = "2026.09.11";
 type OfflineCacheStatus = "preparing" | "ready" | "error" | "unsupported" | "development";
 interface SavedSelection { notebookID?: string; pageID?: string; }
+
+type PageViewMode = "continuous" | "horizontal" | "paged";
+type ImageImportContext = { page: NotePage; store: NoteStore; navigation: number; generation: number };
+const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 
 class NotePadApp {
   private readonly root: HTMLElement;
@@ -51,6 +58,33 @@ class NotePadApp {
   private showRecovery = false;
   private view: "library" | "editor" = "library";
   private libraryTab: "documents" | "favorites" | "search" = "documents";
+  private viewMode: PageViewMode = "continuous";
+  private selectedImageID: string | null = null;
+  private imageDrag: { pointerID: number; pageID: string; imageID: string; startX: number; startY: number; originX: number; originY: number } | null = null;
+  private imageResize: { pointerID: number; pageID: string; imageID: string; startX: number; startWidth: number; ratio: number } | null = null;
+  private flowPreviewObserver: IntersectionObserver | null = null;
+  private flowScrollFrame: number | null = null;
+  private flowPointer: {
+    pageID: string;
+    pointerID: number;
+    sourceLeft: number;
+    sourceTop: number;
+    sourceWidth: number;
+    sourceHeight: number;
+  } | null = null;
+  private pendingFlowPointer: {
+    pageID: string;
+    pointerID: number;
+    sourceLeft: number;
+    sourceTop: number;
+    sourceWidth: number;
+    sourceHeight: number;
+    start: PointerEvent;
+    moves: PointerEvent[];
+    end: PointerEvent | null;
+    activation: Promise<void>;
+  } | null = null;
+  private readonly forwardedFlowEvents = new WeakSet<Event>();
   private selectedTool: CanvasTool["kind"] = "pen";
   private readonly toolSettings = {
     pen: { color: 0xff252429, width: 3 },
@@ -152,11 +186,13 @@ class NotePadApp {
 
   private renderShell(): void {
     this.root.innerHTML = shellMarkup(this.auth);
+    this.restoreViewMode();
     const canvas = byId<HTMLCanvasElement>("ink-canvas");
     this.canvas = new PaperCanvas(canvas, byId("paper"), byId("paper-viewport"), {
       onChange: (strokes) => this.handleCanvasChange(strokes),
       onZoom: (scale) => {
         byId("zoom-label").textContent = `${Math.round(scale * 100)}%`;
+        this.updateActiveFlowHeight(scale);
       },
     });
     this.bindEvents();
@@ -166,6 +202,37 @@ class NotePadApp {
     this.renderWorkspaceRecovery();
     this.setOfflineCacheStatus(this.offlineCacheStatus, this.offlineCacheMessage);
     this.syncDrawerState();
+    this.applyViewMode();
+  }
+
+  private viewModeStorageKey(): string { return `notepad.page-view:${this.accountKey()}`; }
+
+  private restoreViewMode(): void {
+    try {
+      const saved = localStorage.getItem(this.viewModeStorageKey());
+      if (saved === "continuous" || saved === "horizontal" || saved === "paged") this.viewMode = saved;
+    } catch { /* Optional device preference. */ }
+  }
+
+  private setViewMode(mode: PageViewMode): void {
+    if (mode !== "continuous" && mode !== "horizontal" && mode !== "paged") return;
+    this.viewMode = mode;
+    try { localStorage.setItem(this.viewModeStorageKey(), mode); } catch { /* Optional device preference. */ }
+    this.applyViewMode();
+    this.renderEditor();
+  }
+
+  private applyViewMode(): void {
+    const selector = document.getElementById("page-view-mode") as HTMLSelectElement | null;
+    if (selector) selector.value = this.viewMode;
+    const viewport = document.getElementById("paper-scroll");
+    const flow = document.getElementById("page-flow");
+    if (!viewport || !flow) return;
+    (this.canvas as PaperCanvas & { setNavigationMode?: (mode: PageViewMode, scrollViewport?: HTMLElement) => void } | null)?.setNavigationMode?.(this.viewMode, viewport);
+    viewport.dataset.viewMode = this.viewMode;
+    flow.dataset.viewMode = this.viewMode;
+    viewport.classList.toggle("is-page-scroll", this.viewMode !== "paged");
+    viewport.classList.toggle("is-horizontal-scroll", this.viewMode === "horizontal");
   }
 
   private bindEvents(): void {
@@ -225,6 +292,21 @@ class NotePadApp {
     onClick("close-inspector", () => { void this.closeDrawers(); });
     onClick("rename-notebook", () => this.openNotebookRename());
     onClick("rename-page", () => { void this.openTextDrawer(true); });
+    onClick("notebook-menu", () => this.toggleQuickMenu("notebook-menu-popup"));
+    onClick("page-menu", () => this.toggleQuickMenu("page-menu-popup"));
+    onClick("insert-image", () => byId<HTMLInputElement>("image-input").click());
+    onClick("paste-image", () => { void this.pasteImageFromClipboard(); });
+    onClick("remove-image", () => { void this.removeSelectedImage(); });
+    onClick("image-left", () => this.nudgeSelectedImage(-12, 0));
+    onClick("image-right", () => this.nudgeSelectedImage(12, 0));
+    onClick("image-up", () => this.nudgeSelectedImage(0, -12));
+    onClick("image-down", () => this.nudgeSelectedImage(0, 12));
+    byId<HTMLInputElement>("image-width").addEventListener("input", (event) => {
+      this.resizeSelectedImage(Number((event.target as HTMLInputElement).value));
+    });
+    byId<HTMLSelectElement>("page-view-mode").addEventListener("change", (event) => {
+      this.setViewMode((event.target as HTMLSelectElement).value as PageViewMode);
+    });
     onClick("sync-button", () => this.sync());
     onClick("library-sync-button", () => this.sync());
     onClick("settings-sync-button", () => this.sync());
@@ -260,10 +342,33 @@ class NotePadApp {
     onClick("keep-page", () => { void this.keepCurrentPage(); });
     onClick("cancel-settings", () => this.closeDialog("settings-dialog"));
     onClick("cancel-notebook", () => this.closeDialog("notebook-dialog"));
+    document.addEventListener("click", (event) => {
+      const target = event.target as HTMLElement | null;
+      const action = target?.closest<HTMLElement>("[data-action]");
+      if (action) {
+        event.preventDefault();
+        event.stopPropagation();
+        void this.handleMenuAction(action.dataset.action ?? "", action.dataset.entity ?? action.dataset.notebook ?? action.dataset.page ?? "");
+        this.closeQuickMenus();
+        return;
+      }
+      if (!target?.closest(".quick-menu, [data-menu-button]")) this.closeQuickMenus();
+    });
     onClick("browse-import", () => byId<HTMLInputElement>("import-input").click());
     onClick("settings-export", () => this.exportArchive());
     onClick("settings-share", () => this.shareArchive());
+    onClick("reload-app", () => { void this.reloadApp(); });
     byId<HTMLInputElement>("import-input").addEventListener("change", (event) => this.importArchive(event));
+    byId<HTMLInputElement>("image-input").addEventListener("change", (event) => { void this.importImageFile(event); });
+    document.addEventListener("paste", this.handlePasteImage);
+    document.addEventListener("pointermove", this.handleImagePointerMove, { passive: false });
+    document.addEventListener("pointerup", this.handleImagePointerUp, { passive: false });
+    document.addEventListener("pointercancel", this.handleImagePointerUp, { passive: false });
+    window.addEventListener("blur", this.handleImagePointerUp);
+    document.addEventListener("pointermove", this.handleFlowPointerMove, { passive: false });
+    document.addEventListener("pointerup", this.handleFlowPointerUp, { passive: false });
+    document.addEventListener("pointercancel", this.handleFlowPointerUp, { passive: false });
+    byId("paper-scroll").addEventListener("scroll", this.handleFlowScroll, { passive: true });
     byId<HTMLInputElement>("search-input").addEventListener("input", (event) => {
       this.search = (event.target as HTMLInputElement).value.trim().toLocaleLowerCase();
       this.renderLists();
@@ -359,6 +464,7 @@ class NotePadApp {
     this.currentPage = currentPage;
     this.renderLists();
     this.renderEditor();
+    if (selectID) this.scrollActiveFlowPageIntoView();
     this.rememberSelection();
     return true;
   }
@@ -434,6 +540,73 @@ class NotePadApp {
     byId("inspector").classList.remove("is-open");
     this.syncDrawerState();
     return true;
+  }
+
+  private async reloadApp(): Promise<void> {
+    if (this.canvasInputActive()) {
+      byId("settings-message").textContent = "Finish the current stroke before reloading.";
+      return;
+    }
+    if (!(await this.flushPendingSave())) return;
+    location.reload();
+  }
+
+  private toggleQuickMenu(id: string): void {
+    const menu = byId(id);
+    this.toggleQuickMenuElement(menu);
+  }
+
+  private toggleQuickMenuElement(menu: HTMLElement): void {
+    const open = menu.hidden;
+    this.closeQuickMenus();
+    menu.hidden = !open;
+    if (open) menu.querySelector<HTMLElement>("button")?.focus();
+  }
+
+  private closeQuickMenus(): void {
+    document.querySelectorAll<HTMLElement>(".quick-menu").forEach((menu) => { menu.hidden = true; });
+  }
+
+  private async handleMenuAction(action: string, entityID: string): Promise<void> {
+    if (!entityID) return;
+    switch (action) {
+      case "rename-notebook":
+        await this.selectNotebookForAction(entityID);
+        this.openNotebookRename();
+        break;
+      case "duplicate-notebook":
+        await this.duplicateNotebook(entityID);
+        break;
+      case "trash-notebook":
+        await this.setNotebookDeleted(entityID, false);
+        break;
+      case "restore-notebook":
+        await this.setNotebookDeleted(entityID, true);
+        break;
+      case "rename-page":
+        await this.selectPageForAction(entityID);
+        await this.openTextDrawer(true);
+        break;
+      case "duplicate-page":
+        await this.duplicatePage(entityID);
+        break;
+      case "trash-page":
+        await this.setPageDeleted(entityID, false);
+        break;
+      case "restore-page":
+        await this.setPageDeleted(entityID, true);
+        break;
+    }
+  }
+
+  private async selectNotebookForAction(id: string): Promise<void> {
+    if (id === this.currentNotebook?.id) return;
+    await this.selectNotebook(id);
+  }
+
+  private async selectPageForAction(id: string): Promise<void> {
+    if (id === this.currentPage?.id) return;
+    await this.selectPage(id);
   }
 
   private openSettings(): void {
@@ -594,7 +767,7 @@ class NotePadApp {
       const shade = [...book.id].reduce((sum, char) => sum + char.charCodeAt(0), 0) % 5;
       const starred = favorites.includes(book.id);
       const date = new Date(modified(book));
-      return `<article class="library-book"><button class="book-open" data-open-book="${book.id}" aria-label="Open notebook ${escapeAttr(book.title)}"><span class="book-cover cover-${shade}"><span class="cover-label"><small>NOTEBOOK</small><strong>${escapeHTML(book.title)}</strong><span>NotePad</span></span></span><span class="book-caption"><strong>${escapeHTML(book.title)}</strong><small>${pages.length} page${pages.length === 1 ? "" : "s"} · ${Number.isFinite(date.getTime()) ? escapeHTML(date.toLocaleDateString(undefined, { month: "short", day: "numeric" })) : ""}</small></span></button><button class="book-star" data-favorite="${book.id}" aria-label="Favorite ${escapeAttr(book.title)}" aria-pressed="${starred}">${starred ? "★" : "☆"}</button></article>`;
+      return `<article class="library-book"><button class="book-open" data-open-book="${book.id}" aria-label="Open notebook ${escapeAttr(book.title)}"><span class="book-cover cover-${shade}"><span class="cover-label"><small>NOTEBOOK</small><strong>${escapeHTML(book.title)}</strong><span>NotePad</span></span></span><span class="book-caption"><strong>${escapeHTML(book.title)}</strong><small>${pages.length} page${pages.length === 1 ? "" : "s"} · ${Number.isFinite(date.getTime()) ? escapeHTML(date.toLocaleDateString(undefined, { month: "short", day: "numeric" })) : ""}</small></span></button><button class="book-star" data-favorite="${book.id}" aria-label="Favorite ${escapeAttr(book.title)}" aria-pressed="${starred}">${starred ? "★" : "☆"}</button><button class="book-menu-button" data-menu-button aria-label="More actions for ${escapeAttr(book.title)}">⋯</button><div class="quick-menu book-quick-menu" hidden><button data-action="rename-notebook" data-entity="${escapeAttr(book.id)}">Rename</button><button data-action="duplicate-notebook" data-entity="${escapeAttr(book.id)}">Duplicate</button><button data-action="trash-notebook" data-entity="${escapeAttr(book.id)}">Move to trash</button></div></article>`;
     }).join("");
     byId("library-books").querySelectorAll<HTMLButtonElement>("[data-open-book]").forEach((button) => button.addEventListener("click", () => { void this.selectNotebook(button.dataset.openBook!); }));
     byId("library-books").querySelectorAll<HTMLButtonElement>("[data-favorite]").forEach((button) => button.addEventListener("click", () => {
@@ -605,6 +778,11 @@ class NotePadApp {
         this.renderLibrary();
       } catch { byId("library-empty").hidden = false; byId("library-empty").textContent = "Could not save favorites on this device."; }
     }));
+    byId("library-books").querySelectorAll<HTMLButtonElement>("[data-menu-button]").forEach((button) => button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const menu = button.parentElement?.querySelector<HTMLElement>(".quick-menu");
+      if (menu) this.toggleQuickMenuElement(menu);
+    }));
   }
 
   private renderLists(): void {
@@ -612,21 +790,39 @@ class NotePadApp {
     const notebookList = byId("notebook-list");
     const notebooks = this.notebooks.filter((notebook) => this.showTrash || !notebook.deletedAt || (this.showRecovery && notebook.id === this.currentNotebook?.id))
       .filter((notebook) => !this.search || notebook.title.toLocaleLowerCase().includes(this.search));
-    notebookList.innerHTML = notebooks.length ? notebooks.map((notebook) => `
-      <button class="nav-row ${notebook.id === this.currentNotebook?.id ? "selected" : ""}" data-notebook="${escapeAttr(notebook.id)}" aria-current="${notebook.id === this.currentNotebook?.id ? "page" : "false"}">
-        <span class="nav-glyph">${notebook.deletedAt ? "◌" : "▱"}</span><span class="nav-copy"><strong>${escapeHTML(notebook.title)}</strong><small>${notebook.id === this.currentNotebook?.id ? `${this.pagesForNotebook(notebook.id)} pages` : "Notebook"}</small></span>
-      </button>`).join("") : `<p class="empty-copy">${this.showTrash ? "Trash is empty." : "Create a notebook to begin."}</p>`;
-    notebookList.querySelectorAll<HTMLButtonElement>("[data-notebook]").forEach((button) => button.addEventListener("click", () => void this.selectNotebook(button.dataset.notebook!)));
+    notebookList.innerHTML = notebooks.length ? notebooks.map((notebook) => {
+      const deleted = Boolean(notebook.deletedAt);
+      return `<div class="nav-row-wrap"><button class="nav-row ${notebook.id === this.currentNotebook?.id ? "selected" : ""}" data-notebook="${escapeAttr(notebook.id)}" aria-current="${notebook.id === this.currentNotebook?.id ? "page" : "false"}">
+        <span class="nav-glyph">${deleted ? "◌" : "▱"}</span><span class="nav-copy"><strong>${escapeHTML(notebook.title)}</strong><small>${notebook.id === this.currentNotebook?.id ? `${this.pagesForNotebook(notebook.id)} pages` : "Notebook"}</small></span>
+      </button><button class="nav-menu-button" data-menu-button aria-label="More actions for ${escapeAttr(notebook.title)}">⋯</button><div class="quick-menu" hidden>
+        ${deleted ? `<button data-action="restore-notebook" data-entity="${escapeAttr(notebook.id)}">Restore notebook</button>` : `<button data-action="rename-notebook" data-entity="${escapeAttr(notebook.id)}">Rename</button><button data-action="duplicate-notebook" data-entity="${escapeAttr(notebook.id)}">Duplicate</button><button data-action="trash-notebook" data-entity="${escapeAttr(notebook.id)}">Move to trash</button>`}
+      </div></div>`;
+    }).join("") : `<p class="empty-copy">${this.showTrash ? "Trash is empty." : "Create a notebook to begin."}</p>`;
+    notebookList.querySelectorAll<HTMLButtonElement>("[data-notebook]:not([data-action])").forEach((button) => button.addEventListener("click", () => void this.selectNotebook(button.dataset.notebook!)));
+    notebookList.querySelectorAll<HTMLButtonElement>("[data-menu-button]").forEach((button) => button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const menu = button.parentElement?.querySelector<HTMLElement>(".quick-menu");
+      if (menu) this.toggleQuickMenuElement(menu);
+    }));
 
     const pageList = byId("page-list");
     const sourcePages = this.showTrash || this.showRecovery || this.search ? this.allPages : this.pages;
     const pages = sourcePages.filter((page) => this.isPageVisible(page))
       .filter((page) => !this.search || `${page.title} ${page.text}`.toLocaleLowerCase().includes(this.search));
-    pageList.innerHTML = pages.length ? pages.map((page) => `
-      <button class="page-row ${page.id === this.currentPage?.id ? "selected" : ""}" data-page="${escapeAttr(page.id)}" aria-current="${page.id === this.currentPage?.id ? "page" : "false"}">
+    pageList.innerHTML = pages.length ? pages.map((page) => {
+      const deleted = this.isPageInTrash(page);
+      return `<div class="nav-row-wrap"><button class="page-row ${page.id === this.currentPage?.id ? "selected" : ""}" data-page="${escapeAttr(page.id)}" aria-current="${page.id === this.currentPage?.id ? "page" : "false"}">
         <span class="page-index">${pages.indexOf(page) + 1}</span><span class="page-copy"><strong>${escapeHTML(page.title || "Untitled page")}</strong><small>${pageNotebookLabel(page, this.notebooks)}${page.text.trim() ? ` · ${escapeHTML(preview(page.text))}` : ` · ${page.strokes.length} strokes`}</small></span>
-      </button>`).join("") : `<p class="empty-copy">${this.showTrash ? "No deleted pages." : this.showRecovery ? "No recovered copies yet." : "No pages yet."}</p>`;
-    pageList.querySelectorAll<HTMLButtonElement>("[data-page]").forEach((button) => button.addEventListener("click", () => void this.selectPage(button.dataset.page!)));
+      </button><button class="nav-menu-button" data-menu-button aria-label="More actions for ${escapeAttr(page.title || "Untitled page")}">⋯</button><div class="quick-menu" hidden>
+        ${deleted ? `<button data-action="restore-page" data-entity="${escapeAttr(page.id)}">Restore page</button>` : `<button data-action="rename-page" data-entity="${escapeAttr(page.id)}">Rename</button><button data-action="duplicate-page" data-entity="${escapeAttr(page.id)}">Duplicate</button><button data-action="trash-page" data-entity="${escapeAttr(page.id)}">Move to trash</button>`}
+      </div></div>`;
+    }).join("") : `<p class="empty-copy">${this.showTrash ? "No deleted pages." : this.showRecovery ? "No recovered copies yet." : "No pages yet."}</p>`;
+    pageList.querySelectorAll<HTMLButtonElement>("[data-page]:not([data-action])").forEach((button) => button.addEventListener("click", () => void this.selectPage(button.dataset.page!)));
+    pageList.querySelectorAll<HTMLButtonElement>("[data-menu-button]").forEach((button) => button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const menu = button.parentElement?.querySelector<HTMLElement>(".quick-menu");
+      if (menu) this.toggleQuickMenuElement(menu);
+    }));
     byId("trash-toggle").classList.toggle("active", this.showTrash);
     byId("trash-toggle").setAttribute("aria-pressed", String(this.showTrash));
     byId("trash-label").textContent = this.showTrash ? "Back to notebook" : "Trash";
@@ -683,6 +879,23 @@ class NotePadApp {
     byId("editor-empty-title").textContent = this.showRecovery ? "No recovered copies" : "Choose a page";
     byId("editor-empty-copy").textContent = this.showRecovery ? "Recovered copies will appear here after a sync conflict." : "Your paper is waiting in the left rail.";
     byId("notebook-name").textContent = this.currentNotebook?.title ?? "No notebook";
+    const notebookMenu = byId<HTMLElement>("notebook-menu-popup");
+    notebookMenu.querySelectorAll<HTMLElement>("[data-notebook]").forEach((button) => { button.dataset.notebook = this.currentNotebook?.id ?? ""; });
+    const notebookMenuTrash = notebookMenu.querySelector<HTMLElement>("[data-action='trash-notebook']");
+    if (notebookMenuTrash) notebookMenuTrash.textContent = this.currentNotebook?.deletedAt ? "Restore notebook" : "Move notebook to trash";
+    if (this.currentNotebook?.deletedAt) {
+      notebookMenu.innerHTML = `<button data-action="restore-notebook" data-entity="${escapeAttr(this.currentNotebook.id)}">Restore notebook</button>`;
+    } else if (this.currentNotebook) {
+      notebookMenu.innerHTML = `<button data-action="rename-notebook" data-entity="${escapeAttr(this.currentNotebook.id)}">Rename notebook</button><button data-action="duplicate-notebook" data-entity="${escapeAttr(this.currentNotebook.id)}">Duplicate notebook</button><button data-action="trash-notebook" data-entity="${escapeAttr(this.currentNotebook.id)}">Move notebook to trash</button>`;
+    }
+    byId<HTMLButtonElement>("notebook-menu").disabled = !this.currentNotebook;
+    const pageMenu = byId<HTMLElement>("page-menu-popup");
+    if (page) {
+      pageMenu.innerHTML = this.showTrash
+        ? `<button data-action="restore-page" data-entity="${escapeAttr(page.id)}">Restore page</button>`
+        : `<button data-action="rename-page" data-entity="${escapeAttr(page.id)}">Rename page</button><button data-action="duplicate-page" data-entity="${escapeAttr(page.id)}">Duplicate page</button><button data-action="trash-page" data-entity="${escapeAttr(page.id)}">Move page to trash</button>`;
+    } else pageMenu.replaceChildren();
+    byId<HTMLButtonElement>("page-menu").disabled = !page;
     byId<HTMLButtonElement>("rename-notebook").disabled = !this.currentNotebook || this.showTrash;
     const notebookAction = byId<HTMLButtonElement>("archive-notebook");
     notebookAction.disabled = !this.currentNotebook;
@@ -712,8 +925,547 @@ class NotePadApp {
     pageAction.setAttribute("aria-label", pageAction.title);
     byId("print-title").textContent = page.title || "Untitled page";
     byId("print-text").textContent = page.text;
-    this.canvas?.setPage(page.id, page.width, page.height, page.background, page.strokes);
+    this.canvas?.setPage(page.id, page.width, page.height, page.background, page.strokes, getPageImages(page));
+    this.renderImageLayer(page);
+    this.renderImageInspector(page);
+    this.applyViewMode();
+    this.renderPageFlow();
     this.updateToolbar();
+  }
+
+  /** Keep every page slot in order while rendering neighbours as bounded previews. */
+  private renderPageFlow(): void {
+    const flow = document.getElementById("page-flow");
+    const activeSlot = document.getElementById("active-page-slot");
+    if (!flow || !activeSlot) return;
+    this.flowPreviewObserver?.disconnect();
+    this.flowPreviewObserver = null;
+    const pages = this.editorPages();
+    const current = this.currentPage;
+    if (!current) {
+      flow.replaceChildren(activeSlot);
+      activeSlot.dataset.flowPage = "";
+      return;
+    }
+    activeSlot.dataset.flowPage = current.id;
+    activeSlot.className = "flow-page active";
+    activeSlot.setAttribute("aria-label", current.title || "Current page");
+    if (this.viewMode === "paged") {
+      flow.replaceChildren(activeSlot);
+      activeSlot.style.height = "";
+      return;
+    }
+    const slots = pages.map((page) => {
+      if (page.id === current.id) return activeSlot;
+      const slot = document.createElement("article");
+      slot.className = "flow-page flow-preview";
+      slot.dataset.flowPage = page.id;
+      slot.tabIndex = 0;
+      slot.setAttribute("aria-label", `Open ${page.title || "Untitled page"}`);
+      const header = document.createElement("header");
+      header.innerHTML = `<span>${escapeHTML(page.title || "Untitled page")}</span><small>${page.text.trim() ? escapeHTML(previewText(page.text)) : `${page.strokes.length} strokes`}</small>`;
+      const canvas = document.createElement("canvas");
+      canvas.className = "flow-preview-canvas";
+      canvas.width = 1;
+      canvas.height = 1;
+      canvas.style.aspectRatio = `${Math.max(1, page.width)} / ${Math.max(1, page.height)}`;
+      canvas.style.height = `${Math.max(1, Math.round(Math.min(360, page.width) * page.height / Math.max(1, page.width)))}px`;
+      canvas.setAttribute("aria-label", `${page.title || "Untitled page"} preview`);
+      slot.append(header, canvas);
+      const renderPreview = (): void => {
+        if (canvas.width > 1) return;
+        const width = Math.max(1, Math.round(Math.min(360, page.width)));
+        canvas.width = width;
+        canvas.height = Math.max(1, Math.round(width * page.height / Math.max(1, page.width)));
+        canvas.style.height = "auto";
+        if (typeof navigator === "undefined" || !/jsdom/i.test(navigator.userAgent)) {
+          renderPagePreview(canvas, { width: page.width, height: page.height, background: page.background, strokes: page.strokes, images: getPageImages(page) }, 320);
+        }
+      };
+      if (typeof IntersectionObserver === "undefined") renderPreview();
+      else {
+        this.flowPreviewObserver ??= new IntersectionObserver((entries) => {
+          for (const entry of entries) if (entry.isIntersecting) (entry.target as HTMLCanvasElement).dispatchEvent(new Event("preview-visible"));
+        }, { root: document.getElementById("paper-scroll"), rootMargin: "500px" });
+        canvas.addEventListener("preview-visible", renderPreview, { once: true });
+        this.flowPreviewObserver.observe(canvas);
+      }
+      // The page header remains a navigation target. Only the actual raster preview
+      // can start a pen/mouse stroke, so a finger can still scroll the page stack.
+      canvas.addEventListener("pointerdown", (event) => this.beginFlowPointer(page.id, event, canvas));
+      slot.addEventListener("click", () => { void this.selectPage(page.id); });
+      slot.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); void this.selectPage(page.id); } });
+      return slot;
+    });
+    const addPage = document.createElement("button");
+    addPage.className = "flow-add-page";
+    addPage.type = "button";
+    addPage.textContent = "＋ Add page";
+    addPage.setAttribute("aria-label", "Add page at end");
+    addPage.disabled = this.showTrash || this.showRecovery;
+    addPage.addEventListener("click", () => { void this.createNewPage(); });
+    flow.replaceChildren(...slots, addPage);
+    this.updateActiveFlowHeight();
+  }
+
+  private updateActiveFlowHeight(scale = this.canvas?.currentScale): void {
+    if (this.viewMode === "paged" || !this.currentPage) return;
+    const slot = document.getElementById("active-page-slot");
+    const scroll = document.getElementById("paper-scroll");
+    if (!slot || !scroll) return;
+    const measuredWidth = slot.getBoundingClientRect().width || slot.clientWidth;
+    const fallbackWidth = this.viewMode === "horizontal"
+      ? Math.min(Math.max(240, window.innerWidth - 60), 900)
+      : Math.max(240, scroll.clientWidth - 40);
+    const fitWidth = Math.max(1, (measuredWidth || fallbackWidth) - (measuredWidth ? 0 : 0));
+    const fitScale = clampNumber(fitWidth / Math.max(1, this.currentPage.width), .25, 1.4);
+    const effectiveScale = Math.max(fitScale, Number.isFinite(scale) ? (scale as number) : fitScale);
+    slot.style.height = `${Math.ceil(this.currentPage.height * effectiveScale + 56)}px`;
+  }
+
+  private readonly handleFlowScroll = (): void => {
+    if (this.viewMode === "paged" || this.flowScrollFrame !== null) return;
+    const requestFrame: (callback: FrameRequestCallback) => number = typeof window.requestAnimationFrame === "function" ? window.requestAnimationFrame.bind(window) : ((callback) => window.setTimeout(() => callback(performance.now()), 0));
+    this.flowScrollFrame = requestFrame(() => {
+      this.flowScrollFrame = null;
+      const scroll = document.getElementById("paper-scroll");
+      if (!scroll || this.canvasInputActive() || this.saveTimer !== null || this.saveInFlight !== null || this.unsavedPageID !== null) return;
+      const rect = scroll.getBoundingClientRect();
+      const center = this.viewMode === "horizontal" ? rect.left + rect.width / 2 : rect.top + rect.height / 2;
+      let nearest: { id: string; distance: number } | null = null;
+      for (const slot of document.querySelectorAll<HTMLElement>("#page-flow > .flow-page[data-flow-page]")) {
+        if (!slot.dataset.flowPage) continue;
+        const slotRect = slot.getBoundingClientRect();
+        const slotCenter = this.viewMode === "horizontal" ? slotRect.left + slotRect.width / 2 : slotRect.top + slotRect.height / 2;
+        const distance = Math.abs(slotCenter - center);
+        if (!nearest || distance < nearest.distance) nearest = { id: slot.dataset.flowPage, distance };
+      }
+      if (nearest && nearest.id !== this.currentPage?.id && nearest.distance < (this.viewMode === "horizontal" ? rect.width : rect.height) * .72) this.activateFlowPage(nearest.id);
+    });
+  };
+
+  private activateFlowPage(pageID: string): void {
+    if (pageID === this.currentPage?.id || this.canvasInputActive()) return;
+    const page = this.pages.find((candidate) => candidate.id === pageID && this.isPageVisible(candidate));
+    if (!page) return;
+    if (this.saveTimer !== null || this.saveInFlight !== null || this.unsavedPageID !== null) {
+      void this.selectPage(pageID);
+      return;
+    }
+    this.navigationGeneration += 1;
+    this.editGeneration += 1;
+    this.currentPage = page;
+    this.selectedImageID = null;
+    this.renderLists();
+    this.renderEditor();
+    this.rememberSelection();
+  }
+
+  private beginFlowPointer(pageID: string, event: PointerEvent, preview: HTMLCanvasElement): void {
+    // Touch belongs to the outer page scroller. Pen and primary mouse input are
+    // the only pointer types that should be forwarded into the active canvas.
+    if (event.pointerType === "touch") return;
+    if (this.showTrash || pageID === this.currentPage?.id || this.selectedTool === "hand" || (event.pointerType !== "pen" && event.button !== 0)) {
+      if (pageID !== this.currentPage?.id) this.activateFlowPage(pageID);
+      return;
+    }
+    const page = this.pages.find((candidate) => candidate.id === pageID && this.isPageVisible(candidate));
+    if (!page || this.canvasInputActive()) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const source = preview.getBoundingClientRect();
+    const mapping = {
+      pageID,
+      pointerID: event.pointerId,
+      sourceLeft: source.left,
+      sourceTop: source.top,
+      sourceWidth: Math.max(1, source.width),
+      sourceHeight: Math.max(1, source.height),
+    };
+    if (this.saveTimer !== null || this.saveInFlight !== null || this.unsavedPageID !== null) {
+      // Selection waits for the current page save. Keep every sample arriving
+      // during that await and replay it against the same preview coordinates.
+      const pending: typeof this.pendingFlowPointer = {
+        ...mapping,
+        start: event,
+        moves: [],
+        end: null,
+        activation: Promise.resolve(),
+      };
+      this.pendingFlowPointer = pending;
+      pending.activation = this.selectPage(pageID).then(() => this.replayPendingFlowPointer(pending));
+      return;
+    }
+    this.activateFlowPage(pageID);
+    this.startFlowPointer(mapping, event);
+  }
+
+  private startFlowPointer(mapping: Omit<NonNullable<NotePadApp["flowPointer"]>, never>, start: PointerEvent, moves: PointerEvent[] = [], end: PointerEvent | null = null): void {
+    if (this.currentPage?.id !== mapping.pageID) return;
+    this.flowPointer = mapping;
+    this.dispatchMappedFlowPointer("pointerdown", start, mapping);
+    for (const move of moves) this.dispatchMappedFlowPointer("pointermove", move, mapping);
+    if (end) {
+      this.flowPointer = null;
+      this.dispatchMappedFlowPointer(end.type === "pointercancel" ? "pointercancel" : "pointerup", end, mapping);
+    }
+  }
+
+  private async replayPendingFlowPointer(pending: NonNullable<NotePadApp["pendingFlowPointer"]>): Promise<void> {
+    if (this.pendingFlowPointer !== pending) return;
+    this.pendingFlowPointer = null;
+    if (this.currentPage?.id !== pending.pageID) return;
+    this.startFlowPointer(pending, pending.start, pending.moves, pending.end);
+  }
+
+  private dispatchMappedFlowPointer(type: "pointerdown" | "pointermove" | "pointerup" | "pointercancel", source: PointerEvent, mapping: NonNullable<NotePadApp["flowPointer"]>): void {
+    const canvas = byId<HTMLCanvasElement>("ink-canvas");
+    const target = canvas.getBoundingClientRect();
+    const ratioX = clampNumber((source.clientX - mapping.sourceLeft) / mapping.sourceWidth, 0, 1);
+    const ratioY = clampNumber((source.clientY - mapping.sourceTop) / mapping.sourceHeight, 0, 1);
+    this.dispatchFlowPointer(type, source, target.left + ratioX * target.width, target.top + ratioY * target.height);
+  }
+
+  private dispatchFlowPointer(type: "pointerdown" | "pointermove" | "pointerup" | "pointercancel", source: PointerEvent, clientX: number, clientY: number): void {
+    const canvas = document.getElementById("ink-canvas");
+    if (!(canvas instanceof HTMLCanvasElement) || typeof PointerEvent === "undefined") return;
+    const forwarded = new PointerEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      pointerId: source.pointerId,
+      pointerType: source.pointerType,
+      isPrimary: source.isPrimary,
+      button: source.button,
+      buttons: source.buttons,
+      clientX,
+      clientY,
+      pressure: source.pressure,
+      tiltX: source.tiltX,
+      tiltY: source.tiltY,
+    });
+    // The document listeners also see bubbling synthetic events. Mark them so
+    // they terminate at the active canvas instead of being forwarded forever.
+    this.forwardedFlowEvents.add(forwarded);
+    canvas.dispatchEvent(forwarded);
+  }
+
+  private readonly handleFlowPointerMove = (event: PointerEvent): void => {
+    if (this.forwardedFlowEvents.has(event)) {
+      this.forwardedFlowEvents.delete(event);
+      return;
+    }
+    const canvas = document.getElementById("ink-canvas");
+    if (event.target === canvas) return;
+    if (this.pendingFlowPointer?.pointerID === event.pointerId) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.pendingFlowPointer.moves.push(event);
+      return;
+    }
+    if (!this.flowPointer || this.flowPointer.pointerID !== event.pointerId) return;
+    event.preventDefault();
+    this.dispatchMappedFlowPointer("pointermove", event, this.flowPointer);
+  };
+
+  private readonly handleFlowPointerUp = (event: PointerEvent): void => {
+    if (this.forwardedFlowEvents.has(event)) {
+      this.forwardedFlowEvents.delete(event);
+      return;
+    }
+    const canvas = document.getElementById("ink-canvas");
+    if (event.target === canvas) {
+      // Pointer capture retargets the native terminal event to the canvas. It
+      // has already committed there, so only release the forwarding marker.
+      if (this.flowPointer?.pointerID === event.pointerId) this.flowPointer = null;
+      return;
+    }
+    if (this.pendingFlowPointer?.pointerID === event.pointerId) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.pendingFlowPointer.end = event;
+      return;
+    }
+    if (!this.flowPointer || this.flowPointer.pointerID !== event.pointerId) return;
+    event.preventDefault();
+    const mapping = this.flowPointer;
+    // Clear before dispatching: the synthetic event bubbles through this same
+    // document listener and must not see an active forwarding session.
+    this.flowPointer = null;
+    this.dispatchMappedFlowPointer(event.type === "pointercancel" ? "pointercancel" : "pointerup", event, mapping);
+  };
+
+  private renderImageLayer(page: NotePage): void {
+    const layer = byId("paper-image-layer");
+    layer.replaceChildren();
+    for (const image of getPageImages(page)) {
+      const object = document.createElement("div");
+      object.className = `paper-image-object${this.selectedImageID === image.id ? " selected" : ""}`;
+      object.dataset.imageId = image.id;
+      object.style.left = `${image.x}px`;
+      object.style.top = `${image.y}px`;
+      object.style.width = `${image.width}px`;
+      object.style.height = `${image.height}px`;
+      object.style.pointerEvents = this.selectedTool === "hand" && !this.showTrash ? "auto" : "none";
+      object.setAttribute("role", "img");
+      object.setAttribute("aria-label", "Inserted image");
+      object.tabIndex = 0;
+      if (this.selectedImageID === image.id && !this.showTrash) {
+        const resize = document.createElement("button");
+        resize.className = "image-resize-handle";
+        resize.type = "button";
+        resize.dataset.imageResize = image.id;
+        resize.setAttribute("aria-label", "Resize image");
+        object.append(resize);
+      }
+      object.addEventListener("pointerdown", (event) => {
+        if (this.showTrash || this.selectedTool !== "hand") return;
+        if (this.imageDrag || this.imageResize) return;
+        const target = event.target as HTMLElement;
+        if (target.closest("[data-image-resize]")) {
+          event.preventDefault();
+          event.stopPropagation();
+          this.selectImage(image.id);
+          this.imageResize = { pointerID: event.pointerId, pageID: page.id, imageID: image.id, startX: event.clientX, startWidth: image.width, ratio: image.height / Math.max(1, image.width) };
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        this.selectImage(image.id);
+        this.imageDrag = { pointerID: event.pointerId, pageID: page.id, imageID: image.id, startX: event.clientX, startY: event.clientY, originX: image.x, originY: image.y };
+      });
+      object.addEventListener("keydown", (event) => {
+        if (event.key === "Delete" || event.key === "Backspace") {
+          event.preventDefault();
+          this.selectedImageID = image.id;
+          void this.removeSelectedImage();
+        }
+      });
+      layer.append(object);
+    }
+    layer.toggleAttribute("hidden", getPageImages(page).length === 0);
+  }
+
+  private renderImageInspector(page: NotePage): void {
+    const images = getPageImages(page);
+    if (this.selectedImageID && !images.some((image) => image.id === this.selectedImageID)) this.selectedImageID = null;
+    const list = byId("image-list");
+    list.innerHTML = images.map((image, index) => `<div class="image-list-row ${image.id === this.selectedImageID ? "selected" : ""}"><button class="image-select" type="button" data-image-select="${escapeAttr(image.id)}"><span>${index + 1}</span><img src="${escapeAttr(image.src)}" alt="" /><strong>Image ${index + 1}</strong></button><button class="image-remove" type="button" data-image-remove="${escapeAttr(image.id)}" aria-label="Remove image ${index + 1}">×</button></div>`).join("");
+    byId("image-empty").toggleAttribute("hidden", images.length > 0);
+    list.querySelectorAll<HTMLButtonElement>("[data-image-select]").forEach((button) => button.addEventListener("click", () => this.selectImage(button.dataset.imageSelect!)));
+    list.querySelectorAll<HTMLButtonElement>("[data-image-remove]").forEach((button) => button.addEventListener("click", () => { this.selectedImageID = button.dataset.imageRemove ?? null; void this.removeSelectedImage(); }));
+    const selected = images.find((image) => image.id === this.selectedImageID);
+    const controls = byId<HTMLElement>("image-controls");
+    controls.hidden = !selected || this.showTrash;
+    if (selected) {
+      byId("selected-image-label").textContent = "Selected image";
+      const width = byId<HTMLInputElement>("image-width");
+      width.value = String(Math.round(selected.width));
+      width.max = String(Math.max(48, Math.round(page.width)));
+    }
+    byId<HTMLButtonElement>("insert-image").disabled = !page || this.showTrash;
+    byId<HTMLButtonElement>("paste-image").disabled = !page || this.showTrash;
+  }
+
+  private selectImage(imageID: string): void {
+    this.selectedImageID = imageID;
+    if (this.currentPage) {
+      this.renderImageLayer(this.currentPage);
+      this.renderImageInspector(this.currentPage);
+    }
+  }
+
+  private resizeSelectedImage(width: number): void {
+    const page = this.currentPage;
+    if (!page || !Number.isFinite(width) || this.showTrash) return;
+    const images = getPageImages(page);
+    const image = images.find((candidate) => candidate.id === this.selectedImageID);
+    if (!image) return;
+    const ratio = image.height / Math.max(1, image.width);
+    image.width = clampNumber(width, 48, page.width);
+    image.height = Math.max(24, image.width * ratio);
+    image.x = Math.min(Math.max(0, image.x), Math.max(0, page.width - image.width));
+    image.y = Math.min(Math.max(0, image.y), Math.max(0, page.height - image.height));
+    this.markImageChanged(page);
+    this.updateImageElement(image);
+    this.scheduleSave(180);
+  }
+
+  private nudgeSelectedImage(dx: number, dy: number): void {
+    const page = this.currentPage;
+    if (!page || !this.selectedImageID || this.showTrash) return;
+    const image = getPageImages(page).find((candidate) => candidate.id === this.selectedImageID);
+    if (!image) return;
+    image.x = clampNumber(image.x + dx, 0, Math.max(0, page.width - image.width));
+    image.y = clampNumber(image.y + dy, 0, Math.max(0, page.height - image.height));
+    this.markImageChanged(page);
+    this.updateImageElement(image);
+    this.scheduleSave(180);
+  }
+
+  private updateImageElement(image: PageImage): void {
+    const object = document.querySelector<HTMLElement>(`[data-image-id="${CSS.escape(image.id)}"]`);
+    if (!object) return;
+    object.style.left = `${image.x}px`;
+    object.style.top = `${image.y}px`;
+    object.style.width = `${image.width}px`;
+    object.style.height = `${image.height}px`;
+  }
+
+  private async removeSelectedImage(): Promise<void> {
+    const page = this.currentPage;
+    if (!page || !this.selectedImageID || this.showTrash) return;
+    const images = getPageImages(page);
+    const next = images.filter((image) => image.id !== this.selectedImageID);
+    if (next.length === images.length) return;
+    setPageImages(page, next);
+    this.selectedImageID = null;
+    this.markImageChanged(page);
+    this.renderImageLayer(page);
+    this.renderImageInspector(page);
+    this.scheduleSave(180);
+  }
+
+  private readonly handleImagePointerMove = (event: PointerEvent): void => {
+    if (this.imageDrag && this.imageDrag.pointerID === event.pointerId) {
+      const page = this.currentPage;
+      if (!page || page.id !== this.imageDrag.pageID) return;
+      const image = getPageImages(page).find((candidate) => candidate.id === this.imageDrag!.imageID);
+      if (!image) return;
+      event.preventDefault();
+      const scale = Math.max(.1, this.canvas?.currentScale ?? 1);
+      image.x = clampNumber(this.imageDrag.originX + (event.clientX - this.imageDrag.startX) / scale, 0, Math.max(0, page.width - image.width));
+      image.y = clampNumber(this.imageDrag.originY + (event.clientY - this.imageDrag.startY) / scale, 0, Math.max(0, page.height - image.height));
+      this.markImageChanged(page);
+      this.updateImageElement(image);
+      this.scheduleSave(180);
+    } else if (this.imageResize && this.imageResize.pointerID === event.pointerId) {
+      const page = this.currentPage;
+      if (!page || page.id !== this.imageResize.pageID) return;
+      const image = getPageImages(page).find((candidate) => candidate.id === this.imageResize!.imageID);
+      if (!image) return;
+      event.preventDefault();
+      const scale = Math.max(.1, this.canvas?.currentScale ?? 1);
+      const width = clampNumber(this.imageResize.startWidth + (event.clientX - this.imageResize.startX) / scale, 48, page.width);
+      image.width = width;
+      image.height = Math.max(24, width * this.imageResize.ratio);
+      image.x = Math.min(image.x, Math.max(0, page.width - image.width));
+      image.y = Math.min(image.y, Math.max(0, page.height - image.height));
+      this.markImageChanged(page);
+      this.updateImageElement(image);
+      this.scheduleSave(180);
+    }
+  };
+
+  private markImageChanged(page: NotePage): void {
+    if (this.currentPage?.id !== page.id) return;
+    this.editGeneration += 1;
+    this.canvas?.setImages(getPageImages(page));
+  }
+
+  private readonly handleImagePointerUp = (event?: Event): void => {
+    if (!(event instanceof PointerEvent)) {
+      this.imageDrag = null;
+      this.imageResize = null;
+      return;
+    }
+    if (this.imageDrag?.pointerID === event.pointerId) this.imageDrag = null;
+    if (this.imageResize?.pointerID === event.pointerId) this.imageResize = null;
+  };
+
+  private readonly handlePasteImage = (event: ClipboardEvent): void => {
+    if (!this.canInsertImage() || isTextEntryTarget(event.target)) return;
+    const item = [...(event.clipboardData?.items ?? [])].find((candidate) => candidate.type.startsWith("image/"));
+    const file = item?.getAsFile();
+    if (!file) return;
+    const context = this.captureImageImportContext();
+    if (!context) return;
+    if (!SUPPORTED_IMAGE_TYPES.has(file.type.toLowerCase())) {
+      event.preventDefault();
+      this.setState({ kind: "error", message: "Unsupported image format. Use PNG, JPEG, WebP, or GIF." });
+      return;
+    }
+    event.preventDefault();
+    void this.addImageFile(file, context);
+  };
+
+  private async pasteImageFromClipboard(): Promise<void> {
+    if (!this.canInsertImage()) return;
+    const context = this.captureImageImportContext();
+    if (!context) return;
+    const clipboard = navigator.clipboard;
+    if (!clipboard || typeof clipboard.read !== "function") {
+      this.setState({ kind: "error", message: "This browser cannot read clipboard images. Use keyboard paste or Insert image." });
+      return;
+    }
+    try {
+      const items = await clipboard.read();
+      if (!this.imageImportContextIsCurrent(context)) return;
+      const item = items.find((candidate) => candidate.types.some((type) => type.startsWith("image/")));
+      const type = item?.types.find((candidate) => candidate.startsWith("image/"));
+      if (!item || !type) {
+        this.setState({ kind: "error", message: "No image is available in the clipboard. Copy a picture, then try again." });
+        return;
+      }
+      if (!SUPPORTED_IMAGE_TYPES.has(type.toLowerCase())) {
+        this.setState({ kind: "error", message: "That clipboard image format is unsupported. Use PNG, JPEG, WebP, or GIF." });
+        return;
+      }
+      const blob = await item.getType(type);
+      const extension = type.split("/")[1] || "png";
+      if (!this.imageImportContextIsCurrent(context)) return;
+      await this.addImageFile(new File([blob], `clipboard.${extension}`, { type }), context);
+    } catch (error) {
+      if (!this.imageImportContextIsCurrent(context)) return;
+      this.setState({ kind: "error", message: error instanceof Error ? `Clipboard image unavailable: ${error.message}` : "Clipboard image unavailable. Use keyboard paste or Insert image." });
+    }
+  }
+
+  private async importImageFile(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = "";
+    if (file) await this.addImageFile(file);
+  }
+
+  private canInsertImage(): boolean {
+    return Boolean(this.auth.session && !this.loginRequired && this.view === "editor" && this.currentPage && !this.showTrash && !this.showRecovery);
+  }
+
+  private captureImageImportContext(): ImageImportContext | null {
+    if (!this.canInsertImage() || !this.currentPage) return null;
+    return { page: this.currentPage, store: this.store, navigation: this.navigationGeneration, generation: this.editGeneration };
+  }
+
+  private imageImportContextIsCurrent(context: ImageImportContext): boolean {
+    return this.canInsertImage() && context.store === this.store && context.page === this.currentPage && context.page.id === this.currentPage?.id && context.navigation === this.navigationGeneration && context.generation === this.editGeneration;
+  }
+
+  private async addImageFile(file: File, expected?: ImageImportContext): Promise<void> {
+    const context = expected ?? this.captureImageImportContext();
+    if (!context || !this.imageImportContextIsCurrent(context)) return;
+    const { page, store, navigation, generation } = context;
+    if (!SUPPORTED_IMAGE_TYPES.has(file.type.toLowerCase())) {
+      this.setState({ kind: "error", message: "Unsupported image format. Use PNG, JPEG, WebP, or GIF." });
+      return;
+    }
+    if (file.size > 12 * 1024 * 1024) {
+      this.setState({ kind: "error", message: "That image is larger than 12 MB." });
+      return;
+    }
+    try {
+      if (!(await this.flushPendingSave())) return;
+      if (!this.imageImportContextIsCurrent(context)) return;
+      const image = await makePageImage(file, page, getPageImages(page).length);
+      if (store !== this.store || navigation !== this.navigationGeneration || this.currentPage !== page || this.currentPage?.id !== page.id || this.editGeneration !== generation || !this.canInsertImage()) return;
+      setPageImages(page, [...getPageImages(page), image]);
+      this.selectedImageID = image.id;
+      this.markImageChanged(page);
+      this.renderImageLayer(page);
+      this.renderImageInspector(page);
+      this.scheduleSave(180);
+    } catch (error) {
+      this.setState({ kind: "error", message: error instanceof Error ? error.message : "Could not insert image" });
+    }
   }
 
   private async deleteCurrentPage(): Promise<void> {
@@ -839,9 +1591,28 @@ class NotePadApp {
     this.view = "editor";
     this.renderLists();
     this.renderEditor();
+    this.scrollActiveFlowPageIntoView();
     this.rememberSelection();
     await this.closeDrawers(false);
     if (navigation !== this.navigationGeneration) return;
+  }
+
+  /** Bring an explicitly selected page into view without changing automatic flow activation. */
+  private scrollActiveFlowPageIntoView(): void {
+    if (this.viewMode === "paged") return;
+    const scroll = document.getElementById("paper-scroll");
+    const flow = document.getElementById("page-flow");
+    const slot = this.currentPage && flow ? [...flow.children].find((candidate) => (candidate as HTMLElement).dataset.flowPage === this.currentPage?.id) as HTMLElement | undefined : undefined;
+    if (!scroll || !slot) return;
+    const adjust = (): void => {
+      if (!slot.isConnected || this.currentPage?.id !== slot.dataset.flowPage) return;
+      const scrollRect = scroll.getBoundingClientRect();
+      const slotRect = slot.getBoundingClientRect();
+      if (this.viewMode === "horizontal") scroll.scrollLeft += slotRect.left - scrollRect.left - Math.max(0, (scrollRect.width - slotRect.width) / 2);
+      else scroll.scrollTop += slotRect.top - scrollRect.top - Math.max(0, (scrollRect.height - slotRect.height) / 2);
+    };
+    adjust();
+    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(adjust);
   }
 
   private async createNotebook(title: string): Promise<void> {
@@ -889,6 +1660,7 @@ class NotePadApp {
       if (duplicate) {
         page.text = source.text;
         page.strokes = clonePage(source).strokes;
+        setPageImages(page, cloneImages(getPageImages(source), true));
       }
     }
     try {
@@ -1019,6 +1791,7 @@ class NotePadApp {
       }));
     } catch { /* Tool preferences are optional; note durability uses SQLite. */ }
     this.updateToolbar();
+    if (this.currentPage) this.renderImageLayer(this.currentPage);
   }
 
   private restoreToolSettings(): void {
@@ -1058,6 +1831,97 @@ class NotePadApp {
     if (retry) {
       retry.disabled = state.kind === "syncing";
       retry.setAttribute("aria-label", `Sync now · ${label}`);
+    }
+  }
+
+  private async duplicatePage(pageID: string): Promise<void> {
+    if (!(await this.flushPendingSave())) return;
+    const source = this.allPages.find((page) => page.id === pageID) ?? await this.store.getPage(pageID);
+    if (!source || source.deletedAt || this.showTrash || this.showRecovery) return;
+    const copy = createPage(source.notebookId, `${source.title || "Untitled page"} (copy)`);
+    copy.background = source.background;
+    copy.width = source.width;
+    copy.height = source.height;
+    copy.text = source.text;
+    copy.strokes = clonePage(source).strokes;
+    setPageImages(copy, cloneImages(getPageImages(source), true));
+    try {
+      const result = await this.store.savePage(copy);
+      if (result.status === "failed") {
+        this.setState({ kind: "error", message: result.message ?? "Could not duplicate page" });
+        return;
+      }
+      this.coordinator.notifyLocalWrite();
+      this.view = "editor";
+      await this.reload(copy.id);
+      await this.closeDrawers();
+    } catch (error) {
+      this.setState({ kind: "error", message: error instanceof Error ? error.message : "Could not duplicate page" });
+    }
+  }
+
+  private async duplicateNotebook(notebookID: string): Promise<void> {
+    if (!(await this.flushPendingSave())) return;
+    if (this.showTrash || this.showRecovery) return;
+    const source = this.notebooks.find((notebook) => notebook.id === notebookID) ?? await this.store.getNotebook(notebookID);
+    if (!source || source.deletedAt) return;
+    const copy = createNotebook(`${source.title || "Untitled notebook"} (copy)`);
+    try {
+      const notebookResult = await this.store.saveNotebook(copy);
+      if (notebookResult.status === "failed") throw new Error(notebookResult.message ?? "Could not duplicate notebook");
+      this.coordinator.notifyLocalWrite();
+      const pages = await this.store.listPages(source.id);
+      let firstPageID: string | undefined;
+      for (const sourcePage of pages) {
+        const page = createPage(copy.id, sourcePage.title);
+        page.background = sourcePage.background;
+        page.width = sourcePage.width;
+        page.height = sourcePage.height;
+        page.text = sourcePage.text;
+        page.strokes = clonePage(sourcePage).strokes;
+        setPageImages(page, cloneImages(getPageImages(sourcePage), true));
+        const pageResult = await this.store.savePage(page);
+        if (pageResult.status === "failed") throw new Error(pageResult.message ?? "Could not duplicate notebook page");
+        this.coordinator.notifyLocalWrite();
+        firstPageID ??= page.id;
+      }
+      this.view = "editor";
+      await this.reload(firstPageID);
+      await this.closeDrawers();
+    } catch (error) {
+      this.setState({ kind: "error", message: error instanceof Error ? error.message : "Could not duplicate notebook" });
+    }
+  }
+
+  private async setNotebookDeleted(notebookID: string, restore: boolean): Promise<void> {
+    if (!(await this.flushPendingSave())) return;
+    try {
+      const result = restore ? await this.store.restoreNotebook(notebookID) : await this.store.archiveNotebook(notebookID);
+      if (result.status === "failed") {
+        this.setState({ kind: "error", message: result.message ?? "Could not update notebook" });
+        return;
+      }
+      this.coordinator.notifyLocalWrite();
+      if (notebookID === this.currentNotebook?.id && !restore) this.currentPage = null;
+      await this.reload();
+    } catch (error) {
+      this.setState({ kind: "error", message: error instanceof Error ? error.message : "Could not update notebook" });
+    }
+  }
+
+  private async setPageDeleted(pageID: string, restore: boolean): Promise<void> {
+    if (!(await this.flushPendingSave())) return;
+    try {
+      const result = restore ? await this.store.restorePage(pageID) : await this.store.deletePage(pageID);
+      if (result.status === "failed") {
+        this.setState({ kind: "error", message: result.message ?? "Could not update page" });
+        return;
+      }
+      this.coordinator.notifyLocalWrite();
+      if (pageID === this.currentPage?.id && !restore) this.currentPage = null;
+      await this.reload();
+    } catch (error) {
+      this.setState({ kind: "error", message: error instanceof Error ? error.message : "Could not update page" });
     }
   }
 
@@ -1466,7 +2330,7 @@ function shellMarkup(auth: AuthSession): string {
       <nav class="library-tabs" aria-label="Library sections"><button id="library-documents" aria-current="page"><span aria-hidden="true">▱</span>Documents</button><button id="library-tab-search" aria-current="false"><span aria-hidden="true">⌕</span>Search</button><button id="library-favorites" aria-current="false"><span aria-hidden="true">☆</span>Favorites</button></nav>
     </main>
     <main class="workspace" id="editor-workspace" hidden>
-      <header class="topbar"><div class="topbar-leading"><button class="back-library" id="back-library" aria-label="Back to Documents">‹ <span>Documents</span></button><button class="drawer-trigger" id="mobile-menu" aria-controls="sidebar" aria-expanded="false"><span class="drawer-trigger-icon">☰</span><span>Pages</span></button><div class="crumbs"><span class="eyebrow">NOTEBOOK</span><button class="notebook-title-button" id="rename-notebook" aria-label="Rename notebook"><strong id="notebook-name">My notebook</strong><span aria-hidden="true">✎</span></button></div></div><div class="top-actions"><button class="text-toggle" id="text-toggle" aria-label="Text and page details" aria-controls="inspector" aria-expanded="false"><span aria-hidden="true">T</span><span>Text</span></button><button class="sync-status" id="sync-button" data-sync-button aria-label="Sign in required"><span id="sync-icon" data-sync-icon>·</span><span id="sync-label" data-sync-label>Sign in required</span></button><button class="avatar-button" id="auth-button" aria-label="Account">○</button></div></header>
+      <header class="topbar"><div class="topbar-leading"><button class="back-library" id="back-library" aria-label="Back to Documents">‹ <span>Documents</span></button><button class="drawer-trigger" id="mobile-menu" aria-controls="sidebar" aria-expanded="false"><span class="drawer-trigger-icon">☰</span><span>Pages</span></button><div class="crumbs"><span class="eyebrow">NOTEBOOK</span><button class="notebook-title-button" id="rename-notebook" aria-label="Rename notebook"><strong id="notebook-name">My notebook</strong><span aria-hidden="true">✎</span></button><button class="menu-trigger" id="notebook-menu" data-menu-button aria-label="Notebook actions">⋯</button><div class="quick-menu top-quick-menu" id="notebook-menu-popup" hidden><button data-action="rename-notebook" data-notebook="">Rename notebook</button><button data-action="duplicate-notebook" data-notebook="">Duplicate notebook</button><button data-action="trash-notebook" data-notebook="">Move notebook to trash</button></div></div></div><div class="top-actions"><button class="text-toggle" id="text-toggle" aria-label="Text and page details" aria-controls="inspector" aria-expanded="false"><span aria-hidden="true">T</span><span>Text</span></button><button class="sync-status" id="sync-button" data-sync-button aria-label="Sign in required"><span id="sync-icon" data-sync-icon>·</span><span id="sync-label" data-sync-label>Sign in required</span></button><button class="avatar-button" id="auth-button" aria-label="Account">○</button></div></header>
       <section class="editor-layout">
         <div class="editor-stage" id="editor-content">
       <div class="editor-toolbar" role="toolbar" aria-label="Writing tools">
@@ -1489,13 +2353,13 @@ function shellMarkup(auth: AuthSession): string {
           <label class="width-control"><span id="width-value">3px</span><input id="width-range" type="range" min="1" max="12" step="0.5" value="3" aria-label="Stroke width" /></label>
         </div>
       </div>
-           <div class="page-bar"><button class="page-title-button" id="rename-page" aria-label="Rename page"><span class="page-title-kicker">PAGE</span><strong id="page-title-label">First page</strong><span aria-hidden="true">✎</span><span class="recovery-badge" id="recovery-page-badge" hidden>Recovered copy</span></button><div class="page-navigation"><button class="quiet-button" id="previous-page" aria-label="Previous page">‹</button><span id="page-position" aria-live="polite">1 / 1</span><button class="quiet-button" id="next-page" aria-label="Next page">›</button><button class="quiet-button add-page" id="add-page" aria-label="Add page" title="Add page with the same paper">＋</button></div></div>
-          <div class="paper-viewport" id="paper-viewport"><div class="paper" id="paper"><canvas id="ink-canvas" aria-label="Note page drawing surface"></canvas></div></div>
+           <div class="page-bar"><div class="page-heading"><button class="page-title-button" id="rename-page" aria-label="Rename page"><span class="page-title-kicker">PAGE</span><strong id="page-title-label">First page</strong><span aria-hidden="true">✎</span><span class="recovery-badge" id="recovery-page-badge" hidden>Recovered copy</span></button><button class="menu-trigger page-menu-trigger" id="page-menu" data-menu-button aria-label="Page actions">⋯</button><div class="quick-menu top-quick-menu" id="page-menu-popup" hidden><button data-action="rename-page" data-page="">Rename page</button><button data-action="duplicate-page" data-page="">Duplicate page</button><button data-action="trash-page" data-page="">Move page to trash</button></div></div><div class="page-navigation"><label class="view-mode-select"><span>View</span><select id="page-view-mode" aria-label="Page view mode"><option value="continuous">Continuous</option><option value="horizontal">Book scroll</option><option value="paged">Page turn</option></select></label><button class="quiet-button" id="previous-page" aria-label="Previous page">‹</button><span id="page-position" aria-live="polite">1 / 1</span><button class="quiet-button" id="next-page" aria-label="Next page">›</button><button class="quiet-button add-page" id="add-page" aria-label="Add page" title="Add page with the same paper">＋</button></div></div>
+          <div class="paper-scroll" id="paper-scroll"><div class="page-flow" id="page-flow"><article class="flow-page active" id="active-page-slot" data-flow-page=""><div class="paper-viewport" id="paper-viewport"><div class="paper" id="paper"><canvas id="ink-canvas" aria-label="Note page drawing surface"></canvas><div class="paper-image-layer" id="paper-image-layer" aria-label="Page images"></div></div></div></article></div></div>
           <div class="print-note" aria-hidden="true"><h1 id="print-title"></h1><p id="print-text"></p></div>
            <div class="stage-foot" title="Two fingers to move or zoom · Hand tool for one-finger pan"><span id="tool-name" aria-live="polite">Pen</span><small class="gesture-hint">2 fingers: move / zoom · Hand: 1-finger pan</small><div class="view-controls"><button class="quiet-button" id="zoom-out" aria-label="Zoom out">−</button><span class="zoom-label" id="zoom-label">100%</span><button class="quiet-button" id="zoom-in" aria-label="Zoom in">＋</button><button class="quiet-button" id="fit-button" aria-label="Fit page width">Fit width</button><button class="quiet-button" id="fit-whole-page" aria-label="Fit whole page">Full page</button></div><span id="page-revision">revision 0</span></div>
         </div>
          <div class="empty-editor hidden" id="editor-empty"><div class="empty-orbit">✦</div><h1 id="editor-empty-title">Choose a page</h1><p id="editor-empty-copy">Your paper is waiting in the left rail.</p></div>
-      <aside class="inspector" id="inspector" aria-label="Text and page details" aria-hidden="true"><div class="inspector-head"><div><span class="eyebrow">TEXT & DETAILS</span><strong class="inspector-title">Page tools</strong></div><button class="icon-button" id="close-inspector" aria-label="Close text panel">×</button></div><label class="title-field"><span>Page title</span><input id="page-title" type="text" placeholder="Untitled page" /></label><label class="text-field"><span>Typed note</span><textarea id="page-text" rows="8" placeholder="Type in Thai or English…" dir="auto"></textarea></label><label class="select-field"><span>Paper</span><select id="background-select"><option value="blank">Blank</option><option value="ruled">Ruled lines</option><option value="grid">Grid</option></select></label><div class="inspector-actions"><button class="outline-button" id="duplicate-page">Duplicate page</button><button class="outline-button" id="delete-page">Move page to trash</button><button class="outline-button" id="keep-page" hidden>Keep as normal page</button><button class="outline-button" id="archive-notebook" title="Archive or restore notebook" aria-label="Archive or restore notebook">Archive notebook</button><button class="outline-button" id="print-button">Print / PDF</button><button class="outline-button" id="share-button">Share archive</button><button class="outline-button" id="export-button">Export backup</button></div><p class="inspector-note">Changes save locally after each edit. Sync uses the configured server only when you sign in.</p></aside>
+      <aside class="inspector" id="inspector" aria-label="Text and page details" aria-hidden="true"><div class="inspector-head"><div><span class="eyebrow">TEXT & DETAILS</span><strong class="inspector-title">Page tools</strong></div><button class="icon-button" id="close-inspector" aria-label="Close text panel">×</button></div><label class="title-field"><span>Page title</span><input id="page-title" type="text" placeholder="Untitled page" /></label><label class="text-field"><span>Typed note</span><textarea id="page-text" rows="8" placeholder="Type in Thai or English…" dir="auto"></textarea></label><label class="select-field"><span>Paper</span><select id="background-select"><option value="blank">Blank</option><option value="ruled">Ruled lines</option><option value="grid">Grid</option></select></label><section class="image-tools" aria-label="Page images"><div class="image-tools-head"><strong>Images</strong><span><button class="outline-button compact" id="insert-image" type="button">Insert image</button><button class="outline-button compact" id="paste-image" type="button">Paste image</button></span></div><input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden /><p class="image-empty" id="image-empty">Paste an image or choose a file.</p><div id="image-list"></div><div class="image-controls" id="image-controls" hidden><span id="selected-image-label">Selected image</span><label>Width <input id="image-width" type="range" min="48" max="960" step="1" value="320" /></label><div class="image-nudge"><button class="outline-button compact" id="image-left" type="button" aria-label="Move image left">←</button><button class="outline-button compact" id="image-right" type="button" aria-label="Move image right">→</button><button class="outline-button compact" id="image-up" type="button" aria-label="Move image up">↑</button><button class="outline-button compact" id="image-down" type="button" aria-label="Move image down">↓</button><button class="outline-button compact danger-button" id="remove-image" type="button">Remove</button></div></div></section><div class="inspector-actions"><button class="outline-button" id="duplicate-page">Duplicate page</button><button class="outline-button" id="delete-page">Move page to trash</button><button class="outline-button" id="keep-page" hidden>Keep as normal page</button><button class="outline-button" id="archive-notebook" title="Archive or restore notebook" aria-label="Archive or restore notebook">Archive notebook</button><button class="outline-button" id="print-button">Print / PDF</button><button class="outline-button" id="share-button">Share archive</button><button class="outline-button" id="export-button">Export backup</button></div><p class="inspector-note">Changes save locally after each edit. Sync uses the configured server only when you sign in.</p></aside>
       </section>
     </main>
     <dialog class="dialog new-document-dialog" id="new-document-dialog" aria-label="New document"><div class="dialog-form"><div class="dialog-head"><h2>New…</h2><button class="icon-button" id="cancel-new-document" aria-label="Close new document">×</button></div><button id="new-document-notebook" class="new-document-option"><span aria-hidden="true">▱</span><span><strong>Notebook</strong><small>Choose your paper and start writing</small></span><span aria-hidden="true">›</span></button><button id="new-document-import" class="new-document-option"><span aria-hidden="true">↥</span><span><strong>Import backup</strong><small>Open a NotePad archive</small></span><span aria-hidden="true">›</span></button></div></dialog>
@@ -1509,7 +2373,7 @@ function authMarkup(): string {
 
 function dialogMarkup(auth: AuthSession): string {
   return `${authMarkup()}
-  <dialog class="dialog" id="settings-dialog"><form class="dialog-form" id="settings-form"><div class="dialog-head"><div><span class="eyebrow">SETTINGS</span><h2>Keep your paper close</h2></div><button type="button" class="icon-button" id="cancel-settings" aria-label="Close">×</button></div><label>Sync server URL<input id="endpoint-input" type="url" inputmode="url" placeholder="https://notes.example.com" /></label><p class="form-hint">Use the same HTTPS server on every device. Changing servers requires signing in again.</p><div class="account-line"><span>Sync</span><strong id="settings-sync-label" aria-live="polite" title="Sign in required">Sign in required</strong><button class="outline-button compact" type="button" id="settings-sync-button">Sync now</button></div><p class="form-message offline-cache-status" id="offline-cache-status" role="status">Preparing offline cache…</p><div class="settings-actions"><button class="outline-button" type="button" id="browse-import">Import backup</button><button class="outline-button" type="button" id="settings-export">Export backup</button><button class="outline-button" type="button" id="settings-share">Share backup</button></div><input id="import-input" type="file" accept="application/json,.json,.notepad" hidden /><p class="form-message" id="settings-message"></p>${thisAccountMarkup(auth)}<button class="primary-button" type="submit">Save settings</button></form></dialog>
+  <dialog class="dialog" id="settings-dialog"><form class="dialog-form" id="settings-form"><div class="dialog-head"><div><span class="eyebrow">SETTINGS</span><h2>Keep your paper close</h2></div><button type="button" class="icon-button" id="cancel-settings" aria-label="Close">×</button></div><label>Sync server URL<input id="endpoint-input" type="url" inputmode="url" placeholder="https://notes.example.com" /></label><p class="form-hint">Use the same HTTPS server on every device. Changing servers requires signing in again.</p><div class="account-line"><span>Sync</span><strong id="settings-sync-label" aria-live="polite" title="Sign in required">Sign in required</strong><button class="outline-button compact" type="button" id="settings-sync-button">Sync now</button></div><p class="form-message offline-cache-status" id="offline-cache-status" role="status">Preparing offline cache…</p><div class="settings-actions"><button class="outline-button" type="button" id="browse-import">Import backup</button><button class="outline-button" type="button" id="settings-export">Export backup</button><button class="outline-button" type="button" id="settings-share">Share backup</button></div><input id="import-input" type="file" accept="application/json,.json,.notepad" hidden /><p class="form-message" id="settings-message"></p>${thisAccountMarkup(auth)}<div class="app-build"><span>Web app build ${APP_BUILD}</span><button class="outline-button compact" type="button" id="reload-app">Reload app</button></div><button class="primary-button" type="submit">Save settings</button></form></dialog>
   <dialog class="dialog" id="notebook-dialog"><form class="dialog-form" id="notebook-form"><div class="dialog-head"><div><span class="eyebrow">NOTEBOOK</span><h2>Rename notebook</h2></div><button type="button" class="icon-button" id="cancel-notebook" aria-label="Close">×</button></div><label>Name<input id="notebook-title" type="text" maxlength="500" autocomplete="off" required /></label><div id="new-notebook-options" hidden><label>Paper<select id="new-paper"><option value="blank">Blank</option><option value="ruled" selected>Ruled lines</option><option value="grid">Grid</option></select></label><div class="paper-choices" role="group" aria-label="Paper preview"><button type="button" class="paper-sample paper-blank" data-paper="blank" aria-pressed="false">Blank</button><button type="button" class="paper-sample paper-ruled" data-paper="ruled" aria-pressed="true">Ruled</button><button type="button" class="paper-sample paper-grid" data-paper="grid" aria-pressed="false">Grid</button></div></div><p class="form-error" id="notebook-error" role="alert"></p><button class="primary-button" type="submit">Save name</button></form></dialog>
 `;
 }
@@ -1526,6 +2390,7 @@ function onClick(id: string, handler: () => void): void { byId(id).addEventListe
 function escapeHTML(value: string): string { return value.replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", "\"": "&quot;" })[char] ?? char); }
 function escapeAttr(value: string): string { return escapeHTML(value); }
 function preview(value: string): string { return value.replace(/\s+/g, " ").trim().slice(0, 54); }
+function previewText(value: string): string { return value.replace(/\s+/g, " ").trim().slice(0, 80); }
 function pageNotebookLabel(page: NotePage, notebooks: Notebook[]): string {
   const notebook = notebooks.find((item) => item.id === page.notebookId);
   return notebook ? escapeHTML(notebook.title) : "Notebook";
@@ -1533,6 +2398,86 @@ function pageNotebookLabel(page: NotePage, notebooks: Notebook[]): string {
 function dateStamp(): string { return new Date().toISOString().slice(0, 10); }
 function download(blob: Blob, filename: string): void { const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = filename; link.click(); window.setTimeout(() => URL.revokeObjectURL(url), 1000); }
 function argbToCSS(color: number): string { const value = color >>> 0; return `rgba(${(value >>> 16) & 0xff},${(value >>> 8) & 0xff},${value & 0xff},${((value >>> 24) & 0xff) / 255})`; }
+
+function getPageImages(page: NotePage): PageImage[] {
+  const images = page.images;
+  return Array.isArray(images) ? images : [];
+}
+
+function setPageImages(page: NotePage, images: PageImage[]): void {
+  page.images = images;
+}
+
+function cloneImages(images: PageImage[], freshIDs = false): PageImage[] {
+  return images.map((image) => ({ ...image, id: freshIDs ? id() : image.id }));
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, Number.isFinite(value) ? value : min));
+}
+
+function isTextEntryTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+}
+
+async function makePageImage(file: File, page: NotePage, index: number): Promise<PageImage> {
+  const original = await readFileAsDataURL(file);
+  let src = original;
+  let sourceWidth = 1200;
+  let sourceHeight = 900;
+  const decoded = await decodeImage(file, original);
+  try {
+    sourceWidth = decoded.width;
+    sourceHeight = decoded.height;
+    if (!(sourceWidth > 0 && sourceHeight > 0)) throw new Error("Could not decode image dimensions.");
+    const maxDimension = 1600;
+    if (Math.max(sourceWidth, sourceHeight) > maxDimension || file.size > 1_500_000) {
+      const scale = Math.min(1, maxDimension / Math.max(sourceWidth, sourceHeight));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+      canvas.height = Math.max(1, Math.round(sourceHeight * scale));
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("This browser cannot prepare images.");
+      context.drawImage(decoded.source, 0, 0, canvas.width, canvas.height);
+      src = canvas.toDataURL("image/jpeg", .84);
+      sourceWidth = canvas.width;
+      sourceHeight = canvas.height;
+    }
+  } finally {
+    decoded.close?.();
+  }
+  const maxWidth = Math.max(1, page.width - 64);
+  const maxHeight = Math.max(1, page.height - 64);
+  let width = Math.min(maxWidth, sourceWidth, 640);
+  let height = Math.max(1, width * sourceHeight / Math.max(1, sourceWidth));
+  if (height > maxHeight) {
+    const fit = maxHeight / height;
+    width *= fit;
+    height = maxHeight;
+  }
+  const offset = Math.min(64 + index * 16, Math.max(0, page.width - width));
+  return { id: id(), src, x: offset, y: Math.min(64 + index * 16, Math.max(0, page.height - height)), width, height };
+}
+
+async function readFileAsDataURL(file: File): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => typeof reader.result === "string" ? resolve(reader.result) : reject(new Error("Could not read image."));
+    reader.onerror = () => reject(new Error("Could not read image."));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function decodeImage(file: File, src: string): Promise<{ width: number; height: number; source: CanvasImageSource; close?: () => void }> {
+  if (typeof createImageBitmap === "function") {
+    const bitmap = await createImageBitmap(file);
+    return { width: bitmap.width, height: bitmap.height, source: bitmap, close: () => bitmap.close() };
+  }
+  const image = new Image();
+  image.src = src;
+  await new Promise<void>((resolve, reject) => { image.onload = () => resolve(); image.onerror = () => reject(new Error("Could not decode image.")); });
+  return { width: image.naturalWidth || image.width, height: image.naturalHeight || image.height, source: image };
+}
 
 function waitForServiceWorker(worker: ServiceWorker): Promise<void> {
   if (worker.state === "activated") return Promise.resolve();
