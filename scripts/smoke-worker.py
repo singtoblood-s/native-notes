@@ -72,7 +72,7 @@ class WorkerSmoke:
         self.timeout = timeout
 
     def request(self, case: str, method: str, path: str, token: str | None = None, body: Any = None, extra_headers: dict[str, str] | None = None) -> HttpResult:
-        headers = {"Accept": "application/json", "Origin": self.origin}
+        headers = {"Accept": "application/json", "Origin": self.origin, "User-Agent": "NativeNotes-Smoke/1.0"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         data: bytes | None = None
