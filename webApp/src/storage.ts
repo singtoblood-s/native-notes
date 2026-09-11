@@ -690,31 +690,39 @@ export class SQLiteNoteStoreEngine implements NoteStore {
   }
 
   async createConflictCopyFromOperation(operation: SyncOperation, originalPageID = operation.entityId): Promise<void> {
-    if (operation.entityType === "page") {
-      const page = validatePageSnapshot(operation.payload, operation.entityId);
-      const notebook = await this.getNotebook(page.notebookId);
-      let notebookID = page.notebookId;
-      if (!notebook || notebook.deletedAt) {
-        const recoveredNotebook = notebook
-          ? { ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() }
-          : createNotebook("Recovered page");
-        // A recovered page may be edited immediately. Persist the parent
-        // upload before exposing the page so its later operation cannot reach
-        // the server with a notebook ID the server has never seen.
-        await this.saveNotebook(recoveredNotebook, true);
-        notebookID = recoveredNotebook.id;
+    const operationID = requireUUID(operation.opId, "Operation ID");
+    await this.transaction(() => {
+      // Conflict recovery runs before the outbox row is acknowledged. The
+      // marker makes that recovery idempotent if the app stops between these
+      // two durable operations, while preserving any copy the user edited or
+      // deleted before the retry.
+      if (this.hasConflictRecoveryMarkerDirect(operationID)) return;
+      if (operation.entityType === "page") {
+        const page = validatePageSnapshot(operation.payload, operation.entityId);
+        const notebook = this.notebookFromRow(this.row(page.notebookId, "notebooks"));
+        let notebookID = page.notebookId;
+        if (!notebook || notebook.deletedAt) {
+          const recoveredNotebook = notebook
+            ? { ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() }
+            : createNotebook("Recovered page");
+          // A recovered page may be edited immediately. Persist the parent
+          // upload before exposing the page so its later operation cannot reach
+          // the server with a notebook ID the server has never seen.
+          this.saveNotebookRow(recoveredNotebook, true);
+          notebookID = recoveredNotebook.id;
+        }
+        const copy = sanitizePage({ ...page, id: id(), notebookId: notebookID, title: conflictTitle(page.title, MAX_PAGE_TITLE), revision: 0, conflictOf: originalPageID, deletedAt: null });
+        this.savePageRow(copy, false);
+      } else if (operation.entityType === "notebook") {
+        const notebook = validateNotebookSnapshot(operation.payload, operation.entityId);
+        // The recovered notebook is a valid place for the user to create a new
+        // page immediately, so make its server-side parent durable first.
+        this.saveNotebookRow({ ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() }, true);
+      } else {
+        this.insertConflictDirect(operation.entityType, operation.entityId, operation.payload, "rejected local operation", 0);
       }
-      await this.createConflictCopy({ ...page, notebookId: notebookID }, originalPageID);
-      return;
-    }
-    if (operation.entityType === "notebook") {
-      const notebook = validateNotebookSnapshot(operation.payload, operation.entityId);
-      // The recovered notebook is a valid place for the user to create a new
-      // page immediately, so make its server-side parent durable first.
-      await this.saveNotebook({ ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() }, true);
-      return;
-    }
-    await this.transaction(() => this.insertConflictDirect(operation.entityType, operation.entityId, operation.payload, "rejected local operation", 0));
+      this.markConflictRecoveryDirect(operationID);
+    });
   }
 
   async pendingOperations(limit = 50): Promise<SyncOperation[]> {
@@ -785,7 +793,9 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     await this.transaction(() => {
       const pending = this.pendingForEntityDirect(checkedChange.entityType, checkedChange.entityId).filter((operation) => operation.opId !== operationID);
       if (pending.length > 0) {
+        if (operationID && this.hasConflictServerMarkerDirect(operationID)) return;
         this.insertConflictDirect(checkedChange.entityType, checkedChange.entityId, checkedChange.payload, "server snapshot while newer local edit is pending", checkedChange.sequence);
+        if (operationID) this.markConflictServerDirect(operationID);
         if (checkedChange.revision > 0) this.db.exec({ sql: "UPDATE outbox SET base_revision = ? WHERE entity_type = ? AND entity_id = ? AND state = 'pending'", bind: [checkedChange.revision, checkedChange.entityType, checkedChange.entityId] });
         return;
       }
@@ -942,6 +952,30 @@ export class SQLiteNoteStoreEngine implements NoteStore {
 
   private getOperationDirect(opID: string): SyncOperation | null {
     return this.operationFromRow(this.query(`SELECT op_id, entity_type, entity_id, base_revision, action, payload, created_at, state FROM outbox WHERE op_id = ?`, [opID])[0]);
+  }
+
+  private conflictRecoveryKey(operationID: string): string {
+    return `conflict-recovery:${operationID}`;
+  }
+
+  private conflictServerKey(operationID: string): string {
+    return `conflict-server:${operationID}`;
+  }
+
+  private hasConflictRecoveryMarkerDirect(operationID: string): boolean {
+    return this.query("SELECT value FROM metadata WHERE key = ?", [this.conflictRecoveryKey(operationID)]).length > 0;
+  }
+
+  private markConflictRecoveryDirect(operationID: string): void {
+    this.db.exec({ sql: "INSERT INTO metadata(key, value) VALUES(?, ?) ON CONFLICT(key) DO NOTHING", bind: [this.conflictRecoveryKey(operationID), "1"] });
+  }
+
+  private hasConflictServerMarkerDirect(operationID: string): boolean {
+    return this.query("SELECT value FROM metadata WHERE key = ?", [this.conflictServerKey(operationID)]).length > 0;
+  }
+
+  private markConflictServerDirect(operationID: string): void {
+    this.db.exec({ sql: "INSERT INTO metadata(key, value) VALUES(?, ?) ON CONFLICT(key) DO NOTHING", bind: [this.conflictServerKey(operationID), "1"] });
   }
 
   private currentCursorDirect(): number {

@@ -148,7 +148,6 @@ export class SyncClient {
       try {
         await this.pushAll(store, endpoint, session.sessionToken, report);
         await this.pullAll(store, endpoint, session.sessionToken, report);
-        report.conflicts = Math.max(report.conflicts, (await store.listConflicts()).length);
       } catch (error) {
         this.rememberPartialPull(store, expectedAccountKey, report.pulled);
         throw error;
