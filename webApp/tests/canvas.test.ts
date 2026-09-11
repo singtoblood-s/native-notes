@@ -292,6 +292,35 @@ describe("PaperCanvas pointer contract", () => {
     canvasController.destroy();
   });
 
+  it("keeps the photo layer in place without full-page copies while highlighting and panning", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", callback => { frames.push(callback); return frames.length; });
+    const { canvas, paper, canvasController } = setup();
+    const internals = canvasController as unknown as { context: CanvasRenderingContext2D; renderStatic(): void };
+    const redraw = vi.spyOn(internals, "renderStatic");
+    const background = paper.querySelector<HTMLCanvasElement>(".paper-background-canvas")!;
+    expect(background.nextElementSibling).toBe(canvas);
+    expect([background.width, background.height]).toEqual([canvas.width, canvas.height]);
+    canvasController.setTool({ kind: "highlighter", color: 0xffffcc00, width: 18 });
+    canvas.dispatchEvent(pointer("pointerdown", { clientX: 10 }));
+    frames.shift()!(0);
+    for (let index = 1; index <= 10; index++) {
+      canvas.dispatchEvent(pointer("pointermove", { clientX: 10 + index }));
+      frames.shift()!(index);
+    }
+    canvas.dispatchEvent(pointer("pointerup", { clientX: 20 }));
+    canvasController.setTool({ kind: "hand" });
+    canvas.dispatchEvent(pointer("pointerdown", { pointerType: "touch", clientX: 200 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerType: "touch", clientX: 240 }));
+    canvas.dispatchEvent(pointer("pointerup", { pointerType: "touch", clientX: 240 }));
+    expect(internals.context.drawImage).not.toHaveBeenCalled();
+    expect(redraw).not.toHaveBeenCalled();
+    expect(paper.querySelector(".paper-background-canvas")).toBe(background);
+    canvasController.destroy();
+    expect(background.isConnected).toBe(false);
+    expect([background.width, background.height]).toEqual([1, 1]);
+  });
+
   it("keeps a tap when coalesced events is empty", () => {
     const { canvas, changes } = setup();
     const down = pointer("pointerdown", { clientX: 100, clientY: 100, timeStamp: 10 });

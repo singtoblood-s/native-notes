@@ -221,7 +221,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .paper-image-object.selected .image-resize-handle { position: absolute; right: -9px; bottom: -9px; z-index: 1; width: 18px; height: 18px; padding: 0; border: 2px solid #fff; border-radius: 50%; background: var(--accent); cursor: nwse-resize; }
 .paper-image-object.selected .image-resize-handle::after { position: absolute; inset: 4px; border-right: 1px solid #fff; border-bottom: 1px solid #fff; content: ""; }
 .paper { position: absolute; top: 0; left: 0; overflow: hidden; transform-origin: top left; border: 1px solid rgba(65, 54, 44, .17); background: var(--paper); box-shadow: var(--shadow); will-change: transform; }
-#ink-canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+#ink-canvas { position: relative; z-index: 1; display: block; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
 .print-note { display: none; }
 .stage-foot { display: flex; align-items: center; justify-content: space-between; min-height: 33px; padding: 0 23px; color: var(--faint); font-size: 10px; }
 .stage-foot .gesture-hint { min-width: 0; flex: 1; margin-inline: 10px; overflow: hidden; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
