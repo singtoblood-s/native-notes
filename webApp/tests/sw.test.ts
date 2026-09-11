@@ -63,7 +63,7 @@ async function loadGeneratedServiceWorker() {
     async open() { return cache; },
     async keys() { return ["notepad-static-old", "unrelated-cache"]; },
     async delete() { return true; },
-    async match() { return undefined as TestResponse | undefined; },
+    async match(_request: string | TestRequest) { return undefined as TestResponse | undefined; },
   };
   const self = {
     location: { origin: "https://notes.example.test" },
