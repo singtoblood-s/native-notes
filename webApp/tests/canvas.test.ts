@@ -109,6 +109,8 @@ describe("PaperCanvas pointer contract", () => {
     expect(scroll.scrollLeft).toBeCloseTo(50);
     expect(scroll.scrollTop).toBeCloseTo(100);
     preview.dispatchEvent(pointer("pointercancel", { pointerId: 90, pointerType: "touch" }));
+    scroll.dispatchEvent(pointer("pointermove", { pointerId: 91, pointerType: "touch", clientX: 450, clientY: 190 }));
+    expect(scroll.scrollTop).toBeCloseTo(110);
     scroll.dispatchEvent(pointer("pointercancel", { pointerId: 91, pointerType: "touch" }));
     expect(canvasController.isInputActive).toBe(false);
     expect(changes).not.toHaveBeenCalled();
@@ -132,6 +134,40 @@ describe("PaperCanvas pointer contract", () => {
     expect(viewport.scrollTop - top).toBe(100);
     expect(viewport.scrollLeft - left).toBe(50);
     expect(transformOf(paper)).toEqual({ x: 0, y: 0, scale });
+    canvasController.destroy();
+  });
+  it("ignores empty wheel zoom and rebases when a third finger leaves", () => {
+    const { canvasController, canvas, paper } = setup();
+    const before = transformOf(paper);
+    canvas.dispatchEvent(new WheelEvent("wheel", { ctrlKey: true, deltaX: 40, deltaY: 0, bubbles: true, cancelable: true }));
+    expect(transformOf(paper)).toEqual(before);
+    for (const pointerId of [1, 2, 3]) canvas.dispatchEvent(pointer("pointerdown", { pointerId, pointerType: "touch", clientX: 200 + pointerId * 100, clientY: 300 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 3, pointerType: "touch", clientX: 700, clientY: 600 }));
+    expect(transformOf(paper)).toEqual(before);
+    canvas.dispatchEvent(pointer("pointercancel", { pointerId: 1, pointerType: "touch" }));
+    const rebased = transformOf(paper);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 2, pointerType: "touch", clientX: 400, clientY: 300 }));
+    expect(transformOf(paper)).toEqual(rebased);
+    window.dispatchEvent(new Event("blur"));
+    expect(canvasController.isInputActive).toBe(false);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 3, pointerType: "touch", clientX: 900, clientY: 900 }));
+    expect(transformOf(paper)).toEqual(rebased);
+    canvasController.destroy();
+  });
+  it("responds immediately when a pinch reverses at either zoom limit", () => {
+    const { canvasController, canvas } = setup();
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 81, pointerType: "touch", clientX: 300, clientY: 300 }));
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 82, pointerType: "touch", clientX: 500, clientY: 300 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 81, pointerType: "touch", clientX: -1300, clientY: 300 }));
+    const maximum = canvasController.currentScale;
+    expect(maximum).toBe(2.8);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 81, pointerType: "touch", clientX: -1280, clientY: 300 }));
+    expect(canvasController.currentScale).toBeLessThan(maximum);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 81, pointerType: "touch", clientX: 499, clientY: 300 }));
+    const minimum = canvasController.currentScale;
+    expect(minimum).toBe(.25);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 81, pointerType: "touch", clientX: 489, clientY: 300 }));
+    expect(canvasController.currentScale).toBeGreaterThan(minimum);
     canvasController.destroy();
   });
   it("cancels native canvas touch moves without duplicate ink or blocking outside scrolling", () => {
@@ -294,7 +330,7 @@ describe("PaperCanvas pointer contract", () => {
 
   it("keeps the photo layer in place without full-page copies while highlighting and panning", () => {
     const frames: FrameRequestCallback[] = [];
-    vi.stubGlobal("requestAnimationFrame", callback => { frames.push(callback); return frames.length; });
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => { frames.push(callback); return frames.length; });
     const { canvas, paper, canvasController } = setup();
     const internals = canvasController as unknown as { context: CanvasRenderingContext2D; renderStatic(): void };
     const redraw = vi.spyOn(internals, "renderStatic");

@@ -823,6 +823,7 @@ export class PaperCanvas {
   private beginPinch(): void {
     const [first, second] = [...this.touchPointers.values()].slice(0, 2);
     if (!first || !second) return;
+    this.scrollVelocity = 0;
     const center = midpoint(first, second);
     const rect = this.viewport.getBoundingClientRect();
     this.pinchStart = {
@@ -841,7 +842,8 @@ export class PaperCanvas {
     const nextCenter = midpoint(first, second);
     const nextDistance = Math.max(1, distance(first, second));
     const world = worldPointAt(start.center, start.scale, start.offsetX, start.offsetY);
-    const nextScale = clamp(start.scale * (nextDistance / start.distance), this.minimumScale, this.maximumScale);
+    const requestedScale = start.scale * (nextDistance / start.distance);
+    const nextScale = clamp(requestedScale, this.minimumScale, this.maximumScale);
     const nextOffset = offsetAtAnchor(world, nextScale, nextCenter);
     if (this.navigationMode !== "paged") {
       const rect = this.viewport.getBoundingClientRect();
@@ -850,11 +852,12 @@ export class PaperCanvas {
     }
     this.fitMode = "custom";
     this.applyTransform(nextScale, nextOffset, true);
+    if (nextScale !== requestedScale) this.beginPinch();
   }
 
   private endTouchPointer(pointerID: number): void {
     if (!this.touchPointers.delete(pointerID)) return;
-    this.scrollLast = null;
+    this.scrollLast = this.navigationMode !== "paged" && this.touchPointers.size === 1 ? [...this.touchPointers.values()][0]! : null;
     this.rebaseTouchGesture();
   }
 
@@ -919,8 +922,15 @@ export class PaperCanvas {
       // Resize every sheet before adjusting scroll to keep the gesture anchor fixed.
       this.callbacks.onZoom(this.scale);
       const nextRect = this.viewport.getBoundingClientRect();
-      this.scrollViewport.scrollLeft += nextRect.left - rect.left - nextOffset.x;
-      this.scrollViewport.scrollTop += nextRect.top - rect.top - nextOffset.y;
+      const left = this.scrollViewport.scrollLeft + nextRect.left - rect.left - nextOffset.x;
+      const top = this.scrollViewport.scrollTop + nextRect.top - rect.top - nextOffset.y;
+      this.scrollViewport.scrollLeft = left;
+      this.scrollViewport.scrollTop = top;
+      if (this.pinchStart) {
+        // Discard movement beyond a boundary so reversing the fingers responds immediately.
+        this.pinchStart.offsetX += (left - this.scrollViewport.scrollLeft) * this.pinchStart.scale / scale;
+        this.pinchStart.offsetY += (top - this.scrollViewport.scrollTop) * this.pinchStart.scale / scale;
+      }
       return;
     }
     const gutter = viewportGutter(rect.width);
@@ -937,6 +947,10 @@ export class PaperCanvas {
     this.scale = scale;
     this.offsetX = bounded.x;
     this.offsetY = bounded.y;
+    if (this.pinchStart) {
+      this.pinchStart.offsetX += (bounded.x - nextOffset.x) * this.pinchStart.scale / scale;
+      this.pinchStart.offsetY += (bounded.y - nextOffset.y) * this.pinchStart.scale / scale;
+    }
     this.updateTransform();
     if (notifyZoom) this.callbacks.onZoom(this.scale);
   }
@@ -1008,6 +1022,7 @@ export class PaperCanvas {
       this.applyPan();
       return;
     }
+    if (!finite(event.deltaY) || event.deltaY === 0) return;
     const rect = this.viewport.getBoundingClientRect();
     this.zoomTo(this.scale * (event.deltaY < 0 ? 1.08 : 0.92), { x: event.clientX - rect.left, y: event.clientY - rect.top });
   };

@@ -14,6 +14,7 @@ export class FloatingTools {
 
   constructor(signal: AbortSignal, private readonly closeMenus: () => void, private readonly canToggle: () => boolean) {
     this.workspace = document.getElementById("editor-workspace")!;
+    this.workspace.querySelector(".top-actions")!.insertAdjacentHTML("afterbegin", '<button id="float-tools" class="outline-button" title="Hide bars in a draggable circle" aria-label="Collapse bars into floating tools">◉ <span>Focus</span></button>');
     this.toggle = document.getElementById("float-tools") as HTMLButtonElement;
     this.workspace.insertAdjacentHTML("beforeend", `
       <button id="floating-tools-button" class="floating-tools-button" hidden aria-controls="floating-tools-panel" aria-expanded="false" aria-describedby="floating-tools-help"><span class="floating-tool-icon" aria-hidden="true"></span><span class="floating-tool-status" aria-hidden="true"></span></button>
@@ -101,6 +102,7 @@ export class FloatingTools {
       if (this.panel.hidden || this.panel.contains(event.target as Node) || this.bubble.contains(event.target as Node) || document.querySelector("dialog[open]") || document.body.classList.contains("drawer-open")) return;
       this.close(false);
     }, { signal, capture: true });
+    this.panel.addEventListener("scroll", () => this.closeMenus(), { signal });
     window.addEventListener("resize", () => this.place(), { signal });
     window.visualViewport?.addEventListener("resize", () => this.place(), { signal });
     window.visualViewport?.addEventListener("scroll", () => this.place(), { signal });
@@ -179,6 +181,7 @@ export class FloatingTools {
   }
 
   private refresh(): void {
+    if (!this.workspace.isConnected) return;
     if (this.workspace.hidden) this.close(false);
     this.panel.classList.toggle("floating-no-page", document.getElementById("editor-content")!.classList.contains("hidden"));
     const active = this.workspace.querySelector<HTMLElement>(".tool-button.active");

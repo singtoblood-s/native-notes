@@ -18,6 +18,8 @@
   text-rendering: optimizeLegibility;
 }
 
+/* Native scrolling stays available in drawers and dialogs; paper owns zoom. */
+:where(html, body, body *) { touch-action: pan-x pan-y; }
 [hidden] { display: none !important; }
 .library { height: 100dvh; display: flex; flex-direction: column; background: #f7f8fa; color: #23334a; }
 .library-header { display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; height: 64px; padding: 0 32px; border-bottom: 1px solid #dce1e7; background: #fff; }
@@ -723,6 +725,45 @@ input, textarea, select { accent-color: var(--accent); }
   .library-tabs { grid-column: 1; grid-row: 2; flex-direction: column; justify-content: flex-start; gap: 7px; padding: 36px 16px; border: 0; border-right: 1px solid var(--line); background: #f4f6f9; }
   .library-tabs button { flex-direction: row; justify-content: flex-start; gap: 12px; padding: 0 16px; min-height: 48px; font-size: 13px; }
 }
+
+/* Floating controls reuse the original bars without taking space from the paper. */
+#editor-workspace.floating-tools-mode > .editor-layout { height: 100%; }
+#float-tools { white-space: nowrap; min-width: 44px; }
+.floating-tools-button { position: fixed; z-index: 61; display: grid; place-items: center; width: 56px; height: 56px; padding: 0; border: 1px solid #cbd8ee; border-radius: 50%; background: #fff; color: var(--accent-dark); box-shadow: 0 4px 20px #243f6b30; touch-action: none; user-select: none; cursor: grab; }
+.floating-tools-button:hover, .floating-tools-button[aria-expanded="true"] { background: var(--accent-soft); }
+.floating-tools-button.is-dragging { cursor: grabbing; box-shadow: 0 8px 25px #243f6b40; }
+.floating-tool-icon { display: grid; place-items: center; pointer-events: none; }
+.floating-tool-icon svg { width: 25px; height: 25px; }
+.floating-tool-status { position: absolute; right: -1px; bottom: -1px; display: grid; place-items: center; min-width: 19px; height: 19px; border: 2px solid white; border-radius: 50%; background: #eaf0fc; font-size: 11px; pointer-events: none; }
+.floating-tools-button[data-state="error"] .floating-tool-status, .floating-tools-button[data-state="conflict"] .floating-tool-status, .floating-tools-button[data-state="needs-login"] .floating-tool-status { color: #fff; background: #aa3838; }
+#floating-tools-panel { position: fixed; z-index: 60; overflow: auto; overscroll-behavior: contain; padding: 10px; border: 1px solid var(--line-strong); border-radius: 18px; background: white; box-shadow: 0 12px 44px #243f6b30; }
+.floating-tools-heading { display: flex; align-items: center; gap: 6px; }
+.floating-tools-heading strong { flex: 1; font-size: 14px; }
+.floating-tools-heading button { min-height: 44px; padding-inline: 9px; font-size: 11px; }
+.floating-tools-heading .icon-button { width: 44px; flex-shrink: 0; font-size: 24px; }
+#floating-tools-help { margin: 6px 4px 12px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+#floating-tools-panel .topbar { height: auto; min-height: 0; padding: 4px; flex-wrap: wrap; gap: 4px; }
+#floating-tools-panel .topbar-leading { width: 100%; gap: 4px; }
+#floating-tools-panel .top-actions { width: 100%; justify-content: flex-end; gap: 8px; }
+#floating-tools-panel .notebook-title-button strong { max-width: min(240px, 30vw); font-size: 13px; }
+#floating-tools-panel .sync-status { max-width: none; flex: 1; }
+#floating-tools-panel #sync-label { display: inline; text-align: left; overflow-wrap: anywhere; }
+#floating-tools-panel .editor-toolbar { height: auto; min-height: 0; padding: 6px 0; flex-wrap: wrap; gap: 4px; }
+#floating-tools-panel .primary-tools, #floating-tools-panel .ink-options { width: 100%; flex-wrap: wrap; overflow: visible; justify-content: flex-start; padding: 0; }
+#floating-tools-panel .toolbar-divider { display: none; }
+#floating-tools-panel .width-control { display: flex; margin: 0 8px; }
+#floating-tools-panel .ink-options select { max-width: none; }
+#floating-tools-panel .page-bar { height: auto; padding: 4px; flex-wrap: wrap; gap: 2px; }
+#floating-tools-panel .page-heading { width: 100%; flex: auto; }
+#floating-tools-panel .page-title-button strong { max-width: 240px; }
+#floating-tools-panel .page-navigation { margin-left: auto; flex-wrap: wrap; }
+#floating-tools-panel .stage-foot { height: auto; min-height: 0; padding: 6px 2px; flex-wrap: wrap; gap: 4px; }
+#floating-tools-panel .stage-foot .gesture-hint, #floating-tools-panel #page-revision { display: none; }
+#floating-tools-panel .view-controls { flex-wrap: wrap; }
+#floating-tools-panel.floating-no-page .editor-toolbar, #floating-tools-panel.floating-no-page .page-bar, #floating-tools-panel.floating-no-page .stage-foot { display: none; }
+.floating-tools-button:focus-visible, #floating-tools-panel button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 720px) { #float-tools { padding-inline: 8px; } #float-tools span { display: none; } }
+@media print { #floating-tools-button, #floating-tools-panel { display: none !important; } }
 @media (max-width: 1250px) {
   .editor-toolbar { height: auto; min-height: 72px; flex-wrap: wrap; justify-content: center; padding-inline: 8px; gap: 0; }
   .primary-tools { width: 100%; justify-content: center; padding-block: 5px; }
@@ -808,4 +849,9 @@ input, textarea, select { accent-color: var(--accent); }
 #versions-list .recovery-row > span {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+/* Avoid focus zoom for small form fields on touch devices. */
+@media (any-pointer: coarse) {
+  input, textarea, select { font-size: max(16px, 1em) !important; }
 }

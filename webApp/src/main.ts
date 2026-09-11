@@ -1,4 +1,5 @@
 import "./styles.css";
+import { lockBrowserZoom } from "./browser-zoom";
 import { AuthClient, AuthSession, getEndpoint, setEndpoint, workspaceAccountKey } from "./auth";
 import { PaperCanvas, CanvasTool, renderPagePreview, clearPagePreview } from "./canvas";
 import {
@@ -21,6 +22,7 @@ import { SyncCoordinator, SyncCoordinatorStatus, SyncCompleteContext } from "./c
 import { SyncClient } from "./sync";
 import { IMAGE_TYPES, mediaType, canvasBlob, imageCanvas, encodePageImage, importMediaPages, exportPages } from "./media";
 import { removeGuestData } from "./remove-guest-data";
+import { FloatingTools } from "./floating-tools";
 
 const BASE = import.meta.env.BASE_URL;
 const APP_BUILD = "2026.09.11.3";
@@ -117,6 +119,7 @@ class NotePadApp {
 
   constructor(root: HTMLElement) {
     this.root = root;
+    lockBrowserZoom();
     document.addEventListener("keydown", (event) => { if (!this.loginRequired) this.handleShortcut(event); });
     window.addEventListener("pagehide", this.handlePageHide, { capture: true });
     window.setInterval(() => {
@@ -224,6 +227,7 @@ class NotePadApp {
     this.setOfflineCacheStatus(this.offlineCacheStatus, this.offlineCacheMessage);
     this.syncDrawerState();
     this.applyViewMode();
+    new FloatingTools(this.shellEvents.signal, () => this.closeQuickMenus(), () => !this.canvasInputActive());
   }
 
   private viewModeStorageKey(): string { return `notepad.page-view:${this.accountKey()}`; }
@@ -1369,7 +1373,7 @@ class NotePadApp {
     const images = getPageImages(page);
     if (this.selectedImageID && !images.some((image) => image.id === this.selectedImageID)) this.selectedImageID = null;
     const list = byId("image-list");
-    list.innerHTML = images.map((image, index) => `<div class="image-list-row ${image.id === this.selectedImageID ? "selected" : ""}"><button class="image-select" type="button" data-image-select="${escapeAttr(image.id)}"><span>${index + 1}</span><img src="${escapeAttr(image.src)}" alt="" /><strong>Image ${index + 1}</strong></button><button class="image-remove" type="button" data-image-remove="${escapeAttr(image.id)}" aria-label="Remove image ${index + 1}">×</button></div>`).join("");
+    list.innerHTML = images.map((image, index) => `<div class="image-list-row ${image.id === this.selectedImageID ? "selected" : ""}"><button class="image-select" type="button" data-image-select="${escapeAttr(image.id)}"><span>${index + 1}</span><img src="${escapeAttr(image.src)}" alt="" loading="lazy" decoding="async" /><strong>Image ${index + 1}</strong></button><button class="image-remove" type="button" data-image-remove="${escapeAttr(image.id)}" aria-label="Remove image ${index + 1}">×</button></div>`).join("");
     byId("image-empty").toggleAttribute("hidden", images.length > 0);
     list.querySelectorAll<HTMLButtonElement>("[data-image-select]").forEach((button) => button.addEventListener("click", () => this.selectImage(button.dataset.imageSelect!)));
     list.querySelectorAll<HTMLButtonElement>("[data-image-remove]").forEach((button) => button.addEventListener("click", () => { this.selectedImageID = button.dataset.imageRemove ?? null; void this.removeSelectedImage(); }));
@@ -2543,6 +2547,11 @@ class NotePadApp {
         byId<HTMLInputElement>("library-search").focus();
       }
       return;
+    }
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.isComposing) {
+      if (event.key === "+" || event.key === "=") { this.canvas?.zoomBy(1.16); return; }
+      if (event.key === "-" || event.key === "_") { this.canvas?.zoomBy(0.86); return; }
+      if (event.key === "0") { this.canvas?.fitToViewport(); return; }
     }
     if (!event.metaKey && !event.ctrlKey && !event.altKey && !this.showTrash) {
       if (this.selectedImageID && (event.key === "Delete" || event.key === "Backspace")) {

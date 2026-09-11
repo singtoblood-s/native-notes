@@ -104,6 +104,21 @@ try {
   await page.waitForFunction(() => document.querySelector("#page-position").textContent === "2 / 2");
   await page.locator("#previous-page").click();
   await page.waitForFunction(() => document.querySelector("#page-position").textContent === "1 / 2");
+  const scroll = await page.evaluate(async () => {
+    const surface = document.querySelector("#ink-canvas");
+    const scroller = document.querySelector("#paper-scroll");
+    const before = scroller.scrollTop;
+    const rect = surface.getBoundingClientRect();
+    const pointer = (type, y) => surface.dispatchEvent(new PointerEvent(type, { pointerId: 22, pointerType: "touch", bubbles: true, cancelable: true, isPrimary: true, clientX: rect.left + 30, clientY: y, button: 0, buttons: 1 }));
+    pointer("pointerdown", rect.top + 350);
+    pointer("pointermove", rect.top + 250);
+    await new Promise(requestAnimationFrame);
+    const after = scroller.scrollTop;
+    pointer("pointercancel", rect.top + 250);
+    scroller.scrollTop = before;
+    return after - before;
+  });
+  assert(scroll > 0, "A finger must scroll the photo page while the pen tool is selected");
   const saves = await page.evaluate(() => window.qa.saves);
   await page.reload();
   await page.locator("[data-open-book]").click();
