@@ -1695,10 +1695,6 @@ class NotePadApp {
       this.setState({ kind: "error", message: "Unsupported image format. Use PNG, JPEG, WebP, or GIF." });
       return;
     }
-    if (file.size > 12 * 1024 * 1024) {
-      this.setState({ kind: "error", message: "That image is larger than 12 MB." });
-      return;
-    }
     try {
       if (!(await this.flushPendingSave())) return;
       if (!this.imageImportContextIsCurrent(context)) return;

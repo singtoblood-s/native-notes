@@ -1,6 +1,6 @@
 import { chromium } from "playwright";
 import { PDFDocument, rgb } from "pdf-lib";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 
@@ -40,16 +40,19 @@ try {
     sheet.drawRectangle({ x: 0, y: 0, width: dimensions[0], height: dimensions[1], color: rgb(.93, .96, 1) });
     sheet.drawText(`${title} PDF test`, { x: 40, y: dimensions[1] - 80, size: 26, color: rgb(.1, .25, .45) });
   }
+  if (process.env.QA_LARGE_MEDIA === "1") source.context.register(source.context.stream(new Uint8Array(55 * 1024 * 1024)));
   const pdfFile = { name: "Mixed pages.pdf", mimeType: "application/pdf", buffer: Buffer.from(await source.save()) };
+  const pdfPath = `${output}/source.pdf`;
+  await writeFile(pdfPath, pdfFile.buffer);
   const imageData = await page.evaluate(() => {
     const canvas = document.createElement("canvas"); canvas.width = 400; canvas.height = 260;
     const context = canvas.getContext("2d"); context.fillStyle = "#eeb530"; context.fillRect(30, 30, 340, 200); context.fillStyle = "#252429"; context.font = "24px sans-serif"; context.fillText("PASTE IMAGE", 100, 140);
     return canvas.toDataURL().split(",")[1];
   });
-  const picture = { name: "Picture.png", mimeType: "image/png", buffer: Buffer.from(imageData, "base64") };
+  const picture = { name: "Picture.png", mimeType: "image/png", buffer: Buffer.concat([Buffer.from(imageData, "base64"), Buffer.alloc(process.env.QA_LARGE_MEDIA === "1" ? 13 * 1024 * 1024 : 0)]) };
   await page.locator("#library-new").click();
   await page.locator("#new-document-pdf").click();
-  await page.locator("#media-input").setInputFiles(pdfFile);
+  await page.locator("#media-input").setInputFiles(pdfPath);
   await page.waitForFunction(() => !document.querySelector("#media-dialog").open, {}, { timeout: 30_000 });
   assert.equal(await page.locator("#page-position").textContent(), "1 / 2");
   await page.evaluate(() => { window.qaSlots = [...document.querySelectorAll(".flow-page")]; });
@@ -145,6 +148,29 @@ try {
   const smallPage = await page.locator("#paper").boundingBox();
   const smallSlot = await page.locator("#active-page-slot").boundingBox();
   assert(Math.abs(smallPage.width - smallSlot.width) < 2, "Small picture pages must match preview geometry");
+  if (process.env.QA_LARGE_MEDIA === "1") {
+    const compression = await page.evaluate(async () => {
+      const { imageCanvas, encodePageImage } = await import(`${location.pathname}src/media.ts`);
+      const source = document.createElement("canvas"); source.width = 3000; source.height = 1800;
+      const context = source.getContext("2d");
+      const pixels = context.createImageData(source.width, source.height);
+      let seed = 12345;
+      const values = new Uint32Array(pixels.data.buffer);
+      for (let i = 0; i < values.length; i++) {
+        seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
+        values[i] = (seed & 0xffffff) | 0xff000000;
+      }
+      context.putImageData(pixels, 0, 0);
+      const blob = await new Promise(resolve => source.toBlob(resolve, "image/png"));
+      const canvas = await imageCanvas(new File([blob], "Large camera image.png", { type: "image/png" }));
+      const encoded = encodePageImage(canvas);
+      return { originalBytes: blob.size, compressedBytes: atob(encoded.split(",")[1]).length, width: canvas.width, height: canvas.height };
+    });
+    assert(compression.originalBytes > 12 * 1024 * 1024);
+    assert(compression.compressedBytes <= 512 * 1024);
+    assert.deepEqual([compression.width, compression.height], [2000, 1200]);
+    console.log("Large media compression:", JSON.stringify(compression));
+  }
   assert.deepEqual(errors, []);
   console.log("PASS: PDF/image import, annotation, native file chooser, text/image clipboard, long press, stable page slots, all view modes, PDF/PNG export, reload, tablet menu, damaged-file recovery.");
 } finally {

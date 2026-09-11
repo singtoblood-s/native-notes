@@ -1,17 +1,17 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { PDFDocument } from "pdf-lib";
-import { importMediaPages, exportPages, mediaType } from "../src/media";
-import { createPage } from "../src/models";
+import { importMediaPages, exportPages, mediaType, encodePageImage, imageCanvas } from "../src/media";
+import { createPage, pageImageDataBytes } from "../src/models";
 
 const mocks = vi.hoisted(() => ({ getDocument: vi.fn(), renderExport: vi.fn() }));
-vi.mock("pdfjs-dist/legacy/build/pdf.mjs", () => ({ getDocument: mocks.getDocument, GlobalWorkerOptions: {} }));
+vi.mock("pdfjs-dist/legacy/build/pdf.mjs", () => ({ getDocument: mocks.getDocument, GlobalWorkerOptions: {}, PDFDataRangeTransport: class { onDataRange = vi.fn(); } }));
 vi.mock("pdfjs-dist/legacy/build/pdf.worker.min.mjs?url", () => ({ default: "/worker.mjs" }));
 vi.mock("../src/canvas", () => ({ renderPageExport: mocks.renderExport }));
 const notebookID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j1ZkAAAAASUVORK5CYII=";
 const pdfFile = (): File => {
   const file = new File(["%PDF-test"], "Lesson.PDF", { type: "" });
-  Object.defineProperty(file, "arrayBuffer", { value: async () => new ArrayBuffer(8) });
+  Object.defineProperty(file, "arrayBuffer", { configurable: true, value: async () => new ArrayBuffer(8) });
   return file;
 };
 
@@ -63,4 +63,41 @@ it("exports a reopenable multi-page PDF in order, with original page sizes", asy
 it("stops export when an image cannot render instead of delivering missing content", async () => {
   mocks.renderExport.mockRejectedValue(new Error("A page image could not be loaded"));
   await expect(exportPages([createPage(notebookID)], "pdf", vi.fn(), new AbortController().signal)).rejects.toThrow("image could not be loaded");
+});
+
+it("reduces resolution when quality alone cannot meet the image budget, preserving source dimensions", () => {
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({ drawImage: vi.fn() } as unknown as CanvasRenderingContext2D);
+  vi.spyOn(HTMLCanvasElement.prototype, "toDataURL").mockImplementation(function (this: HTMLCanvasElement) {
+    return `data:image/png;base64,${"A".repeat(this.width > 1000 ? 200_000 : 40_000)}`;
+  });
+  const canvas = document.createElement("canvas"); canvas.width = 2000; canvas.height = 1500;
+  const src = encodePageImage(canvas, 64 * 1024);
+  expect(pageImageDataBytes(src)).toBeLessThanOrEqual(64 * 1024);
+  expect([canvas.width, canvas.height]).toEqual([2000, 1500]);
+});
+
+it("accepts PDFs above the former 50 MB ceiling without reading the entire file", async () => {
+  const file = pdfFile();
+  Object.defineProperty(file, "size", { value: 80 * 1024 * 1024 });
+  const wholeRead = vi.spyOn(file, "arrayBuffer");
+  const slice = vi.spyOn(file, "slice").mockReturnValue({ arrayBuffer: async () => new ArrayBuffer(16) } as Blob);
+  mocks.getDocument.mockImplementation(options => {
+    options.range.requestDataRange(1024, 1040);
+    return { destroy: vi.fn(), promise: Promise.resolve({ numPages: 1, getPage: async () => ({
+      getViewport: ({ scale }: { scale: number }) => ({ width: 600 * scale, height: 800 * scale }), render: () => ({ promise: Promise.resolve() }), cleanup: vi.fn(),
+    }) }) };
+  });
+  const pages = await importMediaPages([file], notebookID, 0, vi.fn(), new AbortController().signal);
+  expect(pages).toHaveLength(1);
+  expect(wholeRead).not.toHaveBeenCalled();
+  expect(slice).toHaveBeenCalledWith(1024, 1040);
+});
+
+it("rejects sources beyond the device memory guard before decoding", async () => {
+  const file = pdfFile();
+  Object.defineProperty(file, "size", { value: 251 * 1024 * 1024 });
+  await expect(importMediaPages([file], notebookID, 0, vi.fn(), new AbortController().signal)).rejects.toThrow("250 MB");
+  const picture = new File(["x"], "large.png", { type: "image/png" });
+  Object.defineProperty(picture, "size", { value: 51 * 1024 * 1024 });
+  await expect(imageCanvas(picture)).rejects.toThrow("50 MB");
 });

@@ -9,7 +9,7 @@ import {
   SyncOperation,
   toWirePayload,
 } from "./models";
-import { fetchWithTimeout, getEndpoint, parseJSON, readError } from "./auth";
+import { requestWithTimeout, getEndpoint, readError } from "./auth";
 import { NoteStore } from "./storage";
 
 const MAX_PUSH_OPERATIONS = 10;
@@ -19,6 +19,7 @@ const MAX_OPERATION_PAYLOAD_BYTES = 32 * 1024 * 1024;
 const MAX_LARGE_PUSH_BYTES = 34 * 1024 * 1024;
 const MAX_PENDING_OPERATIONS = 100;
 const MAX_PULL_PAGES = 1000;
+const MAX_PUSH_ROUNDS = 10;
 const PUSH_BLOCKED_REASON = "A note change exceeds the 32 MiB server limit; it remains queued.";
 const textEncoder = new TextEncoder();
 
@@ -64,6 +65,8 @@ function selectPushBatchDetails(operations: SyncOperation[], maxBytes: number): 
   const batch: SyncOperation[] = [];
   const entities = new Set<string>();
   let skippedOversized = false;
+  const envelopeBytes = encodedPushSize([]);
+  let requestBytes = envelopeBytes;
   for (const operation of operations) {
     const item = sizeOperation(operation);
     const entityKey = `${operation.entityType}:${operation.entityId}`;
@@ -77,8 +80,7 @@ function selectPushBatchDetails(operations: SyncOperation[], maxBytes: number): 
       skippedOversized = true;
       continue;
     }
-    const candidate = [...batch, operation];
-    const size = encodedPushSize(candidate);
+    const size = requestBytes + item.requestBytes - envelopeBytes + (batch.length ? 1 : 0);
     if (size > maxBytes) {
       if (batch.length === 0 && item.requestBytes > maxBytes) {
         batch.push(operation);
@@ -87,6 +89,7 @@ function selectPushBatchDetails(operations: SyncOperation[], maxBytes: number): 
       break;
     }
     batch.push(operation);
+    requestBytes = size;
     if (batch.length >= MAX_PUSH_OPERATIONS) break;
   }
   return { batch, skippedOversized };
@@ -97,10 +100,10 @@ function encodedPushSize(operations: SyncOperation[]): number {
 }
 
 function sizeOperation(operation: SyncOperation): SizedOperation {
-  const payload = toWirePayload(operation);
+  const wire = toWireOperation(operation);
   return {
-    payloadBytes: textEncoder.encode(JSON.stringify(payload)).byteLength,
-    requestBytes: encodedPushSize([operation]),
+    payloadBytes: textEncoder.encode(JSON.stringify(wire.payload)).byteLength,
+    requestBytes: textEncoder.encode(JSON.stringify({ operations: [wire] })).byteLength,
   };
 }
 
@@ -121,17 +124,18 @@ function toWireOperation(operation: SyncOperation): Record<string, unknown> {
 }
 
 export class SyncClient {
-  private active: Promise<SyncReport> | null = null;
-  private readonly partialPulls = new WeakMap<NoteStore, { accountKey: string; count: number }>();
+  private readonly active = new WeakMap<NoteStore, Promise<SyncReport>>();
+  private readonly partialPulls = new WeakMap<NoteStore, { accountKey: string; count: number; conflicts: number; blockedReason?: string }>();
 
   async sync(store: NoteStore, session: AuthResponse | null): Promise<SyncReport> {
-    if (this.active) return this.active;
+    const existing = this.active.get(store);
+    if (existing) return existing;
     const run = this.runSync(store, session);
-    this.active = run;
+    this.active.set(store, run);
     try {
       return await run;
     } finally {
-      if (this.active === run) this.active = null;
+      if (this.active.get(store) === run) this.active.delete(store);
     }
   }
 
@@ -153,10 +157,16 @@ export class SyncClient {
         await this.pushAll(store, endpoint, session.sessionToken, report);
         await this.pullAll(store, endpoint, session.sessionToken, report);
       } catch (error) {
-        this.rememberPartialPull(store, expectedAccountKey, report.pulled);
+        this.rememberPartialPull(store, expectedAccountKey, report);
         throw error;
       }
-      report.pulled += this.consumePartialPull(store, expectedAccountKey);
+      const partial = this.partialPulls.get(store);
+      if (partial?.accountKey === expectedAccountKey) {
+        report.pulled += partial.count;
+        report.conflicts += partial.conflicts;
+        if (partial.blockedReason && !report.blockedReason) report.blockedReason = partial.blockedReason;
+        this.partialPulls.delete(store);
+      }
       return report;
     } finally {
       releaseLease?.();
@@ -164,9 +174,9 @@ export class SyncClient {
   }
 
   private async pushAll(store: NoteStore, endpoint: string, token: string, report: SyncReport): Promise<void> {
-    let rounds = 0;
-    while (true) {
-      if (++rounds > MAX_PULL_PAGES) throw new Error("Sync has too many pending note changes; try again later.");
+    // Continuous drawing must still give remote updates a turn. The durable
+    // remainder is picked up by the coordinator's next scheduled run.
+    for (let rounds = 0; rounds < MAX_PUSH_ROUNDS; rounds++) {
       const available = await store.pendingOperations(MAX_PENDING_OPERATIONS);
       if (available.length === 0) return;
       const selection = selectPushBatchDetails(available, MAX_PUSH_BYTES);
@@ -188,15 +198,11 @@ export class SyncClient {
       const requestLimit = immutableBatch.length === 1 && immutableSizes[0]!.requestBytes > MAX_PUSH_BYTES
         ? MAX_LARGE_PUSH_BYTES
         : MAX_PUSH_BYTES;
-      if (immutableSizes.some(isOversized) || encodedPushSize(immutableBatch) > requestLimit) {
+      if (immutableSizes.some(isOversized)) {
         report.blockedReason = PUSH_BLOCKED_REASON;
         return;
       }
-      const push = await this.request<PushResponse>(`${endpoint}/v1/sync/push`, token, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ operations: immutableBatch.map(toWireOperation) }),
-      });
+      const push = await this.pushBatch(endpoint, token, immutableBatch, requestLimit);
       const results = validatePushResponse(push, immutableBatch);
       const byID = new Map(immutableBatch.map((operation) => [operation.opId, operation]));
       for (const result of results) {
@@ -229,13 +235,43 @@ export class SyncClient {
           await store.markOperationAcked(result.opId, result.revision ?? undefined, Boolean(result.serverPayload));
           continue;
         }
-        await store.createConflictCopyFromOperation(operation, operation.entityId);
-        await store.markOperationAcked(result.opId, result.revision ?? undefined);
-        throw new Error(result.code ? `The server rejected a note change (${result.code}).` : "The server rejected a note change.");
+        // A rejected payload must not breed another identical upload forever.
+        // Keep a durable, visible local recovery copy before retiring the receipt.
+        await store.createConflictCopyFromOperation(operation, operation.entityId, false);
+        await store.markOperationAcked(result.opId, undefined, false);
+        report.conflicts += 1;
+        report.blockedReason = `A change needs review (${result.code ?? "rejected"}). A local recovery copy was kept. Review Recovered copies / Documents; other notes can still sync.`;
       }
       // PushResponse.cursor is only an informational high-water mark. Pull is
       // the sole owner of the local cursor because it returns every change.
     }
+  }
+
+  private async pushBatch(endpoint: string, token: string, batch: SyncOperation[], maxBytes: number): Promise<PushResponse> {
+    if (batch.length > 1 && encodedPushSize(batch) > maxBytes) return this.splitPushBatch(endpoint, token, batch, maxBytes);
+    try {
+      return await this.request<PushResponse>(`${endpoint}/v1/sync/push`, token, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ operations: batch.map(toWireOperation) }),
+      });
+    } catch (error) {
+      // A proxy or D1 query budget may be smaller than the client estimate.
+      // Retrying immutable operation IDs is safe even after a lost response.
+      if (error instanceof SyncHttpError && error.status === 413 && batch.length > 1) return this.splitPushBatch(endpoint, token, batch, maxBytes);
+      throw error;
+    }
+  }
+
+  private async splitPushBatch(endpoint: string, token: string, batch: SyncOperation[], maxBytes: number): Promise<PushResponse> {
+    const middle = Math.ceil(batch.length / 2);
+    const left = batch.slice(0, middle);
+    const right = batch.slice(middle);
+    const first = await this.pushBatch(endpoint, token, left, maxBytes);
+    validatePushResponse(first, left);
+    const second = await this.pushBatch(endpoint, token, right, maxBytes);
+    validatePushResponse(second, right);
+    return { results: [...first.results, ...second.results], cursor: Math.max(first.cursor, second.cursor) };
   }
 
   private async pullAll(store: NoteStore, endpoint: string, token: string, report: SyncReport): Promise<void> {
@@ -262,28 +298,33 @@ export class SyncClient {
     throw new Error("Sync returned too many pages; try again later.");
   }
 
-  private rememberPartialPull(store: NoteStore, accountKey: string, count: number): void {
-    if (count === 0) return;
+  private rememberPartialPull(store: NoteStore, accountKey: string, report: SyncReport): void {
+    if (report.pulled === 0 && report.conflicts === 0) return;
     const previous = this.partialPulls.get(store);
     const previousCount = previous?.accountKey === accountKey ? previous.count : 0;
-    this.partialPulls.set(store, { accountKey, count: previousCount + count });
-  }
-
-  private consumePartialPull(store: NoteStore, accountKey: string): number {
-    const partial = this.partialPulls.get(store);
-    if (!partial || partial.accountKey !== accountKey) return 0;
-    this.partialPulls.delete(store);
-    return partial.count;
+    this.partialPulls.set(store, {
+      accountKey, count: previousCount + report.pulled,
+      conflicts: (previous?.accountKey === accountKey ? previous.conflicts : 0) + report.conflicts,
+      blockedReason: report.blockedReason ?? (previous?.accountKey === accountKey ? previous.blockedReason : undefined),
+    });
   }
 
   private async request<T>(input: RequestInfo | URL, token: string, init: RequestInit): Promise<T> {
-    const response = await fetchWithTimeout(input, {
+    // Large ink pages may take minutes over mobile data. Bound downloads too,
+    // so a stalled response body cannot keep the coordinator active forever.
+    const bytes = typeof init.body === "string" ? textEncoder.encode(init.body).byteLength : 0;
+    const timeoutMs = init.method === "GET" ? 5 * 60_000 : Math.min(5 * 60_000, Math.max(60_000, 30_000 + bytes / (32 * 1024) * 1000));
+    return requestWithTimeout(input, {
       ...init,
       headers: { ...(init.headers ?? {}), Authorization: `Bearer ${token}` },
-    });
-    const payload = await parseJSON(response);
-    if (!response.ok) throw new SyncHttpError(response.status, readError(payload, `Sync failed (${response.status}).`), readCode(payload));
-    return payload as unknown as T;
+    }, async response => {
+      const body = await response.text();
+      let payload: Record<string, unknown> = {};
+      try { payload = JSON.parse(body); } catch { /* Preserve HTTP status for non-JSON proxy errors. */ }
+      if (!payload || typeof payload !== "object") payload = {};
+      if (!response.ok) throw new SyncHttpError(response.status, readError(payload, `Sync failed (${response.status}).`), readCode(payload));
+      return payload as unknown as T;
+    }, timeoutMs);
   }
 }
 
@@ -325,6 +366,7 @@ function validatePullResponse(payload: PullResponse, cursor: number): PullRespon
     previous = change.sequence;
   }
   if (payload.changes.length > 0 && payload.nextCursor !== previous) throw new Error("The server returned a non-monotonic pull cursor.");
+  if (payload.hasMore && payload.nextCursor <= cursor) throw new Error("The server returned a pull page without progress.");
   return payload;
 }
 

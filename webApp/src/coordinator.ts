@@ -62,6 +62,7 @@ export class SyncCoordinator {
   private statusValue: SyncCoordinatorStatus = emptyStatus();
   private started = false;
   private timer: number | null = null;
+  private timerAt = 0;
   private active: Promise<void> | null = null;
   private requested = false;
   private nextReason = "startup";
@@ -81,6 +82,11 @@ export class SyncCoordinator {
   private readonly handleVisibility = (): void => {
     if (this.isVisible()) this.schedule(0, "foreground");
     else this.cancelTimer();
+  };
+
+  private readonly handleResume = (): void => {
+    this.retryCount = 0;
+    this.schedule(0, "resume");
   };
 
   constructor(options: SyncCoordinatorOptions) {
@@ -108,6 +114,8 @@ export class SyncCoordinator {
     window.addEventListener("online", this.handleOnline);
     window.addEventListener("offline", this.handleOffline);
     document.addEventListener("visibilitychange", this.handleVisibility);
+    document.addEventListener("resume", this.handleResume);
+    window.addEventListener("pageshow", this.handleResume);
     if (!this.isOnline()) {
       this.publish({ state: "offline", error: null });
       return;
@@ -124,6 +132,8 @@ export class SyncCoordinator {
     window.removeEventListener("online", this.handleOnline);
     window.removeEventListener("offline", this.handleOffline);
     document.removeEventListener("visibilitychange", this.handleVisibility);
+    document.removeEventListener("resume", this.handleResume);
+    window.removeEventListener("pageshow", this.handleResume);
   }
 
   /** Call after login, logout, endpoint changes, or a guest/account switch. */
@@ -166,7 +176,10 @@ export class SyncCoordinator {
       return;
     }
     // A local edit should shorten an already scheduled periodic wake-up.
+    // Frequent pen saves must not postpone an earlier wake-up indefinitely.
+    if (this.timer !== null && this.timerAt <= Date.now() + delay) return;
     this.cancelTimer();
+    this.timerAt = Date.now() + delay;
     if (reason === "local-write") this.publish({ state: "scheduled", reason, error: null });
     this.timer = window.setTimeout(() => {
       this.timer = null;
@@ -207,6 +220,7 @@ export class SyncCoordinator {
       this.publishIfCurrent(generation, { state: "offline", error: null });
       return;
     }
+    if (!this.isVisible()) return;
     if (!session || store.accountKey === "guest" || !getEndpoint()) {
       this.publishIfCurrent(generation, { state: "needs-login", error: null });
       return;

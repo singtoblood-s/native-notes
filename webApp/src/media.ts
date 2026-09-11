@@ -2,6 +2,9 @@ import { createPage, id, pageImageDataBytes, MAX_PAGE_IMAGE_BYTES, type NotePage
 import { renderPageExport } from "./canvas";
 
 export const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const MAX_IMAGE_FILE_BYTES = 50 * 1024 * 1024;
+const MAX_PDF_FILE_BYTES = 250 * 1024 * 1024;
+const IMPORT_IMAGE_BUDGET = 36 * 1024 * 1024;
 export type MediaProgress = (message: string) => void;
 
 export function mediaType(file: File): string {
@@ -14,21 +17,37 @@ export function canvasBlob(canvas: HTMLCanvasElement, type = "image/png"): Promi
   return new Promise((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error("Could not encode this image.")), type));
 }
 
-export function encodePageImage(canvas: HTMLCanvasElement): string {
-  let src = canvas.toDataURL("image/png");
-  if ((pageImageDataBytes(src) ?? Infinity) > MAX_PAGE_IMAGE_BYTES) {
-    for (const quality of [.9, .8, .65]) {
-      src = canvas.toDataURL("image/webp", quality);
-      if ((pageImageDataBytes(src) ?? Infinity) <= MAX_PAGE_IMAGE_BYTES) break;
+export function encodePageImage(canvas: HTMLCanvasElement, maxBytes = 512 * 1024): string {
+  const budget = Math.min(MAX_PAGE_IMAGE_BYTES, Math.max(16 * 1024, maxBytes));
+  // Keep lossless output when small; otherwise reduce quality before resolution.
+  // Resize a separate canvas so the page's aspect ratio/physical size is unchanged.
+  let current = canvas;
+  try {
+    while (true) {
+      let src = current.toDataURL("image/png");
+      if ((pageImageDataBytes(src) ?? Infinity) <= budget) return src;
+      for (const quality of [.9, .8, .65]) {
+        src = current.toDataURL("image/webp", quality);
+        if ((pageImageDataBytes(src) ?? Infinity) <= budget) return src;
+      }
+      if (Math.max(current.width, current.height) <= 256) throw new Error("Could not compress this image. Try a different picture.");
+      const smaller = document.createElement("canvas");
+      smaller.width = Math.max(1, Math.round(current.width * .75));
+      smaller.height = Math.max(1, Math.round(current.height * .75));
+      const context = smaller.getContext("2d");
+      if (!context) throw new Error("Image rendering is unavailable.");
+      context.drawImage(current, 0, 0, smaller.width, smaller.height);
+      if (current !== canvas) current.width = current.height = 1;
+      current = smaller;
     }
+  } finally {
+    if (current !== canvas) current.width = current.height = 1;
   }
-  if ((pageImageDataBytes(src) ?? Infinity) > MAX_PAGE_IMAGE_BYTES) throw new Error("This page image is too large. Choose a smaller image.");
-  return src;
 }
 
 export async function imageCanvas(file: File): Promise<HTMLCanvasElement> {
   if (!IMAGE_TYPES.has(mediaType(file))) throw new Error("Use PNG, JPEG, WebP or GIF images.");
-  if (file.size > 12 * 1024 * 1024) throw new Error("Images must be 12 MB or smaller.");
+  if (file.size > MAX_IMAGE_FILE_BYTES) throw new Error("Images must be 50 MB or smaller before compression.");
   const url = URL.createObjectURL(file);
   try {
     const image = new Image();
@@ -54,10 +73,10 @@ export async function importMediaPages(files: File[], notebookID: string, firstO
   if (!files.length || files.length > 100) throw new Error("Choose between 1 and 100 files.");
   const pages: NotePage[] = [];
   let bytes = 0;
-  const append = (canvas: HTMLCanvasElement, title: string, dimensions?: { width: number; height: number }): void => {
+  const append = (canvas: HTMLCanvasElement, title: string, remaining: number, dimensions?: { width: number; height: number }): void => {
     signal.throwIfAborted();
     if (pages.length >= 100) throw new Error("Import up to 100 pages at a time. Split this document first.");
-    const src = encodePageImage(canvas);
+    const src = encodePageImage(canvas, Math.min(512 * 1024, Math.floor((IMPORT_IMAGE_BUDGET - bytes) * .75 / remaining)));
     bytes += src.length;
     if (bytes > 38 * 1024 * 1024) throw new Error("Imported pages exceed 38 MB. Split this document first.");
     const page = createPage(notebookID, title.slice(0, 500));
@@ -73,22 +92,32 @@ export async function importMediaPages(files: File[], notebookID: string, firstO
     page.images = [{ id: id(), src, x: 0, y: 0, width: page.width, height: page.height }];
     pages.push(page);
   };
-  for (const file of files) {
+  for (const [fileIndex, file] of files.entries()) {
     signal.throwIfAborted();
     progress(`Opening ${file.name}…`);
     const title = file.name.replace(/\.[^.]+$/, "") || "Imported page";
     if (mediaType(file) !== "application/pdf") {
       progress(`Opening ${file.name}…`);
       const canvas = await imageCanvas(file);
-      try { append(canvas, title); } finally { canvas.width = canvas.height = 1; }
+      try { append(canvas, title, files.length - fileIndex); } finally { canvas.width = canvas.height = 1; }
       continue;
     }
-    if (file.size > 50 * 1024 * 1024) throw new Error("PDF files must be 50 MB or smaller.");
+    if (file.size > MAX_PDF_FILE_BYTES) throw new Error("PDF files must be 250 MB or smaller before compression.");
     const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
     const { default: worker } = await import("pdfjs-dist/legacy/build/pdf.worker.min.mjs?url");
     pdfjs.GlobalWorkerOptions.workerSrc = worker;
     const base = `${import.meta.env.BASE_URL}pdfjs/`;
-    const task = pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), cMapUrl: `${base}cmaps/`, cMapPacked: true, standardFontDataUrl: `${base}standard_fonts/`, wasmUrl: `${base}wasm/` });
+    signal.throwIfAborted();
+    // Read local PDFs in ranges instead of copying the entire source into the UI.
+    const range = new pdfjs.PDFDataRangeTransport(file.size, null);
+    let stopped = false;
+    range.abort = () => { stopped = true; };
+    range.requestDataRange = (begin, end) => {
+      void file.slice(begin, end).arrayBuffer().then(buffer => {
+        if (!stopped && !signal.aborted) range.onDataRange(begin, new Uint8Array(buffer));
+      }).catch(() => { if (!stopped) void task.destroy(); });
+    };
+    const task = pdfjs.getDocument({ range, rangeChunkSize: 256 * 1024, disableStream: true, disableAutoFetch: true, cMapUrl: `${base}cmaps/`, cMapPacked: true, standardFontDataUrl: `${base}standard_fonts/`, wasmUrl: `${base}wasm/` });
     const cancel = (): void => { void task.destroy(); };
     signal.addEventListener("abort", cancel, { once: true });
     task.onPassword = () => { void task.destroy(); };
@@ -97,7 +126,7 @@ export async function importMediaPages(files: File[], notebookID: string, firstO
       if (pdf.numPages + pages.length > 100) throw new Error("Import up to 100 PDF pages at a time. Split this document first.");
       for (let index = 1; index <= pdf.numPages; index++) {
         signal.throwIfAborted();
-        progress(`${file.name} · page ${index} of ${pdf.numPages}`);
+        progress(`${file.name} · compressing page ${index} of ${pdf.numPages}`);
         const page = await pdf.getPage(index);
         const natural = page.getViewport({ scale: 1 });
         const viewport = page.getViewport({ scale: 2000 / Math.max(natural.width, natural.height) });
@@ -106,7 +135,7 @@ export async function importMediaPages(files: File[], notebookID: string, firstO
         canvas.height = Math.ceil(viewport.height);
         try {
           await page.render({ canvas, viewport }).promise;
-          append(canvas, `${title} · ${index}`, { width: natural.width / .75, height: natural.height / .75 });
+          append(canvas, `${title} · ${index}`, pdf.numPages - index + files.length - fileIndex, { width: natural.width / .75, height: natural.height / .75 });
         } finally { page.cleanup(); canvas.width = canvas.height = 1; }
         await new Promise(resolve => setTimeout(resolve, 0));
       }

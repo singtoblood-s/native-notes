@@ -212,15 +212,27 @@ export class AuthClient {
 }
 
 export async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs = 15000): Promise<Response> {
+  return requestWithTimeout(input, init, async response => response, timeoutMs);
+}
+
+/** Keep the deadline active while consuming the body, not only until headers arrive. */
+export async function requestWithTimeout<T>(input: RequestInfo | URL, init: RequestInit, consume: (response: Response) => Promise<T>, timeoutMs: number): Promise<T> {
   const controller = new AbortController();
+  const suspend = (): void => controller.abort();
+  document.addEventListener("freeze", suspend);
+  window.addEventListener("pagehide", suspend);
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(input, { ...init, signal: controller.signal });
+    const response = await fetch(input, { ...init, signal: controller.signal });
+    return await consume(response);
   } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") throw new Error("The request timed out. Your notes are still safe offline.");
-    throw new Error("Network unavailable. Your notes are still safe offline.");
+    if (controller.signal.aborted) throw new Error("The request timed out. Your notes are still safe offline.");
+    if (error instanceof TypeError) throw new Error("Network unavailable. Your notes are still safe offline.");
+    throw error;
   } finally {
     window.clearTimeout(timeout);
+    document.removeEventListener("freeze", suspend);
+    window.removeEventListener("pagehide", suspend);
   }
 }
 

@@ -85,11 +85,117 @@ function fakeStore(initial: SyncOperation[], initialCursor = 0): { store: NoteSt
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   localStorage.clear();
 });
 
 describe("sync durability protocol", () => {
+  it("refreshes recovery copies after a later network failure and retry", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const fake = fakeStore([operation(operationID)]);
+    let pulls = 0;
+    vi.stubGlobal("fetch", vi.fn(async input => {
+      if (String(input).includes("/push")) return new Response(JSON.stringify({ results: [{ opId: operationID, status: "rejected", code: "legacy_format" }], cursor: 0 }));
+      if (++pulls === 1) throw new TypeError("Offline");
+      return new Response(JSON.stringify({ changes: [], nextCursor: 0, hasMore: false }));
+    }));
+    const client = new SyncClient();
+    await expect(client.sync(fake.store, session)).rejects.toThrow("Network unavailable");
+    const retried = await client.sync(fake.store, session);
+    expect(retried.conflicts).toBe(1);
+    expect(retried.blockedReason).toContain("Recovered copies");
+    expect((await client.sync(fake.store, session)).conflicts).toBe(0);
+    expect(fake.store.createConflictCopyFromOperation).toHaveBeenCalledTimes(1);
+  });
+  it("gives pulls a turn while a large outbox still has uploads remaining", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const operations = Array.from({ length: 101 }, (_, index) => {
+      const suffix = String(index + 10).padStart(12, "0");
+      return operation(`00000000-0000-4000-8000-${suffix}`, `10000000-0000-4000-8000-${suffix}`);
+    });
+    const fake = fakeStore(operations);
+    vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+      if (!String(input).includes("/push")) return new Response(JSON.stringify({ changes: [], nextCursor: 0, hasMore: false }));
+      const batch = JSON.parse(String(init.body)).operations as SyncOperation[];
+      return new Response(JSON.stringify({ results: batch.map(item => ({ opId: item.opId, status: "acked", revision: 1 })), cursor: 0 }));
+    }));
+    const client = new SyncClient();
+    expect((await client.sync(fake.store, session)).pushed).toBe(100);
+    expect(fake.pulled).toHaveLength(1);
+    expect(fake.remaining()).toHaveLength(1);
+    expect((await client.sync(fake.store, session)).pushed).toBe(1);
+  });
+
+  it("releases a frozen network request without changing its retry payload", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const fake = fakeStore([operation(operationID)]);
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async (_input, init) => {
+      started();
+      return new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true }));
+    }));
+    const failed = expect(new SyncClient().sync(fake.store, session)).rejects.toThrow("notes are still safe offline");
+    await ready;
+    document.dispatchEvent(new Event("freeze"));
+    await failed;
+    expect(fake.remaining()[0]).toMatchObject({ opId: operationID, baseRevision: 0, state: "sending" });
+  });
+  it("preserves a rejected change once, processes the other ACKs, and still pulls", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const fake = fakeStore([operation(operationID), operation(secondOperationID, pageID)]);
+    vi.stubGlobal("fetch", vi.fn(async input => new Response(JSON.stringify(String(input).includes("/push")
+      ? { results: [{ opId: operationID, status: "rejected", code: "notebook_deleted" }, { opId: secondOperationID, status: "acked", revision: 1 }], cursor: 1 }
+      : { changes: [], nextCursor: 1, hasMore: false }))));
+    const client = new SyncClient();
+    const report = await client.sync(fake.store, session);
+    expect(report).toMatchObject({ pushed: 1, conflicts: 1 });
+    expect(report.blockedReason).toContain("Recovered copies");
+    expect(fake.store.createConflictCopyFromOperation).toHaveBeenCalledWith(expect.objectContaining({ opId: operationID }), notebookID, false);
+    expect(fake.remaining()).toHaveLength(0);
+    expect(fake.pulled).toHaveLength(1);
+    await client.sync(fake.store, session);
+    expect(fake.store.createConflictCopyFromOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it("splits a server-limited batch and retains operation IDs and parent-first order", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const fake = fakeStore([operation(operationID), operation(secondOperationID, pageID)]);
+    const batches: string[][] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+      if (!String(input).includes("/push")) return new Response(JSON.stringify({ changes: [], nextCursor: 0, hasMore: false }));
+      const operations = JSON.parse(String(init.body)).operations as SyncOperation[];
+      batches.push(operations.map(item => item.opId));
+      if (operations.length > 1) return new Response("Proxy limit", { status: 413 });
+      return new Response(JSON.stringify({ results: operations.map(item => ({ opId: item.opId, status: "acked", revision: 1 })), cursor: 1 }));
+    }));
+    expect((await new SyncClient().sync(fake.store, session)).pushed).toBe(2);
+    expect(batches).toEqual([[operationID, secondOperationID], [operationID], [secondOperationID]]);
+  });
+
+  it("times out a stalled response body and retries the exact durable operation", async () => {
+    vi.useFakeTimers();
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const fake = fakeStore([operation(operationID)]);
+    vi.stubGlobal("fetch", vi.fn(async (_input, init) => ({ text: () => new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    }) })));
+    const client = new SyncClient();
+    const failure = expect(client.sync(fake.store, session)).rejects.toThrow("timed out");
+    await vi.advanceTimersByTimeAsync(60_001);
+    await failure;
+    expect(fake.remaining()[0]).toMatchObject({ opId: operationID, state: "sending" });
+  });
+
+  it("stops a non-progressing pull instead of sending 1000 identical requests", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const fake = fakeStore([]);
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ changes: [], nextCursor: 0, hasMore: true })));
+    vi.stubGlobal("fetch", fetch);
+    await expect(new SyncClient().sync(fake.store, session)).rejects.toThrow("without progress");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
   it("leaves the local cursor to pull even when push reports a higher cursor", async () => {
     localStorage.setItem("notepad.endpoint", "https://sync.example.test");
     const fake = fakeStore([operation(operationID)]);

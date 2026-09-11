@@ -94,7 +94,7 @@ export interface NoteStore {
   archiveNotebook(id: string): Promise<SaveResult>;
   restoreNotebook(id: string): Promise<SaveResult>;
   createConflictCopy(page: NotePage, originalPageID: string): Promise<NotePage>;
-  createConflictCopyFromOperation(operation: SyncOperation, originalPageID?: string): Promise<void>;
+  createConflictCopyFromOperation(operation: SyncOperation, originalPageID?: string, queueRecovery?: boolean): Promise<void>;
   pendingOperations(limit?: number): Promise<SyncOperation[]>;
   getOperation(opID: string): Promise<SyncOperation | null>;
   markOperationSending(opID: string): Promise<void>;
@@ -548,6 +548,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     const rows = this.query<{ id: unknown; json: unknown }>("SELECT id, json FROM pages WHERE revision = 0 AND deleted_at IS NULL");
     for (const row of rows) {
       if (typeof row.id !== "string" || typeof row.json !== "string") continue;
+      if (this.query("SELECT 1 FROM metadata WHERE key = ?", [`local-recovery:${row.id}`]).length > 0) continue;
       let page: NotePage;
       try {
         const decoded = JSON.parse(row.json) as Partial<NotePage>;
@@ -685,7 +686,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     const latest = this.query<Record<string, unknown>>(
       `SELECT op_id, action, state FROM outbox
        WHERE entity_type = ? AND entity_id = ? AND state IN ('pending', 'sending')
-       ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+       ORDER BY rowid DESC LIMIT 1`,
       [operation.entityType, operation.entityId],
     )[0];
     if (latest && latest.state === "pending" && latest.action === operation.action && typeof latest.op_id === "string") {
@@ -723,6 +724,13 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       bind: [saved.id, saved.notebookId, saved.revision, saved.deletedAt, JSON.stringify(saved)],
     });
     if (!queue) return { status: "saved", revision: saved.revision };
+    // Locally recovered notebooks may not have a server revision yet. Queue
+    // their parent before the first user edit creates a child upload.
+    const parentRow = this.row(saved.notebookId, "notebooks");
+    const parent = parentRow ? this.notebookFromRow(parentRow) : null;
+    if (parent && parent.revision === 0 && !parent.deletedAt && this.query("SELECT 1 FROM outbox WHERE entity_type = 'notebook' AND entity_id = ? LIMIT 1", [parent.id]).length === 0) {
+      this.queueOperation({ entityType: "notebook", entityId: parent.id, baseRevision: 0, action: "upsert", payload: parent as unknown as Record<string, unknown> });
+    }
     const operationID = this.queueOperation({
       entityType: "page",
       entityId: saved.id,
@@ -838,7 +846,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     return copy;
   }
 
-  async createConflictCopyFromOperation(operation: SyncOperation, originalPageID = operation.entityId): Promise<void> {
+  async createConflictCopyFromOperation(operation: SyncOperation, originalPageID = operation.entityId, queueRecovery = true): Promise<void> {
     const operationID = requireUUID(operation.opId, "Operation ID");
     await this.transaction(() => {
       // Conflict recovery runs before the outbox row is acknowledged. The
@@ -850,7 +858,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
         const page = validatePageSnapshot(operation.payload, operation.entityId);
         const notebook = this.notebookFromRow(this.row(page.notebookId, "notebooks"));
         let notebookID = page.notebookId;
-        if (!notebook || notebook.deletedAt) {
+        if (!queueRecovery || !notebook || notebook.deletedAt) {
           const recoveredNotebook = notebook
             ? { ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() }
             : createNotebook("Recovered page");
@@ -862,7 +870,8 @@ export class SQLiteNoteStoreEngine implements NoteStore {
         }
         const copy = sanitizePage({ ...page, id: id(), notebookId: notebookID, title: conflictTitle(page.title, MAX_PAGE_TITLE), revision: 0, conflictOf: originalPageID, deletedAt: null });
         this.savePageRow(copy, false);
-        if (typeof this.queueOperation === "function") this.queueOperation({
+        if (!queueRecovery) this.db.exec({ sql: "INSERT INTO metadata(key, value) VALUES(?, '1') ON CONFLICT(key) DO NOTHING", bind: [`local-recovery:${copy.id}`] });
+        if (queueRecovery && typeof this.queueOperation === "function") this.queueOperation({
           entityType: "page",
           entityId: copy.id,
           baseRevision: 0,
@@ -875,7 +884,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
         const notebook = validateNotebookSnapshot(operation.payload, operation.entityId);
         // The recovered notebook is a valid place for the user to create a new
         // page immediately, so make its server-side parent durable first.
-        this.saveNotebookRow({ ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() }, true);
+        this.saveNotebookRow({ ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() }, queueRecovery);
       } else {
         this.insertConflictDirect(operation.entityType, operation.entityId, operation.payload, "rejected local operation", 0);
       }
@@ -886,7 +895,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
   async pendingOperations(limit = 50): Promise<SyncOperation[]> {
     const bounded = Math.min(100, Math.max(1, limit));
     return this.query(`SELECT op_id, entity_type, entity_id, base_revision, action, payload, created_at, state
-      FROM outbox WHERE state IN ('pending', 'sending') ORDER BY created_at, rowid LIMIT ?`, [bounded]).map((row) => this.operationFromRow(row)).filter((value): value is SyncOperation => value !== null);
+      FROM outbox WHERE state IN ('pending', 'sending') ORDER BY rowid LIMIT ?`, [bounded]).map((row) => this.operationFromRow(row)).filter((value): value is SyncOperation => value !== null);
   }
 
   async getOperation(opID: string): Promise<SyncOperation | null> {
@@ -957,7 +966,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
         if (checkedChange.revision > 0) this.db.exec({ sql: "UPDATE outbox SET base_revision = ? WHERE entity_type = ? AND entity_id = ? AND state = 'pending'", bind: [checkedChange.revision, checkedChange.entityType, checkedChange.entityId] });
         return;
       }
-      this.applySnapshotDirect(checkedChange);
+      this.applySnapshotDirect(checkedChange, true);
     });
   }
 
@@ -1152,7 +1161,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
 
   private pendingForEntityDirect(entityType: SyncEntityType, entityID: string): SyncOperation[] {
     return this.query(`SELECT op_id, entity_type, entity_id, base_revision, action, payload, created_at, state
-      FROM outbox WHERE entity_type = ? AND entity_id = ? AND state IN ('pending', 'sending') ORDER BY created_at, rowid`, [entityType, entityID]).map((row) => this.operationFromRow(row)).filter((value): value is SyncOperation => value !== null);
+      FROM outbox WHERE entity_type = ? AND entity_id = ? AND state IN ('pending', 'sending') ORDER BY rowid`, [entityType, entityID]).map((row) => this.operationFromRow(row)).filter((value): value is SyncOperation => value !== null);
   }
 
   private applyRemoteDirect(change: PullChange): void {
@@ -1177,10 +1186,10 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     this.applySnapshotDirect(change);
   }
 
-  private applySnapshotDirect(change: PullChange): void {
+  private applySnapshotDirect(change: PullChange, authoritative = false): void {
     if (change.entityType === "page") {
       const current = this.pageFromRow(this.row(change.entityId, "pages"));
-      if (current && current.revision >= change.revision) return;
+      if (!authoritative && current && current.revision >= change.revision) return;
       if (change.action === "delete") {
         const source = validatePageSnapshot(change.payload, change.entityId, change.revision, true);
         this.upsertPageDirect({ ...source, revision: change.revision, deletedAt: source.deletedAt ?? now(), updatedAt: now() });
@@ -1189,7 +1198,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       }
     } else {
       const current = this.notebookFromRow(this.row(change.entityId, "notebooks"));
-      if (current && current.revision >= change.revision) return;
+      if (!authoritative && current && current.revision >= change.revision) return;
       if (change.action === "delete") {
         const source = validateNotebookSnapshot(change.payload, change.entityId);
         this.upsertNotebookDirect({ ...source, revision: change.revision, deletedAt: source.deletedAt ?? now(), updatedAt: now() });
@@ -1371,7 +1380,7 @@ export class SQLiteNoteStore implements NoteStore {
   archiveNotebook(entityID: string): Promise<SaveResult> { return this.rpc("archiveNotebook", [entityID]); }
   restoreNotebook(entityID: string): Promise<SaveResult> { return this.rpc("restoreNotebook", [entityID]); }
   createConflictCopy(page: NotePage, originalPageID: string): Promise<NotePage> { return this.rpc("createConflictCopy", [page, originalPageID]); }
-  createConflictCopyFromOperation(operation: SyncOperation, originalPageID?: string): Promise<void> { return this.rpc("createConflictCopyFromOperation", [operation, originalPageID]); }
+  createConflictCopyFromOperation(operation: SyncOperation, originalPageID?: string, queueRecovery = true): Promise<void> { return this.rpc("createConflictCopyFromOperation", [operation, originalPageID, queueRecovery]); }
   pendingOperations(limit = 50): Promise<SyncOperation[]> { return this.rpc("pendingOperations", [limit]); }
   getOperation(opID: string): Promise<SyncOperation | null> { return this.rpc("getOperation", [opID]); }
   markOperationSending(opID: string): Promise<void> { return this.rpc("markOperationSending", [opID]); }

@@ -35,6 +35,34 @@ afterEach(() => {
 });
 
 describe("automatic sync coordinator", () => {
+  it("syncs during continuous writing instead of postponing every time a save arrives", async () => {
+    vi.useFakeTimers();
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const store = fakeStore();
+    const sync = vi.fn(async () => ({ pushed: 1, pulled: 0, conflicts: 0 }));
+    const coordinator = new SyncCoordinator({ getStore: () => store, getSession: () => session, client: { sync } as unknown as SyncClient });
+    coordinator.start(); await settle();
+    for (let i = 0; i < 8; i++) {
+      coordinator.notifyLocalWrite();
+      await vi.advanceTimersByTimeAsync(200);
+    }
+    expect(sync.mock.calls.length).toBeGreaterThanOrEqual(3);
+    coordinator.stop();
+  });
+
+  it("wakes on Android resume and history restoration, and removes listeners on stop", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const store = fakeStore();
+    const sync = vi.fn(async () => ({ pushed: 0, pulled: 1, conflicts: 0 }));
+    const coordinator = new SyncCoordinator({ getStore: () => store, getSession: () => session, client: { sync } as unknown as SyncClient });
+    coordinator.start(); await settle();
+    document.dispatchEvent(new Event("resume")); await settle();
+    window.dispatchEvent(new Event("pageshow")); await settle();
+    expect(sync).toHaveBeenCalledTimes(3);
+    coordinator.stop();
+    document.dispatchEvent(new Event("resume")); await settle();
+    expect(sync).toHaveBeenCalledTimes(3);
+  });
   it("pulls and pushes on startup for an account workspace", async () => {
     vi.useFakeTimers();
     localStorage.setItem("notepad.endpoint", "https://sync.example.test");
