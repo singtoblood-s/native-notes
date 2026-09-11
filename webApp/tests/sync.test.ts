@@ -99,6 +99,93 @@ describe("sync durability protocol", () => {
     expect(fake.sent.map((item) => item.opId)).toEqual([operationID, operationID]);
   });
 
+  it("reports changes applied before a later pull page failed", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const fake = fakeStore([]);
+    const change: PullChange = {
+      sequence: 1,
+      entityType: "notebook",
+      entityId: notebookID,
+      revision: 1,
+      action: "upsert",
+      payload: { id: notebookID, title: "Notebook", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", deletedAt: null, revision: 1 },
+    };
+    let pulls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes("/push")) return new Response(JSON.stringify({ results: [], cursor: 0 }), { status: 200 });
+      pulls += 1;
+      if (pulls === 1) return new Response(JSON.stringify({ changes: [change], nextCursor: 1, hasMore: true }), { status: 200 });
+      if (pulls === 2) throw new TypeError("offline");
+      return new Response(JSON.stringify({ changes: [], nextCursor: 1, hasMore: false }), { status: 200 });
+    }));
+
+    const client = new SyncClient();
+    await expect(client.sync(fake.store, session)).rejects.toThrow("Network unavailable");
+    const report = await client.sync(fake.store, session);
+
+    expect(report.pulled).toBe(1);
+    expect(fake.store.applyRemoteBatch).toHaveBeenCalledWith([change], 1);
+  });
+
+  it("keeps a pull count when post-pull conflict inspection fails", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const fake = fakeStore([]);
+    fake.store.listConflicts = vi.fn()
+      .mockRejectedValueOnce(new Error("Storage is busy"))
+      .mockResolvedValue([]);
+    const change: PullChange = {
+      sequence: 1,
+      entityType: "notebook",
+      entityId: notebookID,
+      revision: 1,
+      action: "upsert",
+      payload: { id: notebookID, title: "Notebook", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", deletedAt: null, revision: 1 },
+    };
+    let pulls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes("/push")) return new Response(JSON.stringify({ results: [], cursor: 0 }), { status: 200 });
+      pulls += 1;
+      if (pulls === 1) return new Response(JSON.stringify({ changes: [change], nextCursor: 1, hasMore: false }), { status: 200 });
+      return new Response(JSON.stringify({ changes: [], nextCursor: 1, hasMore: false }), { status: 200 });
+    }));
+
+    const client = new SyncClient();
+    await expect(client.sync(fake.store, session)).rejects.toThrow("Storage is busy");
+    const report = await client.sync(fake.store, session);
+
+    expect(report.pulled).toBe(1);
+  });
+
+  it("does not carry a partial pull count into another account store", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const first = fakeStore([]);
+    const second = fakeStore([]);
+    const secondUserID = "66666666-6666-4666-8666-666666666666";
+    Object.defineProperty(second.store, "accountKey", { value: `https://sync.example.test:${secondUserID}`, configurable: true });
+    const change: PullChange = {
+      sequence: 1,
+      entityType: "notebook",
+      entityId: notebookID,
+      revision: 1,
+      action: "upsert",
+      payload: { id: notebookID, title: "Notebook", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", deletedAt: null, revision: 1 },
+    };
+    let pulls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes("/push")) return new Response(JSON.stringify({ results: [], cursor: 0 }), { status: 200 });
+      pulls += 1;
+      if (pulls === 1) return new Response(JSON.stringify({ changes: [change], nextCursor: 1, hasMore: true }), { status: 200 });
+      if (pulls === 2) throw new TypeError("offline");
+      return new Response(JSON.stringify({ changes: [], nextCursor: 0, hasMore: false }), { status: 200 });
+    }));
+
+    const client = new SyncClient();
+    await expect(client.sync(first.store, session)).rejects.toThrow("Network unavailable");
+    const report = await client.sync(second.store, { ...session, user: { ...session.user, id: secondUserID } });
+
+    expect(report.pulled).toBe(0);
+  });
+
   it("sends at most one queued revision for an entity in a batch", () => {
     const selected = selectPushBatch([operation(operationID), operation(secondOperationID, notebookID)]);
     expect(selected.map((item) => item.opId)).toEqual([operationID]);

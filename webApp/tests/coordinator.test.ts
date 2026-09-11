@@ -150,6 +150,27 @@ describe("automatic sync coordinator", () => {
     coordinator.stop();
   });
 
+  it("retries when the initial pending read fails", async () => {
+    vi.useFakeTimers();
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const store = fakeStore();
+    store.pendingOperations = vi.fn()
+      .mockRejectedValueOnce(new Error("Storage is busy"))
+      .mockResolvedValue([]);
+    const sync = vi.fn(async () => ({ pushed: 0, pulled: 1, conflicts: 0 }));
+    const coordinator = new SyncCoordinator({ getStore: () => store, getSession: () => session, client: { sync } as unknown as SyncClient });
+
+    coordinator.start();
+    await settle();
+    expect(sync).not.toHaveBeenCalled();
+    expect(coordinator.status.state).toBe("error");
+    expect(coordinator.status.error).toBe("Storage is busy");
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(sync).toHaveBeenCalledTimes(1);
+    coordinator.stop();
+  });
+
   it("waits for online recovery and never syncs a guest workspace", async () => {
     vi.useFakeTimers();
     localStorage.setItem("notepad.endpoint", "https://sync.example.test");

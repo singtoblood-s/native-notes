@@ -225,6 +225,7 @@ kbd { display: inline-grid; min-width: 15px; height: 17px; margin-right: 2px; pa
 .settings-actions .outline-button, .migration-actions .outline-button, .migration-actions .primary-button { flex: 1; }
 .account-line { display: flex; align-items: center; gap: 8px; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; }
 .account-line strong { min-width: 0; flex: 1; overflow: hidden; color: var(--ink); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+#settings-sync-label { overflow: visible; overflow-wrap: anywhere; text-overflow: clip; white-space: normal; }
 .loading-screen { display: grid; min-height: 100svh; place-content: center; justify-items: center; gap: 13px; color: var(--muted); }
 .loading-screen .brand-mark { width: 42px; height: 42px; animation: breathe 2.2s ease-in-out infinite; }
 .loading-screen p { margin: 0; font: italic 14px Georgia, serif; }
@@ -450,6 +451,8 @@ body.drawer-open { overflow: hidden; }
   .text-field textarea { min-height: 125px; }
   .inspector-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
   .inspector-note { display: none; }
+  #library-sync-button { max-width: 96px; min-width: 0; }
+  #library-sync-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }
 
 /* Hide account contents while the required sign-in dialog is open. */
