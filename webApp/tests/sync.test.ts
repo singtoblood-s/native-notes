@@ -230,9 +230,17 @@ describe("sync durability protocol", () => {
     expect(report.pulled).toBe(0);
   });
 
-  it("sends at most one queued revision for an entity in a batch", () => {
-    const selected = selectPushBatch([operation(operationID), operation(secondOperationID, notebookID)]);
-    expect(selected.map((item) => item.opId)).toEqual([operationID]);
+  it("keeps a later notebook tombstone behind a page restore", () => {
+    const thirdOperationID = "66666666-6666-4666-8666-666666666666";
+    const pageDelete: SyncOperation = { ...operation(operationID, pageID), entityType: "page", action: "delete" };
+    const pageRestore: SyncOperation = { ...pageDelete, opId: secondOperationID, action: "upsert" };
+    const notebookDelete: SyncOperation = { ...operation(thirdOperationID, notebookID), action: "delete" };
+    const selected = selectPushBatch([
+      pageDelete,
+      pageRestore,
+      notebookDelete,
+    ]);
+    expect(selected.map((item) => item.opId)).toEqual([pageDelete.opId]);
   });
 
   it("measures UTF-8 bytes instead of JavaScript string length", () => {

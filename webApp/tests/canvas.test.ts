@@ -364,6 +364,89 @@ describe("PaperCanvas pointer contract", () => {
     canvasController.destroy();
   });
 
+  it("commits every rapid pen contact when Safari reports zero pressure and buttons", () => {
+    const { canvas, changes, canvasController } = setup();
+    const contacts = 40;
+    for (let index = 0; index < contacts; index += 1) {
+      const time = 1_000 + index * 2;
+      const position = 20 + index * 4;
+      canvas.dispatchEvent(pointer("pointerdown", {
+        pointerId: 81,
+        pointerType: "pen",
+        clientX: position,
+        clientY: position,
+        buttons: 0,
+        pressure: 0,
+        timeStamp: time,
+      }));
+      canvas.dispatchEvent(pointer("pointerup", {
+        pointerId: 81,
+        pointerType: "pen",
+        clientX: position,
+        clientY: position,
+        buttons: 0,
+        pressure: 0,
+        timeStamp: time + 1,
+      }));
+    }
+    const strokes = changes.mock.lastCall![0];
+    expect(strokes).toHaveLength(contacts);
+    expect(strokes.every((stroke: { points: Array<{ pressure: number }> }) => stroke.points.length === 1 && stroke.points[0]!.pressure === 0.5)).toBe(true);
+    canvasController.destroy();
+  });
+
+  it("starts a same-ID contact after a missing pointerup without lost capture", () => {
+    const { canvas, changes, canvasController } = setup();
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 82, timeStamp: 100, clientX: 20 }));
+    // The next down is the only reliable boundary when WebKit omits both
+    // pointerup and lostpointercapture for a very short Pencil contact.
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 82, timeStamp: 200, clientX: 80 }));
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 82, timeStamp: 201, clientX: 80, buttons: 0, pressure: 0 }));
+    expect(changes).toHaveBeenCalledTimes(2);
+    expect(changes.mock.lastCall![0]).toHaveLength(2);
+    expect(changes.mock.lastCall![0].map((stroke: { points: Array<{ x: number }> }) => stroke.points[0]!.x)).toEqual([40, 160]);
+    canvasController.destroy();
+  });
+
+  it("commits before a zero-pressure pen hover move without adding its hover point", () => {
+    const { canvas, changes, canvasController } = setup();
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 86, timeStamp: 100, clientX: 20, pressure: 0.6, buttons: 1 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 86, timeStamp: 110, clientX: 40, pressure: 0.6, buttons: 1 }));
+    const hover = pointer("pointermove", { pointerId: 86, timeStamp: 120, clientX: 400, pressure: 0, buttons: 0 });
+    Object.defineProperty(hover, "getCoalescedEvents", { value: () => [pointer("pointermove", { pointerId: 86, timeStamp: 115, clientX: 60, pressure: 0.6, buttons: 1 })] });
+    canvas.dispatchEvent(hover);
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(changes.mock.lastCall![0][0].points.map((point: { x: number }) => point.x)).toEqual([40, 80, 120]);
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 86, timeStamp: 200, clientX: 80, pressure: 0, buttons: 0 }));
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 86, timeStamp: 201, clientX: 80, pressure: 0, buttons: 0 }));
+    expect(changes).toHaveBeenCalledTimes(2);
+    expect(changes.mock.lastCall![0]).toHaveLength(2);
+    expect(changes.mock.lastCall![0][1].points).toHaveLength(1);
+    canvasController.destroy();
+  });
+
+  it("accepts a pointerup when Safari reports a zero timestamp", () => {
+    const { canvas, changes, canvasController } = setup();
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 83, timeStamp: 100, clientX: 40 }));
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 83, timeStamp: 0, clientX: 40, buttons: 0, pressure: 0 }));
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(changes.mock.lastCall![0]).toHaveLength(1);
+    expect(changes.mock.lastCall![0][0].points[0]!.time).toBe(0);
+    canvasController.destroy();
+  });
+
+  it("does not let a different pen pointer terminate the active contact", () => {
+    const { canvas, changes, canvasController } = setup();
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 84, timeStamp: 100, clientX: 20 }));
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 85, timeStamp: 200, clientX: 80 }));
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 85, timeStamp: 201, clientX: 80, buttons: 0, pressure: 0 }));
+    expect(changes).not.toHaveBeenCalled();
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 84, timeStamp: 202, clientX: 20, buttons: 0, pressure: 0 }));
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(changes.mock.lastCall![0]).toHaveLength(1);
+    canvasController.destroy();
+  });
+
   it("suppresses selection and context menus on canvas chrome but preserves form selection", () => {
     const { canvas, canvasController } = setup();
     const chrome = document.createElement("div");

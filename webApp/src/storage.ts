@@ -674,15 +674,22 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     }
   }
 
-  /** Coalesce only an operation that has never been sent. */
+  /** Coalesce unchanged pending state; preserve ordered state transitions. */
   private queueOperation(operation: Omit<SyncOperation, "opId" | "createdAt" | "state">): string {
-    const existing = this.query<Record<string, unknown>>(
-      `SELECT op_id FROM outbox WHERE entity_type = ? AND entity_id = ? AND state = 'pending' ORDER BY created_at LIMIT 1`,
+    // Use the newest row. Coalescing the oldest create row after a pending
+    // delete would erase the parent-before-children ordering needed by the
+    // server. Sending rows are immutable and therefore always force a new
+    // operation. Local edits keep their captured server revision; ACK handling
+    // rebases later pending operations before they are sent.
+    const latest = this.query<Record<string, unknown>>(
+      `SELECT op_id, action, state FROM outbox
+       WHERE entity_type = ? AND entity_id = ? AND state IN ('pending', 'sending')
+       ORDER BY created_at DESC, rowid DESC LIMIT 1`,
       [operation.entityType, operation.entityId],
     )[0];
-    if (existing && typeof existing.op_id === "string") {
-      this.db.exec({ sql: "UPDATE outbox SET action = ?, payload = ? WHERE op_id = ? AND state = 'pending'", bind: [operation.action, JSON.stringify(operation.payload), existing.op_id] });
-      return existing.op_id;
+    if (latest && latest.state === "pending" && latest.action === operation.action && typeof latest.op_id === "string") {
+      this.db.exec({ sql: "UPDATE outbox SET payload = ? WHERE op_id = ? AND state = 'pending'", bind: [JSON.stringify(operation.payload), latest.op_id] });
+      return latest.op_id;
     }
     const opId = id();
     this.db.exec({

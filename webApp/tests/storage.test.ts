@@ -293,6 +293,54 @@ describe("conflict recovery storage", () => {
     expect(insert).not.toHaveBeenCalled();
   });
 
+  it("keeps notebook creation and state transitions ordered in the outbox", () => {
+    const rows: Array<Record<string, unknown>> = [{ op_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", entity_type: "notebook", entity_id: notebookID, action: "upsert", base_revision: 0, state: "pending", rowid: 1, payload: "create" }];
+    let nextRowID = 1;
+    const dbExec = vi.fn((statement: { sql?: string; bind?: unknown[] }) => {
+      const sql = statement.sql ?? "";
+      const bind = statement.bind ?? [];
+      if (sql.includes("INSERT INTO outbox")) {
+        rows.push({ op_id: bind[0], entity_type: bind[1], entity_id: bind[2], action: bind[4], base_revision: bind[3], state: "pending", rowid: ++nextRowID, payload: bind[5] });
+      } else if (sql.includes("UPDATE outbox SET payload")) {
+        const row = rows.find((candidate) => candidate.op_id === bind[1]);
+        if (row) row.payload = bind[0];
+      }
+    });
+    const fake = {
+      query: vi.fn((_sql: string, bind?: unknown[]) => [...rows]
+        .filter((row) => !bind || (row.entity_type === bind[0] && row.entity_id === bind[1]))
+        .sort((left, right) => Number(right.rowid) - Number(left.rowid))),
+      db: { exec: dbExec },
+    } as unknown as SQLiteNoteStoreEngine;
+    const method = (SQLiteNoteStoreEngine.prototype as unknown as {
+      queueOperation: (this: SQLiteNoteStoreEngine, operation: { entityType: "notebook" | "page"; entityId: string; baseRevision: number; action: "upsert" | "delete"; payload: Record<string, unknown> }) => string;
+    }).queueOperation;
+    const payload = { id: notebookID, title: "Notebook" };
+
+    for (const [index, pageEntityID] of ["33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444", "55555555-5555-4555-8555-555555555555"].entries()) {
+      method.call(fake, { entityType: "page", entityId: pageEntityID, baseRevision: 0, action: "upsert", payload: { id: pageEntityID, notebookId: notebookID, title: `Page ${index + 1}` } });
+    }
+
+    const deleteID = method.call(fake, { entityType: "notebook", entityId: notebookID, baseRevision: 0, action: "delete", payload });
+    const restoreID = method.call(fake, { entityType: "notebook", entityId: notebookID, baseRevision: 0, action: "upsert", payload: { ...payload, deletedAt: null } });
+    const finalDeleteID = method.call(fake, { entityType: "notebook", entityId: notebookID, baseRevision: 0, action: "delete", payload: { ...payload, deletedAt: "2026-01-01T00:00:00Z" } });
+    expect(rows.map((row) => `${row.entity_type}:${row.action}`)).toEqual(["notebook:upsert", "page:upsert", "page:upsert", "page:upsert", "notebook:delete", "notebook:upsert", "notebook:delete"]);
+    expect(rows.filter((row) => row.entity_type === "notebook").map((row) => row.base_revision)).toEqual([0, 0, 0, 0]);
+    expect(new Set([deleteID, restoreID, finalDeleteID]).size).toBe(3);
+
+    const sameDeleteID = method.call(fake, { entityType: "notebook", entityId: notebookID, baseRevision: 0, action: "delete", payload: { ...payload, deletedAt: "2026-01-02T00:00:00Z" } });
+    expect(sameDeleteID).toBe(finalDeleteID);
+    expect(rows).toHaveLength(7);
+
+    rows.splice(0, rows.length, { op_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", entity_type: "notebook", entity_id: notebookID, action: "upsert", base_revision: 0, state: "sending", rowid: 1, payload: "immutable" });
+    nextRowID = 1;
+    const sendingID = method.call(fake, { entityType: "notebook", entityId: notebookID, baseRevision: 0, action: "upsert", payload });
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toMatchObject({ action: "upsert", base_revision: 0, state: "pending" });
+    expect(rows[0]?.payload).toBe("immutable");
+    expect(sendingID).not.toBe(rows[0]?.op_id);
+  });
+
   it("preserves embedded images and conflict metadata through local validation", () => {
     const page = createPage(notebookID, "Image page");
     page.id = pageID;

@@ -35,6 +35,10 @@ function describe(value) {
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 
+function exactText(value) {
+  return new RegExp(`^${value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`);
+}
+
 async function loadPlaywright() {
   const requested = process.env.PLAYWRIGHT_MODULE || "playwright";
   let specifier = requested;
@@ -52,11 +56,26 @@ async function loadPlaywright() {
 }
 
 async function waitForPageTitles(page, expected, timeout = 12000) {
-  await page.waitForFunction(
-    (titles) => [...document.querySelectorAll("#page-list .page-row strong")].map((node) => node.textContent?.trim()) .join("\u0000") === titles.join("\u0000"),
-    expected,
-    { timeout },
-  );
+  try {
+    await page.waitForFunction(
+      (titles) => [...document.querySelectorAll("#page-list .page-row strong")].map((node) => node.textContent?.trim()) .join("\u0000") === titles.join("\u0000"),
+      expected,
+      { timeout },
+    );
+  } catch (error) {
+    let diagnostics = "unavailable";
+    try {
+      diagnostics = await page.evaluate(() => JSON.stringify({
+        actualTitles: [...document.querySelectorAll("#page-list .page-row strong")].map((node) => node.textContent?.trim()),
+        pageTitle: document.querySelector("#page-title")?.value || document.querySelector("#page-title-label")?.textContent?.trim() || null,
+        notebookTitle: document.querySelector("#notebook-name")?.textContent?.trim() || null,
+        sync: [...document.querySelectorAll("[data-sync-button]")].map((node) => ({ id: node.id, state: node.dataset.state, label: node.getAttribute("aria-label") })),
+      }));
+    } catch (diagnosticError) {
+      diagnostics = diagnosticError instanceof Error ? diagnosticError.message : String(diagnosticError);
+    }
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; page-title diagnostics: ${diagnostics}`);
+  }
 }
 
 async function waitForImageCount(page, minimum, timeout = 12000) {
@@ -95,6 +114,194 @@ async function chooseMenuAction(page, menuButton, menu, action) {
   const item = page.locator(`${menu} [data-action="${action}"]`);
   await item.waitFor({ state: "visible" });
   await item.click();
+}
+
+async function assertMenuButtonHit(page, button, selector, label) {
+  await button.hover();
+  const box = await button.boundingBox();
+  assert(box && box.width > 0 && box.height > 0, `${label} menu button has no bounds`);
+  const hit = await page.evaluate(({ x, y, targetSelector }) => {
+    const target = document.elementFromPoint(x, y);
+    return Boolean(target?.closest(targetSelector));
+  }, { x: box.x + box.width / 2, y: box.y + box.height / 2, targetSelector: selector });
+  assert(hit, `${label} menu center is covered by another element`);
+}
+
+async function libraryBook(page, title) {
+  const book = page.locator("#library-books .library-book").filter({
+    has: page.locator(".book-caption strong").filter({ hasText: exactText(title) }),
+  });
+  await book.waitFor({ state: "visible" });
+  return book;
+}
+
+async function chooseBookMenuAction(page, title, action) {
+  const book = await libraryBook(page, title);
+  await book.locator(".book-menu-button").click();
+  const item = book.locator(`.quick-menu [data-action="${action}"]`);
+  await item.waitFor({ state: "visible" });
+  await item.click();
+}
+
+async function waitForLibraryBookPages(page, title, expectedPages, timeout = 20000) {
+  try {
+    await page.waitForFunction(
+      ({ title: wantedTitle, pages }) => [...document.querySelectorAll("#library-books button[data-open-book]")].some((node) => {
+        const caption = node.querySelector(".book-caption small")?.textContent?.trim() || "";
+        const pageLabel = `${pages} page${pages === 1 ? "" : "s"}`;
+        return node.textContent?.includes(wantedTitle) && (caption === pageLabel || caption.startsWith(`${pageLabel} ·`));
+      }),
+      { title, pages: expectedPages },
+      { timeout },
+    );
+  } catch (error) {
+    const diagnostics = await page.evaluate(() => ({
+      url: location.href,
+      online: navigator.onLine,
+      books: [...document.querySelectorAll("#library-books button[data-open-book]")].map((node) => ({
+        id: node.getAttribute("data-open-book"),
+        text: node.textContent?.replace(/\s+/g, " ").trim(),
+        aria: node.getAttribute("aria-label"),
+      })),
+      empty: {
+        hidden: document.getElementById("library-empty")?.hidden ?? null,
+        text: document.getElementById("library-empty")?.textContent?.trim() || null,
+      },
+      sync: [...document.querySelectorAll("[data-sync-button]")].map((node) => ({
+        id: node.id,
+        state: node.dataset.state || null,
+        label: node.getAttribute("aria-label"),
+        text: node.textContent?.replace(/\s+/g, " ").trim(),
+      })),
+      recovery: document.getElementById("recovery-count")?.textContent?.trim() || null,
+      storageKeys: Object.keys(localStorage),
+    }));
+    let opened = false;
+    let editor = null;
+    let archive = null;
+    const candidate = page.locator("#library-books button[data-open-book]").filter({ hasText: title }).first();
+    if (await candidate.count()) {
+      await candidate.click().catch(() => {});
+      try {
+        await page.locator("#editor-workspace").waitFor({ state: "visible", timeout: 5000 });
+        opened = true;
+        editor = await page.evaluate(() => ({
+          notebook: document.getElementById("notebook-name")?.textContent?.trim() || null,
+          pageTitle: document.getElementById("page-title-label")?.textContent?.trim() || null,
+          pages: [...document.querySelectorAll("#page-list .page-row strong")].map((node) => node.textContent?.trim()),
+          recovery: document.getElementById("recovery-count")?.textContent?.trim() || null,
+          sync: [...document.querySelectorAll("[data-sync-button]")].map((node) => ({ id: node.id, state: node.dataset.state || null, label: node.getAttribute("aria-label") })),
+        }));
+        try {
+          const exported = await exportArchive(page);
+          archive = {
+            notebooks: exported.notebooks?.map((notebook) => ({ id: notebook.id, title: notebook.title, deletedAt: notebook.deletedAt ?? null })) || [],
+            pages: exported.pages?.map((candidatePage) => ({
+              id: candidatePage.id,
+              notebookId: candidatePage.notebookId,
+              title: candidatePage.title,
+              deletedAt: candidatePage.deletedAt ?? null,
+              conflictOf: candidatePage.conflictOf ?? null,
+              text: candidatePage.text,
+              strokes: Array.isArray(candidatePage.strokes) ? candidatePage.strokes.length : null,
+              images: Array.isArray(candidatePage.images) ? candidatePage.images.length : null,
+            })) || [],
+          };
+        } catch (archiveError) {
+          archive = { error: archiveError instanceof Error ? archiveError.message : String(archiveError) };
+        }
+      } catch (editorError) {
+        editor = { error: editorError instanceof Error ? editorError.message : String(editorError) };
+      }
+    }
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; second-context library diagnostics: ${describe({ diagnostics, opened, editor, archive })}`);
+  }
+}
+
+async function runLibraryCardMenuRegression(page, title) {
+  await page.locator("#back-library").click();
+  await page.locator("#library").waitFor({ state: "visible" });
+  await page.locator("#editor-workspace").waitFor({ state: "hidden" });
+  const book = await libraryBook(page, title);
+  const menuButton = book.locator(".book-menu-button");
+  await book.locator("[data-open-book]").hover();
+  await assertMenuButtonHit(page, menuButton, ".book-menu-button", "Library notebook");
+  await menuButton.click();
+  const menu = book.locator(".book-quick-menu");
+  await menu.waitFor({ state: "visible" });
+  assert(await page.locator("#library").isVisible() && !(await page.locator("#editor-workspace").isVisible()), "Library menu click navigated into the editor");
+  await page.locator("#library-title").click();
+  await menu.waitFor({ state: "hidden" });
+  await book.locator("[data-open-book]").click();
+  await page.locator("#editor-workspace").waitFor({ state: "visible" });
+  console.log("PASS library card menu hit target without navigation");
+}
+
+async function runSidebarAndHomeMenuRegression(page, title, context) {
+  const copyTitle = `${title} (copy)`;
+  const initialRecoveryCount = await recoveryCount(page);
+  await context.setOffline(true);
+  try {
+    await page.locator("#back-library").click();
+    await page.locator("#library").waitFor({ state: "visible" });
+    await chooseBookMenuAction(page, title, "duplicate-notebook");
+    await page.locator("#editor-workspace").waitFor({ state: "visible" });
+    await waitForPageTitles(page, ["First page", "Page 2", "Page 3"]);
+
+    const currentNotebook = await page.locator("#notebook-name").textContent();
+    const currentPage = await page.locator("#page-title-label").textContent();
+    await openSidebar(page);
+    const sourceNotebook = page.locator("#notebook-list .nav-row-wrap").filter({
+      has: page.locator(".nav-copy strong").filter({ hasText: exactText(title) }),
+    });
+    await sourceNotebook.waitFor({ state: "visible" });
+    const sourceNotebookMenu = sourceNotebook.locator(".nav-menu-button");
+    await assertMenuButtonHit(page, sourceNotebookMenu, ".nav-menu-button", "Sidebar notebook");
+    await sourceNotebookMenu.click();
+    await sourceNotebook.locator(".quick-menu").waitFor({ state: "visible" });
+    assert(await page.locator("#notebook-name").textContent() === currentNotebook, "Sidebar notebook menu selected another notebook");
+    await sourceNotebookMenu.click();
+    await sourceNotebook.locator(".quick-menu").waitFor({ state: "hidden" });
+
+    const otherPage = page.locator("#page-list .nav-row-wrap").filter({ hasText: "Page 2" });
+    await otherPage.waitFor({ state: "visible" });
+    const otherPageMenu = otherPage.locator(".nav-menu-button");
+    await assertMenuButtonHit(page, otherPageMenu, ".nav-menu-button", "Sidebar page");
+    await otherPageMenu.click();
+    await otherPage.locator(".quick-menu").waitFor({ state: "visible" });
+    assert(await page.locator("#page-title-label").textContent() === currentPage, "Sidebar page menu selected another page");
+    await otherPageMenu.click();
+    await otherPage.locator(".quick-menu").waitFor({ state: "hidden" });
+    await closeSidebar(page);
+
+    await page.locator("#back-library").click();
+    await page.locator("#library").waitFor({ state: "visible" });
+    const copyBook = await libraryBook(page, copyTitle);
+    const copyMenu = copyBook.locator(".book-menu-button");
+    await assertMenuButtonHit(page, copyMenu, ".book-menu-button", "Temporary notebook");
+    await copyMenu.click();
+    await copyBook.locator(".book-quick-menu").waitFor({ state: "visible" });
+    await copyBook.locator('[data-action="trash-notebook"]').click();
+    await page.waitForFunction((expected) => ![...document.querySelectorAll("#library-books [data-open-book]")].some((node) => node.textContent?.includes(expected)), copyTitle);
+    assert(await page.locator("#library").isVisible() && !(await page.locator("#editor-workspace").isVisible()), "Home notebook trash navigated away from the library");
+
+    const sourceBook = await libraryBook(page, title);
+    await sourceBook.locator("[data-open-book]").click();
+    await page.locator("#editor-workspace").waitFor({ state: "visible" });
+  } finally {
+    await context.setOffline(false).catch(() => {});
+  }
+  await syncAndWait(page);
+  const fixtureArchive = await exportArchive(page);
+  const recoveryPages = fixtureArchive.pages.filter((candidate) => typeof candidate.conflictOf === "string");
+  assert(recoveryPages.length === initialRecoveryCount,
+    `Offline home trash created recovery copies: before ${initialRecoveryCount}, after ${recoveryPages.length}`);
+  const fixtureNotebook = fixtureArchive.notebooks.find((candidate) => candidate.title === copyTitle && candidate.deletedAt);
+  assert(fixtureNotebook, `Trashed temporary notebook was not retained in the archive: ${copyTitle}`);
+  const fixturePages = fixtureArchive.pages.filter((candidate) => candidate.notebookId === fixtureNotebook.id && !candidate.deletedAt);
+  assert(fixturePages.length === 3 && fixturePages.some((candidate) => candidate.strokes.length > 0) && fixturePages.some((candidate) => candidate.images.length > 0),
+    `Trashed temporary notebook lost child content: ${describe(fixturePages.map((candidate) => ({ title: candidate.title, strokes: candidate.strokes.length, images: candidate.images.length, deletedAt: candidate.deletedAt })))} `);
+  console.log("PASS sidebar notebook/page menus, home notebook trash, and offline child ordering");
 }
 
 async function renameNotebookThroughMenu(page, title) {
@@ -160,6 +367,16 @@ async function syncAndWait(page) {
   await button.click();
   await network;
   await page.waitForFunction(() => document.querySelector("#sync-button")?.dataset.state === "saved", undefined, { timeout: 20000 });
+}
+
+async function syncLibraryAndWait(page) {
+  const network = page.waitForResponse(
+    (response) => response.url().includes("/v1/sync/") && response.status() < 500,
+    { timeout: 20000 },
+  );
+  await page.locator("#library-sync-button").click();
+  await network;
+  await page.waitForFunction(() => document.querySelector("#library-sync-button")?.dataset.state === "saved", undefined, { timeout: 20000 });
 }
 
 async function recoveryCount(page) {
@@ -259,10 +476,15 @@ async function drawQuickStroke(page) {
   await canvas.scrollIntoViewIfNeeded();
   await page.waitForTimeout(50);
   const box = await canvas.boundingBox();
-  const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
-  assert(box && box.width > 0 && box.height > 0 && box.x + box.width > 0 && box.y + box.height > 0 && box.x < viewport.width && box.y < viewport.height, "Active canvas is outside the browser viewport");
-  const x = Math.min(viewport.width - 8, Math.max(8, box.x + box.width * 0.25));
-  const y = Math.min(viewport.height - 8, Math.max(8, box.y + box.height * 0.3));
+  const flowBox = await page.locator("#paper-scroll").boundingBox();
+  assert(box && flowBox && box.width > 0 && box.height > 0 && flowBox.width > 0 && flowBox.height > 0, "Active canvas or paper flow has no bounds");
+  const left = Math.max(box.x, flowBox.x) + 20;
+  const right = Math.min(box.x + box.width, flowBox.x + flowBox.width) - 20;
+  const top = Math.max(box.y, flowBox.y) + 20;
+  const bottom = Math.min(box.y + box.height, flowBox.y + flowBox.height) - 20;
+  assert(right >= left && bottom >= top, `Active canvas has no safe visible intersection: ${describe({ box, flowBox })}`);
+  const x = Math.min(right, Math.max(left, box.x + box.width * 0.25));
+  const y = Math.min(bottom, Math.max(top, box.y + box.height * 0.3));
   const hit = await page.evaluate(({ pointX, pointY }) => document.elementFromPoint(pointX, pointY)?.id || document.elementFromPoint(pointX, pointY)?.className || "none", { pointX: x, pointY: y });
   assert(hit === "ink-canvas", `Pointer test point did not hit the ink canvas: ${String(hit)}`);
   await page.mouse.move(x, y);
@@ -271,6 +493,42 @@ async function drawQuickStroke(page) {
     await page.mouse.move(x + index * Math.min(8, box.width / 40), y + Math.sin(index / 2) * 14);
   }
   await page.mouse.up();
+}
+
+async function dispatchRapidPenBurst(page, contacts = 40) {
+  await page.evaluate((count) => {
+    const canvas = document.getElementById("ink-canvas");
+    if (!(canvas instanceof HTMLCanvasElement)) throw new Error("Missing active ink canvas for rapid pen burst");
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) throw new Error("Active ink canvas has no bounds for rapid pen burst");
+    const pointerId = 913;
+    const baseX = rect.left + rect.width * 0.55;
+    const baseY = rect.top + rect.height * 0.45;
+    const makeEvent = (type, index, buttons, pressure) => {
+      const event = new PointerEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        pointerId,
+        pointerType: "pen",
+        isPrimary: true,
+        button: 0,
+        buttons,
+        clientX: baseX + index * 3,
+        clientY: baseY + index * 2,
+        pressure,
+      });
+      // Event timestamps are read-only in a browser, but defining one where
+      // the engine permits it keeps this burst deterministic in WebKit.
+      try { Object.defineProperty(event, "timeStamp", { configurable: true, value: 10_000 + index }); } catch { /* native timestamp is sufficient */ }
+      return event;
+    };
+    for (let index = 0; index < count; index += 1) {
+      canvas.dispatchEvent(makeEvent("pointerdown", index * 2, 0, 0));
+      // Leave a few contacts without pointerup. The next down with this
+      // reused ID must commit the prior contact before starting the next one.
+      if (index % 5 !== 0 || index === count - 1) canvas.dispatchEvent(makeEvent("pointerup", index * 2 + 1, 0, 0));
+    }
+  }, contacts);
 }
 
 async function dispatchPendingPreviewStroke(page, targetTitle) {
@@ -421,6 +679,7 @@ async function run() {
     await page.locator("#add-page").click();
     await waitForPageTitles(page, ["First page", "Page 2", "Page 3"]);
     console.log("PASS notebook and stable page order");
+    await runLibraryCardMenuRegression(page, "Editor smoke notebook");
 
     await assertActiveCanvas(page);
     await drawQuickStroke(page);
@@ -438,6 +697,19 @@ async function run() {
     await selectPageFromSidebar(page, "Page 3");
     await assertActiveCanvas(page);
     console.log("PASS active canvas and buffered pen input across preview activation");
+
+    const rapidBefore = await exportArchive(page);
+    const rapidBeforePage = rapidBefore.pages.find((candidate) => candidate.title === "Page 3");
+    assert(rapidBeforePage, "Rapid pen burst could not find Page 3 before input");
+    await closeInspector(page);
+    await assertActiveCanvas(page);
+    await dispatchRapidPenBurst(page);
+    await page.waitForTimeout(500);
+    const rapidAfter = await exportArchive(page);
+    const rapidAfterPage = rapidAfter.pages.find((candidate) => candidate.title === "Page 3");
+    assert(rapidAfterPage && rapidAfterPage.strokes.length === rapidBeforePage.strokes.length + 40,
+      `Rapid pen burst lost contacts: ${describe({ before: rapidBeforePage.strokes.length, after: rapidAfterPage?.strokes.length })}`);
+    console.log("PASS rapid same-ID pen burst (40 contacts, zero pressure/buttons)");
 
     await ensureInspector(page);
     await page.locator("#image-input").setInputFiles({
@@ -526,7 +798,8 @@ async function run() {
     await page.locator("#page-view-mode").selectOption("continuous");
     await page.waitForFunction(() => document.getElementById("paper-scroll")?.dataset.viewMode === "continuous");
     const flowAdd = page.locator(".flow-add-page");
-    await flowAdd.scrollIntoViewIfNeeded();
+    // Let Playwright scroll and resolve the live end slot in one click. An
+    // explicit scroll can trigger flow page activation and detach this node.
     await flowAdd.click();
     await waitForPageTitles(page, ["First page", "Page 2", "Page 3", "Page 4"]);
     await page.waitForFunction((title) => document.querySelector("#page-title")?.value === title, "Page 4");
@@ -557,9 +830,10 @@ async function run() {
       const second = secondContext.page;
       second.on("pageerror", (error) => pageErrors.push(`second: ${error.message}`));
       await second.locator("#library").waitFor({ state: "visible" });
-      await second.locator("#library-sync-button").click().catch(() => {});
+      await syncLibraryAndWait(second);
       const secondBook = second.locator("#library-books button[data-open-book]").filter({ hasText: "Editor smoke notebook" });
       await secondBook.waitFor({ state: "visible", timeout: 20000 });
+       await waitForLibraryBookPages(second, "Editor smoke notebook", 3);
       await secondBook.click();
       await second.locator("#editor-workspace").waitFor({ state: "visible" });
       await waitForPageTitles(second, ["First page", "Page 2", "Page 3"], 20000);
@@ -570,6 +844,7 @@ async function run() {
       assert(Array.isArray(secondPage.strokes) && secondPage.strokes.length >= firstPage.strokes.length && secondPage.strokes.length > 0, "Second context did not receive the ink stroke");
       assert(Array.isArray(secondPage.images) && secondPage.images.length >= firstPage.images.length && secondPage.images.length > 0, "Second context did not receive the page images");
       console.log("PASS second-context sync");
+      await runSidebarAndHomeMenuRegression(page, "Editor smoke notebook", context);
       if (process.env.SMOKE_CONFLICT !== "0") await runConflictConvergence(page, second, context, secondContext.context);
     } catch (error) {
       if (process.env.REQUIRE_TWO_CONTEXT === "1" || process.env.SMOKE_CONFLICT !== "0") throw error;

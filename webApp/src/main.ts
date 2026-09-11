@@ -21,7 +21,7 @@ import { SyncClient } from "./sync";
 import { removeGuestData } from "./remove-guest-data";
 
 const BASE = import.meta.env.BASE_URL;
-const APP_BUILD = "2026.09.11";
+const APP_BUILD = "2026.09.11.2";
 type OfflineCacheStatus = "preparing" | "ready" | "error" | "unsupported" | "development";
 interface SavedSelection { notebookID?: string; pageID?: string; }
 
@@ -99,6 +99,7 @@ class NotePadApp {
   private pendingRemoteRefresh: { store: NoteStore; conflicts: number } | null = null;
   private remoteRefreshTimer: number | null = null;
   private navigationGeneration = 0;
+  private explicitPageNavigation = false;
   private readonly handlePageHide = (): void => { void this.flushPendingSave(); };
 
   constructor(root: HTMLElement) {
@@ -767,7 +768,7 @@ class NotePadApp {
       const shade = [...book.id].reduce((sum, char) => sum + char.charCodeAt(0), 0) % 5;
       const starred = favorites.includes(book.id);
       const date = new Date(modified(book));
-      return `<article class="library-book"><button class="book-open" data-open-book="${book.id}" aria-label="Open notebook ${escapeAttr(book.title)}"><span class="book-cover cover-${shade}"><span class="cover-label"><small>NOTEBOOK</small><strong>${escapeHTML(book.title)}</strong><span>NotePad</span></span></span><span class="book-caption"><strong>${escapeHTML(book.title)}</strong><small>${pages.length} page${pages.length === 1 ? "" : "s"} · ${Number.isFinite(date.getTime()) ? escapeHTML(date.toLocaleDateString(undefined, { month: "short", day: "numeric" })) : ""}</small></span></button><button class="book-star" data-favorite="${book.id}" aria-label="Favorite ${escapeAttr(book.title)}" aria-pressed="${starred}">${starred ? "★" : "☆"}</button><button class="book-menu-button" data-menu-button aria-label="More actions for ${escapeAttr(book.title)}">⋯</button><div class="quick-menu book-quick-menu" hidden><button data-action="rename-notebook" data-entity="${escapeAttr(book.id)}">Rename</button><button data-action="duplicate-notebook" data-entity="${escapeAttr(book.id)}">Duplicate</button><button data-action="trash-notebook" data-entity="${escapeAttr(book.id)}">Move to trash</button></div></article>`;
+      return `<article class="library-book"><button class="book-open" data-open-book="${book.id}" aria-label="Open notebook ${escapeAttr(book.title)}"><span class="book-cover cover-${shade}"><span class="cover-label"><small>NOTEBOOK</small><strong>${escapeHTML(book.title)}</strong><span>NotePad</span></span></span><span class="book-caption"><strong>${escapeHTML(book.title)}</strong><small>${pages.length} page${pages.length === 1 ? "" : "s"} · ${Number.isFinite(date.getTime()) ? escapeHTML(date.toLocaleDateString(undefined, { month: "short", day: "numeric" })) : ""}</small></span></button><div class="book-actions"><button class="book-star" data-favorite="${book.id}" aria-label="Favorite ${escapeAttr(book.title)}" aria-pressed="${starred}">${starred ? "★" : "☆"}</button><button class="book-menu-button" data-menu-button aria-haspopup="menu" aria-label="More actions for ${escapeAttr(book.title)}" title="Notebook actions">⋯</button></div><div class="quick-menu book-quick-menu" role="menu" hidden><button data-action="rename-notebook" data-entity="${escapeAttr(book.id)}">Rename</button><button data-action="duplicate-notebook" data-entity="${escapeAttr(book.id)}">Duplicate</button><button data-action="trash-notebook" data-entity="${escapeAttr(book.id)}">Move to trash</button></div></article>`;
     }).join("");
     byId("library-books").querySelectorAll<HTMLButtonElement>("[data-open-book]").forEach((button) => button.addEventListener("click", () => { void this.selectNotebook(button.dataset.openBook!); }));
     byId("library-books").querySelectorAll<HTMLButtonElement>("[data-favorite]").forEach((button) => button.addEventListener("click", () => {
@@ -780,7 +781,7 @@ class NotePadApp {
     }));
     byId("library-books").querySelectorAll<HTMLButtonElement>("[data-menu-button]").forEach((button) => button.addEventListener("click", (event) => {
       event.stopPropagation();
-      const menu = button.parentElement?.querySelector<HTMLElement>(".quick-menu");
+      const menu = button.closest(".library-book")?.querySelector<HTMLElement>(".quick-menu");
       if (menu) this.toggleQuickMenuElement(menu);
     }));
   }
@@ -801,7 +802,7 @@ class NotePadApp {
     notebookList.querySelectorAll<HTMLButtonElement>("[data-notebook]:not([data-action])").forEach((button) => button.addEventListener("click", () => void this.selectNotebook(button.dataset.notebook!)));
     notebookList.querySelectorAll<HTMLButtonElement>("[data-menu-button]").forEach((button) => button.addEventListener("click", (event) => {
       event.stopPropagation();
-      const menu = button.parentElement?.querySelector<HTMLElement>(".quick-menu");
+      const menu = button.closest(".nav-row-wrap")?.querySelector<HTMLElement>(".quick-menu");
       if (menu) this.toggleQuickMenuElement(menu);
     }));
 
@@ -820,7 +821,7 @@ class NotePadApp {
     pageList.querySelectorAll<HTMLButtonElement>("[data-page]:not([data-action])").forEach((button) => button.addEventListener("click", () => void this.selectPage(button.dataset.page!)));
     pageList.querySelectorAll<HTMLButtonElement>("[data-menu-button]").forEach((button) => button.addEventListener("click", (event) => {
       event.stopPropagation();
-      const menu = button.parentElement?.querySelector<HTMLElement>(".quick-menu");
+      const menu = button.closest(".nav-row-wrap")?.querySelector<HTMLElement>(".quick-menu");
       if (menu) this.toggleQuickMenuElement(menu);
     }));
     byId("trash-toggle").classList.toggle("active", this.showTrash);
@@ -1024,12 +1025,12 @@ class NotePadApp {
   }
 
   private readonly handleFlowScroll = (): void => {
-    if (this.viewMode === "paged" || this.flowScrollFrame !== null) return;
+    if (this.viewMode === "paged" || this.explicitPageNavigation || this.flowScrollFrame !== null) return;
     const requestFrame: (callback: FrameRequestCallback) => number = typeof window.requestAnimationFrame === "function" ? window.requestAnimationFrame.bind(window) : ((callback) => window.setTimeout(() => callback(performance.now()), 0));
     this.flowScrollFrame = requestFrame(() => {
       this.flowScrollFrame = null;
       const scroll = document.getElementById("paper-scroll");
-      if (!scroll || this.canvasInputActive() || this.saveTimer !== null || this.saveInFlight !== null || this.unsavedPageID !== null) return;
+      if (!scroll || this.explicitPageNavigation || this.canvasInputActive() || this.saveTimer !== null || this.saveInFlight !== null || this.unsavedPageID !== null) return;
       const rect = scroll.getBoundingClientRect();
       const center = this.viewMode === "horizontal" ? rect.left + rect.width / 2 : rect.top + rect.height / 2;
       let nearest: { id: string; distance: number } | null = null;
@@ -1045,7 +1046,7 @@ class NotePadApp {
   };
 
   private activateFlowPage(pageID: string): void {
-    if (pageID === this.currentPage?.id || this.canvasInputActive()) return;
+    if (pageID === this.currentPage?.id || this.explicitPageNavigation || this.canvasInputActive()) return;
     const page = this.pages.find((candidate) => candidate.id === pageID && this.isPageVisible(candidate));
     if (!page) return;
     if (this.saveTimer !== null || this.saveInFlight !== null || this.unsavedPageID !== null) {
@@ -1437,7 +1438,7 @@ class NotePadApp {
   }
 
   private imageImportContextIsCurrent(context: ImageImportContext): boolean {
-    return this.canInsertImage() && context.store === this.store && context.page === this.currentPage && context.page.id === this.currentPage?.id && context.navigation === this.navigationGeneration && context.generation === this.editGeneration;
+    return this.canInsertImage() && context.store === this.store && context.page.id === this.currentPage?.id && context.navigation === this.navigationGeneration && context.generation === this.editGeneration;
   }
 
   private async addImageFile(file: File, expected?: ImageImportContext): Promise<void> {
@@ -1456,12 +1457,17 @@ class NotePadApp {
       if (!(await this.flushPendingSave())) return;
       if (!this.imageImportContextIsCurrent(context)) return;
       const image = await makePageImage(file, page, getPageImages(page).length);
-      if (store !== this.store || navigation !== this.navigationGeneration || this.currentPage !== page || this.currentPage?.id !== page.id || this.editGeneration !== generation || !this.canInsertImage()) return;
-      setPageImages(page, [...getPageImages(page), image]);
+      const targetPage = this.currentPage;
+      if (store !== this.store || navigation !== this.navigationGeneration || !targetPage || targetPage.id !== page.id || this.editGeneration !== generation || !this.canInsertImage()) return;
+      const targetIndex = getPageImages(targetPage).length;
+      const offset = Math.min(64 + targetIndex * 16, Math.max(0, targetPage.width - image.width));
+      image.x = offset;
+      image.y = Math.min(64 + targetIndex * 16, Math.max(0, targetPage.height - image.height));
+      setPageImages(targetPage, [...getPageImages(targetPage), image]);
       this.selectedImageID = image.id;
-      this.markImageChanged(page);
-      this.renderImageLayer(page);
-      this.renderImageInspector(page);
+      this.markImageChanged(targetPage);
+      this.renderImageLayer(targetPage);
+      this.renderImageInspector(targetPage);
       this.scheduleSave(180);
     } catch (error) {
       this.setState({ kind: "error", message: error instanceof Error ? error.message : "Could not insert image" });
@@ -1649,28 +1655,35 @@ class NotePadApp {
   }
 
   private async createNewPage(duplicate = false): Promise<void> {
-    if (!(await this.flushPendingSave())) return;
-    if (!this.currentNotebook || this.showTrash || this.showRecovery) return;
-    const source = this.currentPage;
-    const page = createPage(this.currentNotebook.id, duplicate && source ? `${source.title} (copy)` : `Page ${this.pages.length + 1}`);
-    if (source) {
-      page.background = source.background;
-      page.width = source.width;
-      page.height = source.height;
-      if (duplicate) {
-        page.text = source.text;
-        page.strokes = clonePage(source).strokes;
-        setPageImages(page, cloneImages(getPageImages(source), true));
-      }
-    }
+    if (this.explicitPageNavigation) return;
+    this.explicitPageNavigation = true;
+    const navigation = ++this.navigationGeneration;
     try {
+      if (!(await this.flushPendingSave())) return;
+      if (navigation !== this.navigationGeneration) return;
+      if (!this.currentNotebook || this.showTrash || this.showRecovery) return;
+      const source = this.currentPage;
+      const page = createPage(this.currentNotebook.id, duplicate && source ? `${source.title} (copy)` : `Page ${this.pages.length + 1}`);
+      if (source) {
+        page.background = source.background;
+        page.width = source.width;
+        page.height = source.height;
+        if (duplicate) {
+          page.text = source.text;
+          page.strokes = clonePage(source).strokes;
+          setPageImages(page, cloneImages(getPageImages(source), true));
+        }
+      }
       const result = await this.store.savePage(page);
+      if (navigation !== this.navigationGeneration) return;
       if (result.status === "failed") return this.setState({ kind: "error", message: result.message ?? "Could not save page" });
       this.coordinator.notifyLocalWrite();
-      await this.reload(page.id);
+      if (!(await this.reload(page.id)) || navigation !== this.navigationGeneration) return;
       await this.closeDrawers();
     } catch (error) {
       this.setState({ kind: "error", message: error instanceof Error ? error.message : "Could not save page" });
+    } finally {
+      this.explicitPageNavigation = false;
     }
   }
 

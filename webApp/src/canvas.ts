@@ -455,10 +455,13 @@ export class PaperCanvas {
   private readonly handlePointerDown = (event: PointerEvent): void => {
     event.preventDefault();
     this.markPenPointer(event);
-    // A browser can report a new contact after losing capture on the previous
-    // one without sending its pointerup. Preserve that partial stroke before
-    // accepting the new contact, including a touch used to resume page flow.
-    if (this.active && this.tool.kind !== "hand" && this.lostCapturePointers.has(this.active.pointerID)) this.commitActiveStroke();
+    // A reused pointer ID is a fresh contact boundary even when Safari omitted
+    // both pointerup and lostpointercapture for the previous contact. Commit
+    // that partial stroke before accepting the new down. A different pen ID
+    // cannot safely terminate the current contact, so leave it alone.
+    const samePointerContact = this.active && event.pointerType !== "touch" && event.pointerId === this.active.pointerID;
+    const previousCaptureLost = this.active && this.lostCapturePointers.has(this.active.pointerID);
+    if (this.active && this.tool.kind !== "hand" && (samePointerContact || previousCaptureLost)) this.commitActiveStroke();
     if (event.pointerType === "touch" || this.tool.kind === "hand") {
       if (this.active || this.eraserBefore) return;
       if (event.pointerType === "mouse" && event.button !== 0) return;
@@ -496,6 +499,14 @@ export class PaperCanvas {
     this.markPenPointer(event);
     if (this.active?.pointerID === event.pointerId && isStalePointerEvent(event, this.active.startedAt)) return;
     if (this.active?.pointerID === event.pointerId) {
+      // A hover move is the only post-contact signal available when WebKit
+      // omits pointerup. Finish the sampled stroke without adding the pen's
+      // off-page hover position to it; a later pointerdown can start cleanly.
+      if (event.pointerType === "pen" && event.buttons === 0 && event.pressure === 0) {
+        this.addPoints(event, false);
+        this.commitActiveStroke();
+        return;
+      }
       this.addPoints(event);
       return;
     }
@@ -836,7 +847,7 @@ export class PaperCanvas {
     this.zoomTo(this.scale * (event.deltaY < 0 ? 1.08 : 0.92), { x: event.clientX - rect.left, y: event.clientY - rect.top });
   };
 
-  private addPoints(event: PointerEvent): void {
+  private addPoints(event: PointerEvent, includeCurrent = true): void {
     if (!this.active) return;
     let coalesced: PointerEvent[] = [];
     if (typeof event.getCoalescedEvents === "function") {
@@ -844,7 +855,10 @@ export class PaperCanvas {
     }
     // getCoalescedEvents contains historical samples; the dispatched event is
     // the newest sample and must be retained for fast Pencil strokes.
-    const events = coalesced.length > 0 ? [...coalesced, event] : [event];
+    const events = coalesced.length > 0
+      ? (includeCurrent ? [...coalesced, event] : coalesced)
+      : (includeCurrent ? [event] : []);
+    if (events.length === 0) return;
     const rect = this.canvas.getBoundingClientRect();
     for (const sample of events) {
       const position = this.pagePoint(sample, rect);
@@ -1148,7 +1162,9 @@ function distance(first: TouchPointer, second: TouchPointer): number { return Ma
 function midpoint(first: TouchPointer, second: TouchPointer): TouchPointer { return { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 }; }
 function finite(value: number): boolean { return Number.isFinite(value); }
 function isStalePointerEvent(event: PointerEvent, startedAt: number): boolean {
-  return finite(event.timeStamp) && event.timeStamp < startedAt;
+  // Zero is a valid value on some WebKit PointerEvents. It cannot establish
+  // that a reused-ID event is older, so let the lifecycle event close input.
+  return finite(event.timeStamp) && event.timeStamp > 0 && startedAt > 0 && event.timeStamp < startedAt;
 }
 function roundTo(value: number, places: number): number {
   const factor = 10 ** places;

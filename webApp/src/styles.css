@@ -38,21 +38,24 @@
 .library-sort { margin-left: auto; color: #768193; font-size: 12px; white-space: nowrap; }
 .library-sort select { border: 0; background: transparent; min-height: 44px; color: #315c96; font-size: 13px; }
 .library-books { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 36px 30px; padding: 32px 0; align-content: start; }
-.library-book { position: relative; width: 100%; max-width: 205px; min-width: 0; justify-self: center; }
+.library-book { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 44px; align-items: start; width: 100%; max-width: 205px; min-width: 0; isolation: isolate; justify-self: center; }
 .book-open { display: flex; flex-direction: column; align-items: center; gap: 17px; width: 100%; padding: 0 8px; background: transparent; text-align: center; }
-.book-cover { position: relative; display: flex; width: 145px; height: 197px; padding: 18px 10px 15px 17px; border-radius: 3px 8px 8px 3px; color: #fff; background: var(--cover, #304b6f); box-shadow: 3px 5px 7px #23334a22, inset 5px 0 #00000017, inset 7px 0 #ffffff0c; transition: transform .18s ease, box-shadow .18s ease; }
+.book-cover { position: relative; display: flex; width: min(145px, 100%); height: auto; aspect-ratio: 145 / 197; padding: 18px 10px 15px 17px; border-radius: 3px 8px 8px 3px; color: #fff; background: var(--cover, #304b6f); box-shadow: 3px 5px 7px #23334a22, inset 5px 0 #00000017, inset 7px 0 #ffffff0c; transition: box-shadow .18s ease; }
 .book-cover::after { position: absolute; content: ""; right: -3px; top: 5px; bottom: 5px; width: 3px; background: #e4e1d9; border-radius: 0 2px 2px 0; }
 .cover-1 { --cover: #697866; }.cover-2 { --cover: #ac7464; }.cover-3 { --cover: #667596; }.cover-4 { --cover: #b09866; }
 .cover-label { display: flex; flex-direction: column; align-items: center; justify-content: center; border: 1px solid #ffffff45; width: 100%; min-width: 0; padding: 12px 5px; }
 .cover-label small { font-size: 7px; letter-spacing: 2px; opacity: .8; }
 .cover-label strong { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; margin: 16px 0 auto; font: 500 16px/1.4 Georgia, serif; }
 .cover-label > span { font-size: 8px; opacity: .65; }
-.book-open:hover .book-cover { transform: translateY(-4px); box-shadow: 3px 10px 14px #23334a25, inset 5px 0 #00000017; }
+.book-open:hover .book-cover { box-shadow: 3px 10px 14px #23334a25, inset 5px 0 #00000017; }
 .book-caption { display: flex; flex-direction: column; gap: 5px; width: 100%; }
 .book-caption strong { font-size: 13px; font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .book-caption small { font-size: 11px; color: #7b8697; }
-.book-star { position: absolute; z-index: 1; top: -13px; right: 0; width: 44px; height: 44px; background: #f7f8fa; border-radius: 50%; color: #9aa4b3; font-size: 22px; }
-.book-menu-button { position: absolute; z-index: 2; top: 28px; right: 0; background: #f7f8fa; }
+.book-actions { position: relative; z-index: 3; display: flex; flex-direction: column; align-items: stretch; gap: 0; grid-column: 2; margin-top: -13px; }
+.book-star, .book-menu-button { position: static; flex: 0 0 44px; width: 44px; height: 44px; background: #f7f8fa; border-radius: 50%; color: #9aa4b3; font-size: 22px; }
+.book-star { margin-bottom: -3px; }
+.book-menu-button { z-index: 1; border-radius: 4px; color: #70675e; font-size: 20px; }
+.book-menu-button:hover, .book-menu-button:focus-visible { background: #e8eef7; color: #23334a; }
 .book-quick-menu { top: 67px; right: 0; }
 .book-star[aria-pressed="true"] { color: #2876ca; }
 .library-empty { margin: 70px auto; max-width: 380px; text-align: center; color: #7b8697; font-size: 15px; line-height: 1.7; }
@@ -65,7 +68,8 @@
 .is-list .book-open { flex-direction: row; text-align: left; padding-right: 50px; }
 .is-list .book-cover { width: 45px; height: 60px; flex-shrink: 0; padding: 5px; }
 .is-list .cover-label > * { display: none; }
-.is-list .book-star { top: 23px; }
+.is-list .book-actions { margin-top: 8px; }
+.is-list .book-star { margin-bottom: -3px; }
 .back-library { display: inline-flex; align-items: center; gap: 7px; min-height: 44px; padding: 0 5px; color: #fff; background: transparent; white-space: nowrap; font-size: 25px; }
 .back-library span { font-size: 13px; }
 #editor-workspace .topbar { background: #284d7a; border: 0; }
@@ -91,7 +95,8 @@
   .library-search { flex-basis: 100%; max-width: none; }
   .library-sort { margin-left: 0; flex: 1; }
   .library-books { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 30px 12px; }
-  .book-cover { width: 126px; height: 173px; }
+  .book-open { padding-inline: 0; }
+  .book-cover { width: min(126px, 100%); height: auto; aspect-ratio: 126 / 173; }
   .book-star { right: -6px; }
   .back-library span { display: none; }
   #editor-workspace .topbar-leading { gap: 2px; }
@@ -129,18 +134,18 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .small-action { width: 22px; height: 22px; margin-left: auto; border-radius: 50%; background: transparent; color: var(--muted); font-size: 17px; line-height: 1; }
 .small-action:hover { background: var(--paper-deep); color: var(--ink); }
 #notebook-list, #page-list { display: flex; flex-direction: column; gap: 2px; overflow-y: auto; scrollbar-width: thin; }
-.nav-row, .page-row { display: flex; align-items: center; min-width: 0; width: 100%; padding: 9px 8px; border-radius: 4px; background: transparent; text-align: left; transition: background .18s ease, transform .18s ease; }
-.nav-row-wrap { position: relative; display: flex; align-items: center; min-width: 0; }
-.nav-row-wrap .nav-row { flex: 1; width: auto; }
-.nav-menu-button, .book-menu-button, .menu-trigger { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 4px; background: transparent; color: var(--muted); font-size: 18px; line-height: 1; }
-.nav-menu-button { flex: 0 0 36px; margin-left: -38px; opacity: 0; }
-.nav-row-wrap:hover .nav-menu-button, .nav-row-wrap:focus-within .nav-menu-button { opacity: 1; background: var(--paper-deep); }
+.nav-row, .page-row { display: flex; align-items: center; min-width: 0; width: 100%; padding: 9px 8px; border-radius: 4px; background: transparent; text-align: left; transition: background .18s ease; }
+.nav-row-wrap { position: relative; display: flex; align-items: center; min-width: 0; padding-right: 44px; }
+.nav-row-wrap .nav-row { position: relative; z-index: 0; flex: 1; width: 100%; }
+.nav-menu-button, .menu-trigger { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 4px; background: transparent; color: var(--muted); font-size: 18px; line-height: 1; }
+.nav-menu-button { position: absolute; top: 50%; right: 0; z-index: 2; display: grid; width: 44px; height: 44px; flex: 0 0 44px; margin: 0; border-radius: 4px; opacity: 1; pointer-events: auto; transform: translateY(-50%); }
+.nav-row-wrap:hover .nav-menu-button, .nav-row-wrap:focus-within .nav-menu-button, .nav-menu-button:hover, .nav-menu-button:focus-visible { background: var(--paper-deep); color: var(--ink); }
 .quick-menu { position: absolute; z-index: 100; display: flex; min-width: 160px; flex-direction: column; gap: 2px; padding: 5px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--paper); box-shadow: 0 10px 26px rgba(43, 32, 24, .16); }
 .quick-menu[hidden] { display: none; }
 .nav-row-wrap > .quick-menu { top: calc(100% - 4px); right: 4px; }
 .quick-menu button { min-height: 36px; padding: 0 10px; border-radius: 3px; background: transparent; color: var(--ink); font-size: 11px; text-align: left; white-space: nowrap; }
 .quick-menu button:hover { background: var(--paper-deep); color: var(--accent-dark); }
-.nav-row:hover, .page-row:hover { background: rgba(255, 253, 247, .62); transform: translateX(2px); }
+.nav-row:hover, .page-row:hover { background: rgba(255, 253, 247, .62); }
 .nav-row.selected, .page-row.selected { background: var(--paper); box-shadow: inset 2px 0 var(--accent); }
 .nav-glyph { width: 23px; color: var(--accent); font-size: 19px; }
 .nav-copy, .page-copy { display: flex; min-width: 0; flex-direction: column; gap: 3px; }

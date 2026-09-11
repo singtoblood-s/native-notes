@@ -67,7 +67,11 @@ function selectPushBatchDetails(operations: SyncOperation[], maxBytes: number): 
   for (const operation of operations) {
     const item = sizeOperation(operation);
     const entityKey = `${operation.entityType}:${operation.entityId}`;
-    if (entities.has(entityKey)) continue;
+    // The outbox is ordered globally. Once a second revision of an entity is
+    // reached, later entities must wait for the first revision's ACK; otherwise
+    // a later notebook tombstone can overtake an earlier page restore, so the
+    // server rejects that restore while the notebook is still deleted.
+    if (entities.has(entityKey)) break;
     entities.add(entityKey);
     if (isOversized(item)) {
       skippedOversized = true;

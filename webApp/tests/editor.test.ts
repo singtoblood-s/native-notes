@@ -12,7 +12,21 @@ vi.mock("../src/storage", () => ({ SQLiteNoteStore: { open: async () => ({
   getNotebook: async (id: string) => structuredClone(data.notebooks.find((notebook) => notebook.id === id)),
   getPage: async (id: string) => structuredClone(data.pages.find((page) => page.id === id)),
   saveNotebook: async (notebook: Notebook) => {
-    data.notebooks.push(structuredClone(notebook));
+    const index = data.notebooks.findIndex((item) => item.id === notebook.id);
+    if (index < 0) data.notebooks.push(structuredClone(notebook));
+    else data.notebooks[index] = structuredClone(notebook);
+    return { status: "saved", revision: 1 };
+  },
+  archiveNotebook: async (id: string) => {
+    const index = data.notebooks.findIndex((item) => item.id === id);
+    if (index < 0) return { status: "failed", message: "Notebook not found" };
+    data.notebooks[index] = { ...data.notebooks[index]!, deletedAt: new Date().toISOString() };
+    return { status: "saved", revision: 1 };
+  },
+  restoreNotebook: async (id: string) => {
+    const index = data.notebooks.findIndex((item) => item.id === id);
+    if (index < 0) return { status: "failed", message: "Notebook not found" };
+    data.notebooks[index] = { ...data.notebooks[index]!, deletedAt: null };
     return { status: "saved", revision: 1 };
   },
   savePage: async (page: NotePage) => {
@@ -50,6 +64,11 @@ it("creates notebooks, preserves tool settings, duplicates paper and prevents na
     await vi.waitFor(() => expect(document.querySelector("[data-open-book]")).not.toBeNull());
     expect(element("library").hidden).toBe(false);
     expect(element("editor-workspace").hidden).toBe(true);
+    const notebookMenuButton = document.querySelector<HTMLButtonElement>("#notebook-list .nav-menu-button")!;
+    notebookMenuButton.click();
+    expect(notebookMenuButton.closest(".nav-row-wrap")?.querySelector<HTMLElement>(".quick-menu")?.hidden).toBe(false);
+    expect(element("library").hidden).toBe(false);
+    notebookMenuButton.click();
     document.querySelector<HTMLButtonElement>("[data-favorite]")!.click();
     element("library-favorites").click();
     expect(document.querySelectorAll("[data-open-book]")).toHaveLength(1);
@@ -61,6 +80,14 @@ it("creates notebooks, preserves tool settings, duplicates paper and prevents na
     search.dispatchEvent(new Event("input"));
     expect(document.querySelectorAll("[data-open-book]")).toHaveLength(0);
     element("library-documents").click();
+    const libraryCard = document.querySelector<HTMLElement>(".library-book")!;
+    const libraryMenuButton = libraryCard.querySelector<HTMLButtonElement>(".book-menu-button")!;
+    expect(libraryMenuButton.closest(".book-open")).toBeNull();
+    libraryMenuButton.click();
+    const libraryMenu = libraryCard.querySelector<HTMLElement>(".book-quick-menu")!;
+    expect(libraryMenu.hidden).toBe(false);
+    expect(libraryMenu.querySelector("[data-action='trash-notebook']")?.textContent).toContain("Move to trash");
+    libraryMenuButton.click();
     document.querySelector<HTMLButtonElement>("[data-open-book]")!.click();
     await vi.waitFor(() => expect(element("page-title-label")?.textContent).toBe("Original page"));
     expect(element("editor-workspace").hidden).toBe(false);
@@ -113,6 +140,15 @@ it("creates notebooks, preserves tool settings, duplicates paper and prevents na
     expect(element("page-position").textContent).toBe("1 / 1");
     expect(data.pages.at(-1)!.background).toBe("grid");
     expect(element("library").hidden).toBe(true);
+
+    element("back-library").click();
+    await vi.waitFor(() => expect(element("library").hidden).toBe(false));
+    const createdNotebook = data.notebooks.at(-1)!;
+    const createdCard = document.querySelector<HTMLElement>(`[data-open-book="${createdNotebook.id}"]`)!.closest<HTMLElement>(".library-book")!;
+    createdCard.querySelector<HTMLButtonElement>(".book-menu-button")!.click();
+    createdCard.querySelector<HTMLButtonElement>("[data-action='trash-notebook']")!.click();
+    await vi.waitFor(() => expect(document.querySelector(`[data-open-book="${createdNotebook.id}"]`)).toBeNull());
+    expect(data.notebooks.at(-1)!.deletedAt).toBeTruthy();
   } finally {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
