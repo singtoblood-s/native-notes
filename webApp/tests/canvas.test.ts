@@ -51,6 +51,36 @@ beforeEach(() => {
 afterEach(() => { document.body.innerHTML = ""; vi.unstubAllGlobals(); });
 
 describe("PaperCanvas pointer contract", () => {
+  it("cancels native canvas touch moves without duplicate ink or blocking outside scrolling", () => {
+    const { canvas, viewport, changes, canvasController } = setup();
+    canvasController.setNavigationMode("continuous");
+    const nativeMove = () => new Event("touchmove", { bubbles: true, cancelable: true });
+    const down = pointer("pointerdown", { pointerId: 90, pointerType: "touch", clientX: 300, clientY: 300 });
+    canvas.dispatchEvent(down);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 90, pointerType: "touch", clientX: 300, clientY: 200 }));
+    const touch = nativeMove();
+    canvas.dispatchEvent(touch);
+    expect(touch.defaultPrevented).toBe(true);
+    expect(viewport.scrollTop).toBe(100);
+    expect(changes).not.toHaveBeenCalled();
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 90, pointerType: "touch" }));
+
+    canvas.dispatchEvent(pointer("pointerdown", {}));
+    canvas.dispatchEvent(pointer("pointermove", { clientX: 120 }));
+    canvas.dispatchEvent(nativeMove());
+    canvas.dispatchEvent(pointer("pointerup", { clientX: 140 }));
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(changes.mock.calls[0]![0]).toHaveLength(1);
+
+    const outside = nativeMove();
+    viewport.dispatchEvent(outside);
+    expect(outside.defaultPrevented).toBe(false);
+    canvasController.destroy();
+    const afterDestroy = nativeMove();
+    canvas.dispatchEvent(afterDestroy);
+    expect(afterDestroy.defaultPrevented).toBe(false);
+  });
+
   it("renders bounded page previews with the page aspect ratio and ink", () => {
     const preview = document.createElement("canvas");
     const context = {

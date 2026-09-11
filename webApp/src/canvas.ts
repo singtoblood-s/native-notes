@@ -214,6 +214,7 @@ export class PaperCanvas {
     // The canvas owns all touch gestures. This also prevents browser navigation
     // and native page scrolling from stealing a pen/pinch sequence.
     this.updateTouchAction();
+    this.canvas.addEventListener("touchmove", this.handleNativeTouchMove, { passive: false });
     this.canvas.addEventListener("pointerdown", this.handlePointerDown, { passive: false });
     this.canvas.addEventListener("pointermove", this.handlePointerMove, { passive: false });
     this.canvas.addEventListener("pointerup", this.handlePointerUp, { passive: false });
@@ -387,6 +388,7 @@ export class PaperCanvas {
     window.removeEventListener("resize", this.handleResize);
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
+    this.canvas.removeEventListener("touchmove", this.handleNativeTouchMove);
     this.canvas.removeEventListener("pointerdown", this.handlePointerDown);
     this.canvas.removeEventListener("pointermove", this.handlePointerMove);
     this.canvas.removeEventListener("pointerup", this.handlePointerUp);
@@ -451,6 +453,17 @@ export class PaperCanvas {
     this.staticContext.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     if (render) this.renderStatic();
   }
+
+  // WebKit/Scribble can swallow rapid Pencil contacts before pointerdown.
+  // A non-passive touchmove listener is a reported workaround even with
+  // touch-action:none and pointer-event preventDefault already in place:
+  // https://mikepk.com/2020/10/iOS-safari-scribble-bug/
+  // Keep this on the active canvas: Pointer Events own its ink/pan/pinch,
+  // while neighbouring page previews still need native finger scrolling.
+  // This does not disable Scribble or recover events the OS never dispatches.
+  private readonly handleNativeTouchMove = (event: TouchEvent): void => {
+    if (event.cancelable) event.preventDefault();
+  };
 
   private readonly handlePointerDown = (event: PointerEvent): void => {
     event.preventDefault();
