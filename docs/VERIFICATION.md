@@ -1,5 +1,47 @@
 # Release verification — 2026-09-11
 
+## Repair investigation
+
+The user's follow-up reproduced an undersized writing area, unstable pinch
+anchoring, missing notebook rename controls and unavailable cross-device sync.
+The original public tunnel returned HTTP 530 and the local API was stopped.
+The existing server database was backed up privately before restarting the API
+for local testing. No user database or note export is included in this repository.
+
+The repair adds writing-first drawers, visible rename actions, width-fit paper,
+bounded pinch/pan gestures, automatic sync coordination and explicit local
+workspace recovery exports. See [repair plan](REPAIR_PLAN.md) and
+[device regression checks](TESTING.md). Hosting availability remains separate
+from client behavior: a static Pages deployment cannot supply the sync API.
+
+The results below describe the original delivery; repair-specific results are
+recorded separately so the temporary backend's earlier success is not mistaken
+for a continuously available hosted service.
+
+### Repair checks performed
+
+- Web: 38 passing tests across seven files; TypeScript and production Vite
+  build pass. The unchanged server test suite and install distribution pass.
+- Production builds served on two different browser origins use separate local
+  SQLite stores and the same real local Ktor API/account. Notebook rename,
+  page rename and Thai text from A appeared on B through automatic periodic
+  sync, without pressing the sync button.
+- Closing the text drawer immediately after changing a title/text and reloading
+  preserved the new values. Notebook rename also survived reload.
+- Stopping the API produced a visible network error while preserving edits.
+  Restarting it triggered an automatic retry and uploaded the queued edit.
+- The queued edit from B subsequently appeared on A automatically. A drawn
+  stroke from A also appeared on B through periodic sync.
+- Archiving a notebook made its nondeleted child page visible in Trash.
+  Restoring the notebook and returning from Trash preserved text and ink.
+- Writing-first layouts were inspected at 430 × 932, 834 × 1194 and
+  1194 × 834. Mobile paper uses a 16-pixel gutter and begins at the top;
+  notebook and text drawers begin closed.
+- Automated gesture tests cover stable multi-move pinch anchors, cancellation
+  and one-finger handoff, resize preservation, pan limits, active input guards
+  and bounded history for large pages. Physical multi-touch/pen behavior still
+  needs confirmation on the user's Safari/Chrome devices.
+
 ## Automated
 
 - Web: 17 passing tests covering auth identity/logout/endpoint handling,

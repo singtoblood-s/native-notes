@@ -103,6 +103,17 @@ describe("sync durability protocol", () => {
     expect(selected.map((item) => item.opId)).toEqual([operationID]);
   });
 
+  it("does not upload a workspace selected for another account", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const fake = fakeStore([operation(operationID)]);
+    Object.defineProperty(fake.store, "accountKey", { value: "https://sync.example.test:other-account", configurable: true });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(new SyncClient().sync(fake.store, session)).rejects.toThrow("different account");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("applies a conflict snapshot before acknowledging the rejected local edit", async () => {
     localStorage.setItem("notepad.endpoint", "https://sync.example.test");
     const fake = fakeStore([operation(operationID)]);

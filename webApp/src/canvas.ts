@@ -10,7 +10,87 @@ interface ActiveStroke {
   startedAt: number;
 }
 
-interface TouchPointer { x: number; y: number; }
+export interface CanvasPoint { x: number; y: number; }
+
+interface TouchPointer extends CanvasPoint {}
+
+export interface PanBounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
+/** Keep a small part of a zoomed page visible while it is being panned. */
+export const PAN_MARGIN = 32;
+export const MOBILE_FIT_GUTTER = 16;
+export const MIN_CANVAS_SCALE = 0.25;
+export const MAX_CANVAS_SCALE = 2.8;
+export const FIT_MAX_SCALE = 1.4;
+export const MAX_HISTORY_ENTRIES = 100;
+export const MAX_HISTORY_POINTS = 200_000;
+
+function viewportGutter(viewportWidth: number): number {
+  return viewportWidth < 640 ? MOBILE_FIT_GUTTER : PAN_MARGIN;
+}
+
+function boundedInsideViewport(content: number, viewport: number, margin: number): number | { min: number; max: number } {
+  const maxOffset = viewport - content - margin;
+  return maxOffset < margin ? (viewport - content) / 2 : { min: margin, max: maxOffset };
+}
+
+export function getPanBounds(
+  pageWidth: number,
+  pageHeight: number,
+  scale: number,
+  viewportWidth: number,
+  viewportHeight: number,
+  margin = PAN_MARGIN,
+): PanBounds {
+  const scaledWidth = Math.max(0, pageWidth) * Math.max(0, scale);
+  const scaledHeight = Math.max(0, pageHeight) * Math.max(0, scale);
+  const safeViewportWidth = Math.max(0, viewportWidth);
+  const safeViewportHeight = Math.max(0, viewportHeight);
+  const safeMargin = Math.max(0, margin);
+  const x = scaledWidth <= safeViewportWidth
+    ? boundedInsideViewport(scaledWidth, safeViewportWidth, safeMargin)
+    : { min: safeViewportWidth - scaledWidth - safeMargin, max: safeMargin };
+  const y = scaledHeight <= safeViewportHeight
+    ? boundedInsideViewport(scaledHeight, safeViewportHeight, safeMargin)
+    : { min: safeViewportHeight - scaledHeight - safeMargin, max: safeMargin };
+  return {
+    minX: typeof x === "number" ? x : x.min,
+    maxX: typeof x === "number" ? x : x.max,
+    minY: typeof y === "number" ? y : y.min,
+    maxY: typeof y === "number" ? y : y.max,
+  };
+}
+
+export function clampPan(
+  offsetX: number,
+  offsetY: number,
+  pageWidth: number,
+  pageHeight: number,
+  scale: number,
+  viewportWidth: number,
+  viewportHeight: number,
+  margin = PAN_MARGIN,
+): CanvasPoint {
+  const bounds = getPanBounds(pageWidth, pageHeight, scale, viewportWidth, viewportHeight, margin);
+  return {
+    x: clamp(finite(offsetX) ? offsetX : 0, bounds.minX, bounds.maxX),
+    y: clamp(finite(offsetY) ? offsetY : 0, bounds.minY, bounds.maxY),
+  };
+}
+
+export function worldPointAt(screen: CanvasPoint, scale: number, offsetX: number, offsetY: number): CanvasPoint {
+  const safeScale = finite(scale) && Math.abs(scale) > Number.EPSILON ? scale : 1;
+  return { x: (screen.x - offsetX) / safeScale, y: (screen.y - offsetY) / safeScale };
+}
+
+export function offsetAtAnchor(world: CanvasPoint, scale: number, anchor: CanvasPoint): CanvasPoint {
+  return { x: anchor.x - world.x * scale, y: anchor.y - world.y * scale };
+}
 
 export interface CanvasCallbacks {
   onChange: (strokes: InkStroke[]) => void;
@@ -35,7 +115,13 @@ export class PaperCanvas {
   private eraserBefore: InkStroke[] | null = null;
   private touchPointers = new Map<number, TouchPointer>();
   private panLast: TouchPointer | null = null;
-  private pinchStart: { distance: number; scale: number; center: TouchPointer } | null = null;
+  private pinchStart: {
+    distance: number;
+    scale: number;
+    offsetX: number;
+    offsetY: number;
+    center: TouchPointer;
+  } | null = null;
   private undoStack: InkStroke[][] = [];
   private redoStack: InkStroke[][] = [];
   private dpr = 1;
@@ -43,7 +129,10 @@ export class PaperCanvas {
   private offsetX = 0;
   private offsetY = 0;
   private pageKey = "";
+  private fitMode: "width" | "page" | "custom" = "width";
+  private lastViewportSize: { width: number; height: number } | null = null;
   private activeFrame: number | null = null;
+  private resizeObserver: ResizeObserver | null = null;
 
   constructor(canvas: HTMLCanvasElement, paper: HTMLElement, viewport: HTMLElement, callbacks: CanvasCallbacks) {
     this.canvas = canvas;
@@ -57,6 +146,11 @@ export class PaperCanvas {
     const staticContext = this.staticCanvas.getContext("2d");
     if (!staticContext) throw new Error("This browser cannot create an off-screen canvas.");
     this.staticContext = staticContext;
+    // The canvas owns all touch gestures. This also prevents browser navigation
+    // and native page scrolling from stealing a pen/pinch sequence.
+    this.viewport.style.touchAction = "none";
+    this.paper.style.touchAction = "none";
+    this.canvas.style.touchAction = "none";
     this.canvas.addEventListener("pointerdown", this.handlePointerDown, { passive: false });
     this.canvas.addEventListener("pointermove", this.handlePointerMove, { passive: false });
     this.canvas.addEventListener("pointerup", this.handlePointerUp, { passive: false });
@@ -65,6 +159,10 @@ export class PaperCanvas {
     this.canvas.addEventListener("wheel", this.handleWheel, { passive: false });
     this.canvas.addEventListener("contextmenu", (event) => event.preventDefault());
     window.addEventListener("resize", this.handleResize, { passive: true });
+    if (typeof ResizeObserver !== "undefined") {
+      this.resizeObserver = new ResizeObserver(this.handleResize);
+      this.resizeObserver.observe(this.viewport);
+    }
   }
 
   setPage(pageID: string, width: number, height: number, background: PageBackground, strokes: InkStroke[]): void {
@@ -79,7 +177,7 @@ export class PaperCanvas {
     this.paper.style.height = `${height}px`;
     if (dimensionsChanged || newPage) this.resizeCanvas();
     this.setStrokes(strokes, newPage);
-    if (newPage || dimensionsChanged) this.fitToViewport();
+    if (newPage || dimensionsChanged) this.fitToWidth();
   }
 
   setStrokes(strokes: InkStroke[], resetHistory = false): void {
@@ -99,13 +197,18 @@ export class PaperCanvas {
   setTool(tool: CanvasTool): void { this.tool = tool; }
 
   get currentScale(): number { return this.scale; }
+  /** True while a stroke, erase gesture, or touch navigation gesture is active. */
+  get isInputActive(): boolean {
+    return this.active !== null || this.eraserBefore !== null || this.touchPointers.size > 0;
+  }
   get hasUndo(): boolean { return this.undoStack.length > 0; }
   get hasRedo(): boolean { return this.redoStack.length > 0; }
 
   undo(): void {
     const previous = this.undoStack.pop();
     if (!previous) return;
-    this.redoStack.push(cloneStrokes(this.strokes));
+    if (historyPointCount(this.strokes) <= MAX_HISTORY_POINTS) this.redoStack.push(cloneStrokes(this.strokes));
+    this.trimHistory();
     this.strokes = cloneStrokes(previous);
     this.render();
     this.callbacks.onChange(cloneStrokes(this.strokes));
@@ -114,7 +217,8 @@ export class PaperCanvas {
   redo(): void {
     const next = this.redoStack.pop();
     if (!next) return;
-    this.undoStack.push(cloneStrokes(this.strokes));
+    if (historyPointCount(this.strokes) <= MAX_HISTORY_POINTS) this.undoStack.push(cloneStrokes(this.strokes));
+    this.trimHistory();
     this.strokes = cloneStrokes(next);
     this.render();
     this.callbacks.onChange(cloneStrokes(this.strokes));
@@ -130,19 +234,62 @@ export class PaperCanvas {
     this.zoomTo(this.scale * factor, { x: rect.width / 2, y: rect.height / 2 });
   }
 
-  fitToViewport(): void {
+  /** Fit the page to the viewport width and leave vertical space pannable. */
+  fitToWidth(): void {
+    this.fitMode = "width";
     const rect = this.viewport.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
-    const nextScale = Math.min((rect.width - 64) / this.width, (rect.height - 64) / this.height);
-    this.scale = clamp(nextScale, 0.25, 1.4);
-    this.offsetX = (rect.width - this.width * this.scale) / 2;
-    this.offsetY = (rect.height - this.height * this.scale) / 2;
+    const gutter = viewportGutter(rect.width);
+    const nextScale = clamp((rect.width - gutter * 2) / this.width, MIN_CANVAS_SCALE, FIT_MAX_SCALE);
+    this.scale = nextScale;
+    const bounded = clampPan(
+      (rect.width - this.width * this.scale) / 2,
+      gutter,
+      this.width,
+      this.height,
+      this.scale,
+      rect.width,
+      rect.height,
+      gutter,
+    );
+    this.offsetX = bounded.x;
+    this.offsetY = bounded.y;
     this.updateTransform();
     this.callbacks.onZoom(this.scale);
   }
 
+  /** Fit the complete page inside the viewport. Useful as an explicit view command. */
+  fitToPage(): void {
+    this.fitMode = "page";
+    const rect = this.viewport.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const gutter = viewportGutter(rect.width);
+    const availableWidth = Math.max(1, rect.width - gutter * 2);
+    const availableHeight = Math.max(1, rect.height - gutter * 2);
+    this.scale = clamp(Math.min(availableWidth / this.width, availableHeight / this.height), MIN_CANVAS_SCALE, FIT_MAX_SCALE);
+    const bounded = clampPan(
+      (rect.width - this.width * this.scale) / 2,
+      (rect.height - this.height * this.scale) / 2,
+      this.width,
+      this.height,
+      this.scale,
+      rect.width,
+      rect.height,
+      gutter,
+    );
+    this.offsetX = bounded.x;
+    this.offsetY = bounded.y;
+    this.updateTransform();
+    this.callbacks.onZoom(this.scale);
+  }
+
+  /** Kept for the existing toolbar; width fit is the useful writing default. */
+  fitToViewport(): void { this.fitToWidth(); }
+
   destroy(): void {
     window.removeEventListener("resize", this.handleResize);
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
     this.canvas.removeEventListener("pointerdown", this.handlePointerDown);
     this.canvas.removeEventListener("pointermove", this.handlePointerMove);
     this.canvas.removeEventListener("pointerup", this.handlePointerUp);
@@ -152,7 +299,36 @@ export class PaperCanvas {
   }
 
   private readonly handleResize = (): void => {
+    const currentRect = this.viewport.getBoundingClientRect();
+    const previousSize = this.lastViewportSize ?? { width: currentRect.width, height: currentRect.height };
+    const previousCenter = { x: previousSize.width / 2, y: previousSize.height / 2 };
+    const previousWorld = worldPointAt(previousCenter, this.scale, this.offsetX, this.offsetY);
     this.resizeCanvas();
+    const nextRect = this.viewport.getBoundingClientRect();
+    if (this.pageKey && nextRect.width > 0 && nextRect.height > 0 && this.fitMode === "width") {
+      this.fitToWidth();
+      this.rebaseTouchGesture();
+    } else if (this.pageKey && nextRect.width > 0 && nextRect.height > 0 && this.fitMode === "page") {
+      this.fitToPage();
+      this.rebaseTouchGesture();
+    } else if (this.pageKey && previousSize.width > 0 && previousSize.height > 0 && nextRect.width > 0 && nextRect.height > 0) {
+      const nextOffset = offsetAtAnchor(previousWorld, this.scale, { x: nextRect.width / 2, y: nextRect.height / 2 });
+      const gutter = viewportGutter(nextRect.width);
+      const bounded = clampPan(
+        nextOffset.x,
+        nextOffset.y,
+        this.width,
+        this.height,
+        this.scale,
+        nextRect.width,
+        nextRect.height,
+        gutter,
+      );
+      this.offsetX = bounded.x;
+      this.offsetY = bounded.y;
+      this.updateTransform();
+      this.rebaseTouchGesture();
+    }
     this.render();
   };
 
@@ -173,24 +349,18 @@ export class PaperCanvas {
     event.preventDefault();
     if (event.pointerType === "touch") {
       if (this.active) return;
-      this.touchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-      this.canvas.setPointerCapture(event.pointerId);
-      if (this.touchPointers.size === 1) this.panLast = { x: event.clientX, y: event.clientY };
-      if (this.touchPointers.size === 2) {
-        const [first, second] = [...this.touchPointers.values()];
-        if (first && second) {
-          const rect = this.viewport.getBoundingClientRect();
-          const center = midpoint(first, second);
-          this.pinchStart = { distance: distance(first, second), scale: this.scale, center: { x: center.x - rect.left, y: center.y - rect.top } };
-        }
-      }
+      this.touchPointers.set(event.pointerId, this.touchPoint(event));
+      this.capturePointer(event.pointerId);
+      this.rebaseTouchGesture();
       return;
     }
     if (event.pointerType !== "pen" && event.pointerType !== "mouse") return;
     if (event.pointerType === "mouse" && event.button !== 0) return;
     if (this.active) return;
     this.touchPointers.clear();
-    this.canvas.setPointerCapture(event.pointerId);
+    this.panLast = null;
+    this.pinchStart = null;
+    this.capturePointer(event.pointerId);
     if (this.tool.kind === "eraser") {
       this.eraserBefore = cloneStrokes(this.strokes);
       this.eraseAt(this.pagePoint(event));
@@ -210,25 +380,17 @@ export class PaperCanvas {
     if (event.pointerType === "touch") {
       if (this.active) return;
       if (!this.touchPointers.has(event.pointerId)) return;
-      this.touchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      this.touchPointers.set(event.pointerId, this.touchPoint(event));
       const values = [...this.touchPointers.values()];
-      if (values.length >= 2 && this.pinchStart) {
-        const [first, second] = values;
-        if (first && second) {
-          const nextCenter = midpoint(first, second);
-          const nextDistance = distance(first, second);
-          const rect = this.viewport.getBoundingClientRect();
-          this.zoomTo(
-            this.pinchStart.scale * (nextDistance / Math.max(1, this.pinchStart.distance)),
-            { x: nextCenter.x - rect.left, y: nextCenter.y - rect.top },
-            this.pinchStart.center,
-          );
-        }
+      if (values.length >= 2) {
+        if (!this.pinchStart) this.beginPinch();
+        this.updatePinch();
       } else if (values.length === 1 && this.panLast) {
-        this.offsetX += event.clientX - this.panLast.x;
-        this.offsetY += event.clientY - this.panLast.y;
-        this.panLast = { x: event.clientX, y: event.clientY };
-        this.updateTransform();
+        const point = values[0]!;
+        this.offsetX += point.x - this.panLast.x;
+        this.offsetY += point.y - this.panLast.y;
+        this.panLast = point;
+        this.applyPan();
       }
       return;
     }
@@ -243,9 +405,7 @@ export class PaperCanvas {
     event.preventDefault();
     if (event.pointerType === "touch") {
       if (this.active) return;
-      this.touchPointers.delete(event.pointerId);
-      if (this.touchPointers.size < 2) this.pinchStart = null;
-      if (this.touchPointers.size === 0) this.panLast = null;
+      this.endTouchPointer(event.pointerId);
       return;
     }
     if (this.tool.kind === "eraser") {
@@ -273,12 +433,104 @@ export class PaperCanvas {
 
   private readonly handlePointerCancel = (event: Event): void => {
     const pointerEvent = event as PointerEvent;
-    if (pointerEvent.pointerType === "touch" || this.active?.pointerID !== pointerEvent.pointerId) {
-      this.touchPointers.delete(pointerEvent.pointerId);
+    if (this.touchPointers.has(pointerEvent.pointerId) || pointerEvent.pointerType === "touch") {
+      this.endTouchPointer(pointerEvent.pointerId);
       return;
     }
-    this.cancelActiveInput();
+    if (this.active?.pointerID === pointerEvent.pointerId || this.eraserBefore) this.cancelActiveInput();
   };
+
+  private touchPoint(event: PointerEvent): TouchPointer {
+    const rect = this.viewport.getBoundingClientRect();
+    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  }
+
+  private capturePointer(pointerID: number): void {
+    try { this.canvas.setPointerCapture(pointerID); } catch { /* a browser may reject an already-lost pointer */ }
+  }
+
+  private rebaseTouchGesture(): void {
+    if (this.touchPointers.size === 0) {
+      this.panLast = null;
+      this.pinchStart = null;
+    } else if (this.touchPointers.size === 1) {
+      this.panLast = [...this.touchPointers.values()][0] ?? null;
+      this.pinchStart = null;
+    } else {
+      this.panLast = null;
+      this.beginPinch();
+    }
+  }
+
+  private beginPinch(): void {
+    const [first, second] = [...this.touchPointers.values()].slice(0, 2);
+    if (!first || !second) return;
+    const center = midpoint(first, second);
+    this.pinchStart = {
+      distance: Math.max(1, distance(first, second)),
+      scale: this.scale,
+      offsetX: this.offsetX,
+      offsetY: this.offsetY,
+      center,
+    };
+  }
+
+  private updatePinch(): void {
+    const start = this.pinchStart;
+    const [first, second] = [...this.touchPointers.values()].slice(0, 2);
+    if (!start || !first || !second) return;
+    const nextCenter = midpoint(first, second);
+    const nextDistance = Math.max(1, distance(first, second));
+    const world = worldPointAt(start.center, start.scale, start.offsetX, start.offsetY);
+    const nextScale = clamp(start.scale * (nextDistance / start.distance), MIN_CANVAS_SCALE, MAX_CANVAS_SCALE);
+    const nextOffset = offsetAtAnchor(world, nextScale, nextCenter);
+    this.fitMode = "custom";
+    this.applyTransform(nextScale, nextOffset, true);
+  }
+
+  private endTouchPointer(pointerID: number): void {
+    if (!this.touchPointers.delete(pointerID)) return;
+    this.rebaseTouchGesture();
+  }
+
+  private applyPan(): void {
+    const rect = this.viewport.getBoundingClientRect();
+    const gutter = viewportGutter(rect.width);
+    const bounded = clampPan(
+      this.offsetX,
+      this.offsetY,
+      this.width,
+      this.height,
+      this.scale,
+      rect.width,
+      rect.height,
+      gutter,
+    );
+    this.offsetX = bounded.x;
+    this.offsetY = bounded.y;
+    this.updateTransform();
+  }
+
+  private applyTransform(nextScale: number, nextOffset: CanvasPoint, notifyZoom: boolean): void {
+    const scale = clamp(finite(nextScale) ? nextScale : this.scale, MIN_CANVAS_SCALE, MAX_CANVAS_SCALE);
+    const rect = this.viewport.getBoundingClientRect();
+    const gutter = viewportGutter(rect.width);
+    const bounded = clampPan(
+      finite(nextOffset.x) ? nextOffset.x : this.offsetX,
+      finite(nextOffset.y) ? nextOffset.y : this.offsetY,
+      this.width,
+      this.height,
+      scale,
+      rect.width,
+      rect.height,
+      gutter,
+    );
+    this.scale = scale;
+    this.offsetX = bounded.x;
+    this.offsetY = bounded.y;
+    this.updateTransform();
+    if (notifyZoom) this.callbacks.onZoom(this.scale);
+  }
 
   private cancelActiveInput(): void {
     if (this.active) {
@@ -288,6 +540,7 @@ export class PaperCanvas {
     if (this.eraserBefore) this.strokes = cloneStrokes(this.eraserBefore);
     this.eraserBefore = null;
     this.touchPointers.clear();
+    this.panLast = null;
     this.pinchStart = null;
     if (this.activeFrame !== null) {
       cancelAnimationFrame(this.activeFrame);
@@ -297,10 +550,26 @@ export class PaperCanvas {
   }
 
   private pushUndo(snapshot: InkStroke[]): void {
-    // A page can be large; cap history so a long writing session cannot grow
-    // memory without bound. The page itself remains fully canonical.
-    if (this.undoStack.length >= 100) this.undoStack.shift();
+    // Every entry is a full page snapshot. Cap both entry count and retained
+    // points so a large note cannot multiply its memory footprint on undo.
+    if (historyPointCount(snapshot) > MAX_HISTORY_POINTS) {
+      this.undoStack = [];
+      this.redoStack = [];
+      return;
+    }
     this.undoStack.push(cloneStrokes(snapshot));
+    this.trimHistory();
+  }
+
+  private trimHistory(): void {
+    while (
+      this.undoStack.length + this.redoStack.length > MAX_HISTORY_ENTRIES ||
+      historyStackPointCount(this.undoStack) + historyStackPointCount(this.redoStack) > MAX_HISTORY_POINTS
+    ) {
+      if (this.undoStack.length > 0) this.undoStack.shift();
+      else if (this.redoStack.length > 0) this.redoStack.shift();
+      else break;
+    }
   }
 
   private readonly handleWheel = (event: WheelEvent): void => {
@@ -319,12 +588,14 @@ export class PaperCanvas {
       const timestamp = finite(sample.timeStamp) ? sample.timeStamp : performance.now();
       const pressure = finite(sample.pressure) && sample.pressure > 0 ? clamp(sample.pressure, 0, 1) : 0.5;
       const point: StrokePoint = {
-        x: position.x,
-        y: position.y,
-        pressure,
+        // Two decimals are sub-pixel at normal page zoom and keep dense ink
+        // comfortably below the server's operation-size limit.
+        x: roundTo(position.x, 2),
+        y: roundTo(position.y, 2),
+        pressure: roundTo(pressure, 3),
         time: Math.max(0, Math.round(timestamp - this.active.startedAt)),
-        tiltX: finite(sample.tiltX) ? sample.tiltX : null,
-        tiltY: finite(sample.tiltY) ? sample.tiltY : null,
+        tiltX: finite(sample.tiltX) ? roundTo(sample.tiltX, 1) : null,
+        tiltY: finite(sample.tiltY) ? roundTo(sample.tiltY, 1) : null,
       };
       const previous = this.active.stroke.points.at(-1);
       // A tap commonly arrives as a down and an up with an empty coalesced
@@ -352,18 +623,16 @@ export class PaperCanvas {
   }
 
   private zoomTo(next: number, anchor: TouchPointer, previousAnchor = anchor): void {
-    const nextScale = clamp(next, 0.25, 2.8);
-    const worldX = (previousAnchor.x - this.offsetX) / this.scale;
-    const worldY = (previousAnchor.y - this.offsetY) / this.scale;
-    this.scale = nextScale;
-    this.offsetX = anchor.x - worldX * this.scale;
-    this.offsetY = anchor.y - worldY * this.scale;
-    this.updateTransform();
-    this.callbacks.onZoom(this.scale);
+    const world = worldPointAt(previousAnchor, this.scale, this.offsetX, this.offsetY);
+    const nextScale = clamp(finite(next) ? next : this.scale, MIN_CANVAS_SCALE, MAX_CANVAS_SCALE);
+    this.fitMode = "custom";
+    this.applyTransform(nextScale, offsetAtAnchor(world, nextScale, anchor), true);
   }
 
   private updateTransform(): void {
     this.paper.style.transform = `translate3d(${this.offsetX}px, ${this.offsetY}px, 0) scale(${this.scale})`;
+    const rect = this.viewport.getBoundingClientRect();
+    this.lastViewportSize = { width: rect.width, height: rect.height };
   }
 
   private render(): void {
@@ -446,6 +715,14 @@ function cloneStrokes(strokes: InkStroke[]): InkStroke[] {
   return strokes.map((stroke) => ({ ...stroke, points: stroke.points.map((point) => ({ ...point })) }));
 }
 
+function historyPointCount(strokes: InkStroke[]): number {
+  return strokes.reduce((total, stroke) => total + stroke.points.length, 0);
+}
+
+function historyStackPointCount(history: InkStroke[][]): number {
+  return history.reduce((total, snapshot) => total + historyPointCount(snapshot), 0);
+}
+
 function sameStrokes(left: InkStroke[], right: InkStroke[]): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -470,4 +747,8 @@ function segmentDistance(point: { x: number; y: number }, first: StrokePoint, se
 function distance(first: TouchPointer, second: TouchPointer): number { return Math.hypot(first.x - second.x, first.y - second.y); }
 function midpoint(first: TouchPointer, second: TouchPointer): TouchPointer { return { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 }; }
 function finite(value: number): boolean { return Number.isFinite(value); }
+function roundTo(value: number, places: number): number {
+  const factor = 10 ** places;
+  return Math.round(value * factor) / factor;
+}
 function clamp(value: number, min: number, max: number): number { return Math.min(max, Math.max(min, value)); }

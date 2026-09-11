@@ -16,17 +16,39 @@ unavailable, local editing and backup export still work.
 1. Create an account using Account. Use the same account on both devices.
 2. If you wrote in guest mode, choose whether to copy those notes into the
    account workspace. Signing in alone does not upload guest data.
-3. Write on device A, wait for **Saved locally**, then press the status button
-   to sync. On device B, press the status button to retrieve the changes.
+3. Write on device A and wait for the sync status to confirm a successful
+   server exchange. Device B pulls when brought to the foreground and checks
+   periodically while visible. The status button can request an immediate sync.
 4. Edit the same page offline on both devices, then sync each. Check that
    both versions remain recoverable as conflict copies.
 5. Export a backup before clearing browser data or changing servers. An
    account workspace and a guest workspace are separate, including offline.
 
-Sync is manual in this first version. A local save is not a confirmation that
+Sync is automatic after durable edits, sign-in, reconnect and returning to
+the app, with periodic checks while visible. A local save is not a confirmation that
 the other device already has the note. This is a browser editor; testing on
 the actual devices is still needed for pen pressure, palm rejection, latency,
 orientation changes, the on-screen keyboard and iPad suspension/resume.
+
+## Editor regression checks
+
+- The notebook title at the top opens Rename notebook. Tap the page title to
+  edit its name in Text and page details; verify both after closing and reopening.
+- The editor opens with both drawers closed. Check phone and tablet portrait
+  and landscape, including opening the keyboard and returning to handwriting.
+- Pinch around a word with two fingers, move both fingers, then release one
+  and continue panning. The paper should keep its anchor without jumping.
+- Try a third finger, palm contact during pen input, lifting the pen outside
+  the page, undo/redo, rotation, and repeated zoom at the page edges.
+- Test a server outage, expired login, switching accounts, and changes made
+  while a sync is in flight. Local data must remain accessible and failures
+  must not be shown as a successful server sync.
+- Search for a page in another notebook and restore a deleted page whose
+  notebook is not currently selected.
+
+The originally delivered quick-tunnel endpoint was found unavailable during
+the repair investigation. Client fixes do not provide permanent hosting:
+login and cross-device sync require a running backend on the same URL.
 
 ## Restart a temporary test backend
 

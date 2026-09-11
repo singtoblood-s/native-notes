@@ -75,6 +75,33 @@ Both guest and account stores remain usable offline. Switching accounts must
 close the old store and open a separate one so an outbox entry can never cross
 account boundaries.
 
+`webApp/src/coordinator.ts` owns the automatic sync lifecycle around the store
+and editor. The UI creates it with `getStore`, `getSession`, and an optional
+`SyncClient`, then calls `start()` after the current store is open,
+`notifyAuthChanged()` after login/logout or an endpoint/workspace switch,
+`notifyLocalWrite()` after each durable local save, `request("manual")` for an
+explicit toolbar action, and `stop()` before closing the store. A local save is
+debounced for 750 ms; visible startup, foreground, and online recovery run
+immediately; visible idle work is checked every 60 seconds. Network failures
+use bounded exponential backoff, while offline and guest workspaces never make
+a request. `subscribe`/`onStatus` expose `pending`, `conflicts`, last attempt,
+last success, and a user-facing error without treating a scheduled timer as a
+successful sync. `onBeforeSync` must flush the active editor and may return
+`false`; `onAfterSync` may reload the selected page only when its edit
+generation is unchanged. The coordinator rechecks the generation and exact
+`<endpoint>:<user-id>` workspace key after every awaited local check, so an
+account or endpoint switch cannot upload an old workspace.
+
+Changing the server endpoint does not transfer an old account workspace into a
+new server account automatically. The old browser database and outbox remain
+available through the saved workspace list for an explicit export/recovery
+action.
+
+When a conflict copy refers to a notebook that is missing or tombstoned in the
+local workspace, the client creates a new recovery notebook and queues its
+upsert before showing the recovered page. The recovered page remains local
+until it is edited, so its next queued edit has a server-side parent.
+
 ## Sync API
 
 All `/v1` endpoints require `Authorization: Bearer <sessionToken>` except

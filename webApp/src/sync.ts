@@ -98,7 +98,10 @@ export class SyncClient {
     if (!session) throw new Error("Sign in before syncing. Guest notes stay available offline.");
     const endpoint = getEndpoint();
     if (!endpoint) throw new Error("Add your HTTPS server URL in Settings before syncing.");
-    if (store.accountKey === "guest") throw new Error("Sign in before syncing. Guest notes stay available offline.");
+    const expectedAccountKey = `${endpoint}:${session.user.id.toLowerCase()}`;
+    if (store.accountKey !== expectedAccountKey) {
+      throw new Error("The selected notebook belongs to a different account or sync server.");
+    }
 
     // close() waits for this lease. That keeps an account switch from closing
     // the SQLite handle while an authenticated request is still applying ACKs.
@@ -221,7 +224,7 @@ function readCode(payload: Record<string, unknown>): string | undefined {
 }
 
 function validatePushResponse(payload: PushResponse, operations: SyncOperation[]): PushResult[] {
-  if (!payload || !Array.isArray(payload.results)) throw new Error("The server returned an invalid sync response.");
+  if (!payload || !Array.isArray(payload.results) || !Number.isInteger(payload.cursor) || payload.cursor < 0) throw new Error("The server returned an invalid sync response.");
   const expected = new Set(operations.map((operation) => operation.opId));
   const seen = new Set<string>();
   for (const raw of payload.results) {

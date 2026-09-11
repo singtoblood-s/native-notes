@@ -40,6 +40,36 @@ describe("account-bound browser sessions", () => {
     expect(session.boundEndpoint).toBe("https://two.example.test/api");
   });
 
+  it("invalidates a token immediately when the endpoint changes", () => {
+    setEndpoint("https://one.example.test");
+    const session = new AuthSession();
+    session.set(response("FIRST"));
+    expect(session.session?.sessionToken).toBe("token-FIRST");
+
+    setEndpoint("https://two.example.test");
+    expect(session.session).toBeNull();
+    // Keep the old workspace selected in memory until the UI deliberately
+    // switches to guest; it must never be sent to the new server.
+    expect(session.workspaceKey).toBe("https://one.example.test:first");
+  });
+
+  it("retains every endpoint/account namespace after an explicit sign-out", () => {
+    setEndpoint("https://one.example.test");
+    const session = new AuthSession();
+    session.set(response("FIRST"));
+    setEndpoint("https://two.example.test");
+    session.set(response("SECOND"));
+
+    session.clear();
+    expect(session.workspaceKey).toBe("guest");
+    expect(session.savedWorkspaces.map((item) => `${item.endpoint}:${item.userID}`)).toEqual([
+      "https://one.example.test:first",
+      "https://two.example.test:second",
+    ]);
+    expect(localStorage.getItem("notepad.workspaces")).toContain("first");
+    expect(localStorage.getItem("notepad.workspaces")).toContain("second");
+  });
+
   it("keeps an expired account workspace offline until explicit sign-out", () => {
     setEndpoint("https://sync.example.test");
     const session = new AuthSession();

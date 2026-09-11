@@ -3,29 +3,79 @@ import { AuthResponse, User } from "./models";
 const SESSION_KEY = "notepad.session";
 const ENDPOINT_KEY = "notepad.endpoint";
 const WORKSPACE_KEY = "notepad.workspace";
+const WORKSPACES_KEY = "notepad.workspaces";
+const ACTIVE_WORKSPACE_KEY = "notepad.active-workspace";
 
 interface StoredSession extends AuthResponse {
   endpoint: string;
 }
 
-interface WorkspaceIdentity {
+export interface WorkspaceIdentity {
   endpoint: string;
   userID: string;
   identifier: string;
+}
+
+function workspaceIdentityKey(identity: Pick<WorkspaceIdentity, "endpoint" | "userID">): string {
+  return `${identity.endpoint}:${identity.userID.toLowerCase()}`;
+}
+
+function validWorkspaceIdentity(value: unknown): WorkspaceIdentity | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<WorkspaceIdentity>;
+  if (typeof candidate.endpoint !== "string" || typeof candidate.userID !== "string" || typeof candidate.identifier !== "string") return null;
+  const endpoint = normalizeEndpoint(candidate.endpoint);
+  if (!endpoint || !candidate.userID.trim() || !candidate.identifier.trim()) return null;
+  return { endpoint, userID: candidate.userID.toLowerCase(), identifier: candidate.identifier };
+}
+
+function readWorkspaceIdentities(): Map<string, WorkspaceIdentity> {
+  const identities = new Map<string, WorkspaceIdentity>();
+  try {
+    const raw = JSON.parse(localStorage.getItem(WORKSPACES_KEY) ?? "null") as unknown;
+    if (Array.isArray(raw)) {
+      raw.forEach((value) => {
+        const identity = validWorkspaceIdentity(value);
+        if (identity) identities.set(workspaceIdentityKey(identity), identity);
+      });
+    }
+  } catch {
+    // A malformed preference must not prevent the local notebook from opening.
+  }
+  const legacy = readWorkspaceIdentity();
+  if (legacy) identities.set(workspaceIdentityKey(legacy), legacy);
+  return identities;
+}
+
+function persistWorkspaceIdentities(identities: Map<string, WorkspaceIdentity>): void {
+  localStorage.setItem(WORKSPACES_KEY, JSON.stringify([...identities.values()]));
+  localStorage.removeItem(WORKSPACE_KEY);
 }
 
 export class AuthSession {
   private current: StoredSession | null;
   /**
    * The identity survives an expired browser session so its local database can
-   * still be opened offline. Explicit sign-out clears it below.
+   * still be opened offline. Explicit sign-out selects guest while preserving
+   * the account namespace for recovery or export.
    */
   private identity: WorkspaceIdentity | null;
+  private readonly identities: Map<string, WorkspaceIdentity>;
 
   constructor() {
     this.current = readSession();
-    this.identity = readWorkspaceIdentity();
+    this.identities = readWorkspaceIdentities();
+    const activeKey = localStorage.getItem(ACTIVE_WORKSPACE_KEY);
+    const legacy = !localStorage.getItem(WORKSPACES_KEY) ? readWorkspaceIdentity() : null;
+    this.identity = activeKey ? this.identities.get(activeKey) ?? null : legacy;
     if (this.current && (this.current.endpoint !== getEndpoint() || isExpired(this.current.expiresAt))) this.current = null;
+    if (this.current) {
+      this.identity = this.remember({ endpoint: this.current.endpoint, userID: this.current.user.id, identifier: this.current.user.identifier });
+      localStorage.setItem(ACTIVE_WORKSPACE_KEY, workspaceIdentityKey(this.identity));
+    } else if (legacy) {
+      this.identity = this.remember(legacy);
+      localStorage.setItem(ACTIVE_WORKSPACE_KEY, workspaceIdentityKey(this.identity));
+    }
   }
 
   get session(): AuthResponse | null { return this.activeSession(); }
@@ -36,6 +86,8 @@ export class AuthSession {
   }
   get workspaceIdentifier(): string | null { return this.activeSession()?.user.identifier ?? this.identity?.identifier ?? null; }
   get boundEndpoint(): string | null { return this.activeSession()?.endpoint ?? this.identity?.endpoint ?? null; }
+  /** Account namespaces remain available for an explicit recovery/export UI. */
+  get savedWorkspaces(): readonly WorkspaceIdentity[] { return [...this.identities.values()]; }
 
   private activeSession(): StoredSession | null {
     if (!this.current) return null;
@@ -54,17 +106,29 @@ export class AuthSession {
       const stored: StoredSession = { ...response, endpoint };
       const identity: WorkspaceIdentity = { endpoint, userID: response.user.id.toLowerCase(), identifier: response.user.identifier };
       this.current = stored;
-      this.identity = identity;
+      this.identity = this.remember(identity);
+      localStorage.setItem(ACTIVE_WORKSPACE_KEY, workspaceIdentityKey(identity));
       sessionStorage.setItem(SESSION_KEY, JSON.stringify(stored));
-      localStorage.setItem(WORKSPACE_KEY, JSON.stringify(identity));
     } else {
       sessionStorage.removeItem(SESSION_KEY);
+      // Keep account databases and outboxes. Explicit sign-out selects guest
+      // but never destroys a local account workspace.
+      localStorage.removeItem(ACTIVE_WORKSPACE_KEY);
       localStorage.removeItem(WORKSPACE_KEY);
       this.identity = null;
+      this.current = null;
     }
   }
 
   clear(): void { this.set(null); }
+
+  private remember(identity: WorkspaceIdentity): WorkspaceIdentity {
+    const normalized = { ...identity, endpoint: normalizeEndpoint(identity.endpoint), userID: identity.userID.toLowerCase() };
+    if (!normalized.endpoint) return identity;
+    this.identities.set(workspaceIdentityKey(normalized), normalized);
+    persistWorkspaceIdentities(this.identities);
+    return normalized;
+  }
 }
 
 export function getEndpoint(): string {

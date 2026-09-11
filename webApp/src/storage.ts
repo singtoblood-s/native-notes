@@ -694,7 +694,10 @@ export class SQLiteNoteStoreEngine implements NoteStore {
         const recoveredNotebook = notebook
           ? { ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() }
           : createNotebook("Recovered page");
-        await this.saveNotebook(recoveredNotebook, false);
+        // A recovered page may be edited immediately. Persist the parent
+        // upload before exposing the page so its later operation cannot reach
+        // the server with a notebook ID the server has never seen.
+        await this.saveNotebook(recoveredNotebook, true);
         notebookID = recoveredNotebook.id;
       }
       await this.createConflictCopy({ ...page, notebookId: notebookID }, originalPageID);
@@ -702,7 +705,9 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     }
     if (operation.entityType === "notebook") {
       const notebook = validateNotebookSnapshot(operation.payload, operation.entityId);
-      await this.saveNotebook({ ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() }, false);
+      // The recovered notebook is a valid place for the user to create a new
+      // page immediately, so make its server-side parent durable first.
+      await this.saveNotebook({ ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() }, true);
       return;
     }
     await this.transaction(() => this.insertConflictDirect(operation.entityType, operation.entityId, operation.payload, "rejected local operation", 0));
@@ -988,11 +993,19 @@ export class SQLiteNoteStoreEngine implements NoteStore {
   private insertConflictDirect(entityType: SyncEntityType, entityID: string, payload: Record<string, unknown>, reason: string, sequence: number): void {
     this.db.exec({ sql: "INSERT INTO conflicts(id, entity_type, entity_id, payload, created_at, reason, sequence) VALUES(?, ?, ?, ?, ?, ?, ?)", bind: [id(), entityType, entityID, JSON.stringify(payload), now(), reason, sequence] });
     // Keep the conflict recoverable through the normal notebook/page lists and
-    // archive export. This runs inside the caller's transaction and never
-    // creates another outbox operation.
+    // archive export. A newly recovered parent is also queued in this same
+    // transaction so a later page edit has a server-side owner.
     if (entityType === "notebook") {
       const notebook = validateNotebookSnapshot(payload, entityID);
-      this.upsertNotebookDirect({ ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() });
+      const recoveredNotebook = sanitizeNotebook({ ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() });
+      this.upsertNotebookDirect(recoveredNotebook);
+      this.queueOperation({
+        entityType: "notebook",
+        entityId: recoveredNotebook.id,
+        baseRevision: 0,
+        action: "upsert",
+        payload: recoveredNotebook as unknown as Record<string, unknown>,
+      });
       return;
     }
     const page = validatePageSnapshot(payload, entityID, undefined, false);
@@ -1002,8 +1015,19 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       const recoveredNotebook = notebook
         ? { ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() }
         : createNotebook("Recovered page");
-      this.upsertNotebookDirect(recoveredNotebook);
-      notebookID = recoveredNotebook.id;
+      const savedNotebook = sanitizeNotebook(recoveredNotebook);
+      this.upsertNotebookDirect(savedNotebook);
+      // Keep the recovery parent available to the normal sync drain. The
+      // conflict page itself stays local until the user edits it, but a later
+      // queued page edit can now safely reference this parent.
+      this.queueOperation({
+        entityType: "notebook",
+        entityId: savedNotebook.id,
+        baseRevision: 0,
+        action: "upsert",
+        payload: savedNotebook as unknown as Record<string, unknown>,
+      });
+      notebookID = savedNotebook.id;
     }
     this.upsertPageDirect({ ...page, id: id(), notebookId: notebookID, title: conflictTitle(page.title, MAX_PAGE_TITLE), revision: 0, deletedAt: null, conflictOf: entityID, updatedAt: now() });
   }
