@@ -136,6 +136,10 @@ kbd { display: inline-grid; min-width: 15px; height: 17px; margin-right: 2px; pa
 .form-hint, .migration-copy { margin: -2px 0 1px; color: var(--muted); font: italic 12px/1.5 Georgia, serif; }
 .form-error { min-height: 18px; margin: 0; color: var(--accent-dark); font-size: 11px; }
 .form-message { min-height: 17px; margin: -4px 0 0; color: var(--teal); font-size: 11px; }
+.offline-cache-status { margin-top: -7px; }
+.offline-cache-status[data-state="preparing"] { color: var(--muted); }
+.offline-cache-status[data-state="error"] { color: var(--accent-dark); }
+.offline-cache-status[data-state="unsupported"], .offline-cache-status[data-state="development"] { color: var(--muted); }
 .settings-actions, .migration-actions { display: flex; gap: 8px; }
 .settings-actions .outline-button, .migration-actions .outline-button, .migration-actions .primary-button { flex: 1; }
 .account-line { display: flex; align-items: center; gap: 8px; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; }

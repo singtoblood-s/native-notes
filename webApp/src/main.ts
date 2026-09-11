@@ -17,6 +17,7 @@ import { Archive, NoteStore, SQLiteNoteStore } from "./storage";
 import { SyncClient } from "./sync";
 
 const BASE = import.meta.env.BASE_URL;
+type OfflineCacheStatus = "preparing" | "ready" | "error" | "unsupported" | "development";
 
 class NotePadApp {
   private readonly root: HTMLElement;
@@ -36,6 +37,8 @@ class NotePadApp {
   private showTrash = false;
   private pendingGuestArchive: Archive | null = null;
   private useGuestWorkspace = false;
+  private offlineCacheStatus: OfflineCacheStatus = "preparing";
+  private offlineCacheMessage = "Preparing offline cache…";
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -49,7 +52,7 @@ class NotePadApp {
       await this.store.ensureStarterData();
       this.renderShell();
       await this.reload();
-      this.registerServiceWorker();
+      await this.registerServiceWorker();
       this.setState(this.auth.session ? { kind: "saved" } : { kind: "needs-login" });
     } catch (error) {
       this.root.innerHTML = errorMarkup(error instanceof Error ? error.message : "Could not open the local notebook.");
@@ -71,6 +74,7 @@ class NotePadApp {
     });
     this.bindEvents();
     byId<HTMLInputElement>("endpoint-input").value = getEndpoint();
+    this.setOfflineCacheStatus(this.offlineCacheStatus, this.offlineCacheMessage);
   }
 
   private bindEvents(): void {
@@ -545,14 +549,52 @@ class NotePadApp {
   private openDialog(id: string): void { byId<HTMLDialogElement>(id).showModal(); }
   private closeDialog(id: string): void { byId<HTMLDialogElement>(id).close(); }
 
-  private registerServiceWorker(): void {
-    if (!("serviceWorker" in navigator)) return;
-    if (import.meta.env.DEV) {
-      void navigator.serviceWorker.getRegistrations().then((registrations) => Promise.all(registrations.filter((registration) => registration.scope.includes(BASE)).map((registration) => registration.unregister())));
-      void caches.keys().then((keys) => Promise.all(keys.filter((key) => key.startsWith("notepad-static-") || key.startsWith("notepad-shell-")).map((key) => caches.delete(key))));
+  private setOfflineCacheStatus(status: OfflineCacheStatus, message: string): void {
+    this.offlineCacheStatus = status;
+    this.offlineCacheMessage = message;
+    const target = document.getElementById("offline-cache-status");
+    if (target) {
+      target.textContent = message;
+      target.dataset.state = status;
+    }
+  }
+
+  private readonly handleServiceWorkerMessage = (event: MessageEvent): void => {
+    const data = event.data;
+    if (!data || typeof data !== "object" || data.type !== "notepad-cache-error") return;
+    const message = typeof data.message === "string" && data.message.trim() ? data.message : "The offline cache could not be prepared.";
+    this.setOfflineCacheStatus("error", `Offline cache error: ${message}`);
+  };
+
+  private async registerServiceWorker(): Promise<void> {
+    if (!("serviceWorker" in navigator)) {
+      this.setOfflineCacheStatus("unsupported", "Offline cache is unavailable in this browser.");
       return;
     }
-    void navigator.serviceWorker.register(`${BASE}sw.js`, { scope: BASE });
+    if (import.meta.env.DEV) {
+      try {
+        const registrations = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(registrations.filter((registration) => registration.scope.includes(BASE)).map((registration) => registration.unregister()));
+        const keys = await caches.keys();
+        await Promise.all(keys.filter((key) => key.startsWith("notepad-static-") || key.startsWith("notepad-shell-")).map((key) => caches.delete(key)));
+        this.setOfflineCacheStatus("development", "Offline cache is disabled in development.");
+      } catch {
+        this.setOfflineCacheStatus("error", "Could not clear the development service worker.");
+      }
+      return;
+    }
+    this.setOfflineCacheStatus("preparing", "Preparing offline cache…");
+    navigator.serviceWorker.addEventListener("message", this.handleServiceWorkerMessage);
+    try {
+      const registration = await navigator.serviceWorker.register(`${BASE}sw.js`, { scope: BASE });
+      const worker = registration.installing ?? registration.waiting;
+      if (worker) await waitForServiceWorker(worker);
+      await navigator.serviceWorker.ready;
+      if (!registration.active || registration.active.state !== "activated") throw new Error("The service worker did not activate.");
+      this.setOfflineCacheStatus("ready", navigator.serviceWorker.controller ? "Offline cache ready." : "Offline cache ready; available after reload.");
+    } catch (error) {
+      this.setOfflineCacheStatus("error", `Offline cache error: ${error instanceof Error ? error.message : "installation failed"}`);
+    }
   }
 }
 
@@ -585,7 +627,7 @@ function shellMarkup(): string {
 
 function dialogMarkup(): string {
   return `<dialog class="dialog" id="auth-dialog"><form class="dialog-form" id="auth-form" data-mode="login"><div class="dialog-head"><div><span class="eyebrow">ACCOUNT</span><h2 id="auth-dialog-title">Sign in to sync</h2></div><button type="button" class="icon-button" id="cancel-auth" aria-label="Close">×</button></div><div class="mode-switch"><button type="button" id="login-mode" class="active">Sign in</button><button type="button" id="register-mode">Create account</button></div><label>Identifier<input id="auth-identifier" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="you@example.com or username" required /></label><label>Password<input id="auth-password" type="password" autocomplete="current-password" minlength="12" placeholder="12 characters minimum" required /></label><p class="form-hint">Your guest notebook stays on this device. After sign-in, you choose whether to move it into the account.</p><p class="form-error" id="auth-error" role="alert"></p><button class="primary-button" id="auth-submit" type="submit">Sign in</button></form></dialog>
-  <dialog class="dialog" id="settings-dialog"><form class="dialog-form" id="settings-form"><div class="dialog-head"><div><span class="eyebrow">SETTINGS</span><h2>Keep your paper close</h2></div><button type="button" class="icon-button" id="cancel-settings" aria-label="Close">×</button></div><label>Sync server URL<input id="endpoint-input" type="url" inputmode="url" placeholder="https://notes.example.com" /></label><p class="form-hint">Leave this empty for private guest mode. Use an HTTPS URL for login and sync. A temporary tunnel is only available while its server is running.</p><div class="settings-actions"><button class="outline-button" type="button" id="browse-import">Import backup</button><button class="outline-button" type="button" id="settings-export">Export backup</button><button class="outline-button" type="button" id="settings-share">Share backup</button></div><input id="import-input" type="file" accept="application/json,.json,.notepad" hidden /><p class="form-message" id="settings-message"></p>${thisAccountMarkup()}<button class="primary-button" type="submit">Save settings</button></form></dialog>
+  <dialog class="dialog" id="settings-dialog"><form class="dialog-form" id="settings-form"><div class="dialog-head"><div><span class="eyebrow">SETTINGS</span><h2>Keep your paper close</h2></div><button type="button" class="icon-button" id="cancel-settings" aria-label="Close">×</button></div><label>Sync server URL<input id="endpoint-input" type="url" inputmode="url" placeholder="https://notes.example.com" /></label><p class="form-hint">Leave this empty for private guest mode. Use an HTTPS URL for login and sync. A temporary tunnel is only available while its server is running.</p><p class="form-message offline-cache-status" id="offline-cache-status" role="status">Preparing offline cache…</p><div class="settings-actions"><button class="outline-button" type="button" id="browse-import">Import backup</button><button class="outline-button" type="button" id="settings-export">Export backup</button><button class="outline-button" type="button" id="settings-share">Share backup</button></div><input id="import-input" type="file" accept="application/json,.json,.notepad" hidden /><p class="form-message" id="settings-message"></p>${thisAccountMarkup()}<button class="primary-button" type="submit">Save settings</button></form></dialog>
   <dialog class="dialog" id="migration-dialog"><div class="dialog-form"><div class="dialog-head"><div><span class="eyebrow">GUEST NOTEBOOK</span><h2>Move your local paper?</h2></div><button type="button" class="icon-button" id="cancel-migration" aria-label="Close">×</button></div><p class="migration-copy">You have notes in guest mode. Move a copy into the signed-in account, or keep the guest notebook on this device for later.</p><div class="migration-actions"><button class="outline-button" id="keep-guest">Keep guest notes</button><button class="primary-button" id="move-guest">Move a copy into account</button></div></div></dialog>`;
 }
 
@@ -606,6 +648,26 @@ function dateStamp(): string { return new Date().toISOString().slice(0, 10); }
 function download(blob: Blob, filename: string): void { const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = filename; link.click(); window.setTimeout(() => URL.revokeObjectURL(url), 1000); }
 function argbToCSS(color: number): string { const value = color >>> 0; return `rgba(${(value >>> 16) & 0xff},${(value >>> 8) & 0xff},${value & 0xff},${((value >>> 24) & 0xff) / 255})`; }
 function cssToARGB(css: string): number { const match = css.match(/[\d.]+/g)?.map(Number); if (!match || match.length < 3) return 0xff252429; return (((Math.round((match[3] ?? 1) * 255) & 0xff) << 24) | ((match[0]! & 0xff) << 16) | ((match[1]! & 0xff) << 8) | (match[2]! & 0xff)) >>> 0; }
+
+function waitForServiceWorker(worker: ServiceWorker): Promise<void> {
+  if (worker.state === "activated") return Promise.resolve();
+  if (worker.state === "redundant") return Promise.reject(new Error("installation failed"));
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => finish(new Error("installation timed out")), 20_000);
+    const onStateChange = (): void => {
+      if (worker.state === "activated") finish();
+      else if (worker.state === "redundant") finish(new Error("installation failed"));
+    };
+    const finish = (error?: Error): void => {
+      window.clearTimeout(timeout);
+      worker.removeEventListener("statechange", onStateChange);
+      if (error) reject(error);
+      else resolve();
+    };
+    worker.addEventListener("statechange", onStateChange);
+    onStateChange();
+  });
+}
 
 const appRoot = document.getElementById("app");
 if (appRoot) new NotePadApp(appRoot);

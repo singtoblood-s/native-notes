@@ -1,8 +1,10 @@
 # Testing on your iPad and Samsung
 
 Open https://singtoblood-s.github.io/native-notes/ in Safari on iPad or Chrome
-on Samsung. You can add it to the home screen. Load it online once before
-using it offline. Guest notebooks are stored only in that browser.
+on Samsung. You can add it to the home screen. Load it online once and check
+Settings for **Offline cache ready** before using it offline. Guest notebooks
+are stored only in that browser. Test opening it in airplane mode on each
+device before relying on it away from a connection.
 
 ## Try sync
 

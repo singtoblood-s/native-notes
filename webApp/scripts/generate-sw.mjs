@@ -35,8 +35,15 @@ function isAppRequest(request) {
   return !url.pathname.startsWith(appRoot() + "v1/");
 }
 
+function notifyCacheError(error) {
+  const message = error instanceof Error ? error.message : "precache failed";
+  return self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
+    clients.forEach((client) => client.postMessage({ type: "notepad-cache-error", message }));
+  });
+}
+
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE)));
+  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE)).catch((error) => notifyCacheError(error).then(() => { throw error; })));
   self.skipWaiting();
 });
 self.addEventListener("activate", (event) => {
@@ -49,7 +56,13 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(fetch(event.request).then((response) => {
       if (response.ok) void caches.open(CACHE_NAME).then((cache) => cache.put(event.request, response.clone()));
       return response;
-    }).catch(() => caches.match(event.request).then((cached) => cached || caches.match(new URL("./index.html", self.registration.scope).toString()))));
+    }).catch(async () => {
+      const cached = await caches.match(event.request);
+      if (cached) return cached;
+      const fallback = await caches.match(new URL("./index.html", self.registration.scope).toString())
+        || await caches.match(new URL("./", self.registration.scope).toString());
+      return fallback || new Response("NotePad is offline and its app shell is not cached yet. Open it once while online, then try again.", { status: 503, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    }));
     return;
   }
   event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request).then((response) => {
