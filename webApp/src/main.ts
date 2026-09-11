@@ -693,7 +693,7 @@ class NotePadApp {
           const notebook = version.entityType === "notebook" ? version.payload as unknown as Notebook
             : await store.getNotebook(String(version.payload.notebookId)) ?? { ...createNotebook("Restored notes"), id: String(version.payload.notebookId) };
           const archive: Archive = { version: 1, exportedAt: now(), account: store.accountKey,
-            notebooks: [{ ...notebook, deletedAt: null }],
+            notebooks: [{ ...notebook, title: notebook.title.replace(/(?: · conflict)+$/, "") || "Restored notebook", deletedAt: null }],
             pages: version.entityType === "page" ? [{ ...version.payload as unknown as NotePage, deletedAt: null, conflictOf: undefined }] : [] };
           if (store !== this.store || !this.auth.session) return;
           download(new Blob([JSON.stringify(archive)], { type: "application/json" }), `saved-version-${version.id}.notepad.json`);

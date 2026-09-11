@@ -798,3 +798,12 @@ input, textarea, select { accent-color: var(--accent); }
   .view-mode-select { margin-right: auto; }
 }
 @media print { .paper-scroll { background: #fff; } }
+#versions-list {
+  max-height: min(50vh, 420px);
+  overflow-y: auto;
+}
+
+#versions-list .recovery-row > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

@@ -87,8 +87,10 @@ and build outputs.
   server URL, not just the email typed into a login form.
 - Sync uses immutable operation IDs and server revisions. Device clocks do
   not decide who wins.
-- Concurrent changes preserve recoverable copies instead of silently
-  overwriting handwriting. Sync is not live collaborative editing.
+- Concurrent changes keep alternate snapshots in Settings → Saved versions;
+  sync never creates conflict notebooks or pages. The accepted server snapshot
+  wins an old operation; newer pending edits remain queued. See
+  [conflict prevention and legacy cleanup](docs/NOTEBOOK_CONFLICT_FIX.md).
 - The server can read note contents. This release does not implement
   end-to-end encryption or an email-based password-recovery service.
 - Drawing pressure falls back to a constant value when the device/browser
