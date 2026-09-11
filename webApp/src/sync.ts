@@ -96,7 +96,7 @@ export class SyncClient {
   }
 
   private async runSync(store: NoteStore, session: AuthResponse | null): Promise<SyncReport> {
-    if (!session) throw new Error("Sign in before syncing. Guest notes stay available offline.");
+    if (!session) throw new Error("Sign in before syncing.");
     const endpoint = getEndpoint();
     if (!endpoint) throw new Error("Add your HTTPS server URL in Settings before syncing.");
     const expectedAccountKey = `${endpoint}:${session.user.id.toLowerCase()}`;

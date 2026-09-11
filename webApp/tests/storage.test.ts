@@ -21,6 +21,23 @@ function pageOperation() : SyncOperation {
 }
 
 describe("conflict recovery storage", () => {
+  it("saves and queues old local strokes with repaired timing while preserving their geometry", () => {
+    const page = createPage(notebookID);
+    page.id = pageID;
+    page.strokes = [{ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", color: 0xff000000, width: 2, points: [0, 30, 10].map((time, x) => ({ x, y: x * 2, pressure: 0.5, time, tiltX: null, tiltY: null })) }];
+    const queueOperation = vi.fn(() => "queued");
+    const fake = { db: { exec: vi.fn() }, row: vi.fn(() => null), pageFromRow: vi.fn(() => null), queueOperation } as unknown as SQLiteNoteStoreEngine;
+    const method = (SQLiteNoteStoreEngine.prototype as unknown as {
+      savePageRow: (this: SQLiteNoteStoreEngine, value: typeof page, queue: boolean) => unknown;
+    }).savePageRow;
+    expect(method.call(fake, page, true)).toMatchObject({ status: "saved", operationId: "queued" });
+    const queued = (queueOperation.mock.calls as unknown as Array<[{ payload: typeof page }]>)[0]![0].payload;
+    expect(queued.strokes[0]!.points).toEqual(page.strokes[0]!.points.map((point) => ({ ...point, time: point.x === 2 ? 30 : point.time })));
+    expect(page.strokes[0]!.points[2]!.time).toBe(10);
+    page.strokes[0]!.points[0]!.pressure = 2;
+    expect(() => method.call(fake, page, true)).toThrow("Stroke point values are invalid");
+  });
+
   it("queues a missing parent before creating a recovered page", async () => {
     const saveNotebook = vi.fn(async () => ({ status: "saved" as const, revision: 0 }));
     const createConflictCopy = vi.fn(async () => undefined);

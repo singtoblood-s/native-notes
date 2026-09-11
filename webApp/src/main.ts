@@ -2,7 +2,6 @@ import "./styles.css";
 import { AuthClient, AuthSession, getEndpoint, setEndpoint, workspaceAccountKey } from "./auth";
 import { PaperCanvas, CanvasTool } from "./canvas";
 import {
-  AuthResponse,
   InkStroke,
   NotePage,
   Notebook,
@@ -17,6 +16,7 @@ import {
 import { Archive, NoteStore, SQLiteNoteStore } from "./storage";
 import { SyncCoordinator, SyncCoordinatorStatus, SyncCompleteContext } from "./coordinator";
 import { SyncClient } from "./sync";
+import { removeGuestData } from "./remove-guest-data";
 
 const BASE = import.meta.env.BASE_URL;
 type OfflineCacheStatus = "preparing" | "ready" | "error" | "unsupported" | "development";
@@ -57,23 +57,36 @@ class NotePadApp {
     line: { color: 0xff252429, width: 3 },
     eraser: { width: 6 },
   };
-  private pendingGuestArchive: Archive | null = null;
-  private useGuestWorkspace = false;
+  private loginRequired = false;
   private offlineCacheStatus: OfflineCacheStatus = "preparing";
   private offlineCacheMessage = "Preparing offline cache…";
   private coordinatorGeneration = -1;
   private pendingRemoteRefresh: { store: NoteStore; conflicts: number } | null = null;
   private remoteRefreshTimer: number | null = null;
+  private navigationGeneration = 0;
   private readonly handlePageHide = (): void => { void this.flushPendingSave(); };
 
   constructor(root: HTMLElement) {
     this.root = root;
+    document.addEventListener("keydown", (event) => { if (!this.loginRequired) this.handleShortcut(event); });
+    window.addEventListener("pagehide", this.handlePageHide, { capture: true });
+    window.setInterval(() => {
+      if (document.getElementById("auth-dialog") && !this.loginRequired && !this.auth.session) this.requireLogin();
+    }, 1_000);
     void this.start();
   }
 
   private async start(): Promise<void> {
     this.root.innerHTML = loadingMarkup();
     try {
+      await removeGuestData();
+      if (!this.auth.session) {
+        this.root.innerHTML = authMarkup();
+        this.bindAuthEvents();
+        this.requireLogin();
+        void this.registerServiceWorker();
+        return;
+      }
       this.store = await SQLiteNoteStore.open(this.accountKey());
       const startupSession = this.auth.session;
       // An empty workspace starts in the library; notebook creation is explicit.
@@ -88,7 +101,33 @@ class NotePadApp {
   }
 
   private accountKey(): string {
-    return this.useGuestWorkspace ? "guest" : this.auth.workspaceKey;
+    const key = this.store?.accountKey ?? this.auth.workspaceKey;
+    if (!key) throw new Error("Sign in to open a notebook.");
+    return key;
+  }
+
+  private bindAuthEvents(): void {
+    byId("auth-form").addEventListener("submit", (event) => { event.preventDefault(); void this.submitAuth(); });
+    onClick("register-mode", () => this.setAuthMode("register"));
+    onClick("login-mode", () => this.setAuthMode("login"));
+    byId("auth-dialog").addEventListener("cancel", (event) => { if (this.loginRequired) event.preventDefault(); });
+    const dialog = byId<HTMLDialogElement>("auth-dialog");
+    dialog.addEventListener("close", () => {
+      if (this.loginRequired && dialog.isConnected && !dialog.open) dialog.showModal();
+    });
+  }
+
+  private requireLogin(): void {
+    this.loginRequired = true;
+    this.root.classList.add("login-required");
+    this.pauseCoordinatorForStoreSwitch();
+    this.auth.clear();
+    document.querySelectorAll<HTMLDialogElement>("dialog[open]").forEach((dialog) => dialog.close());
+    this.setAuthMode("login");
+    byId<HTMLInputElement>("auth-endpoint").value = getEndpoint();
+    byId("auth-endpoint").closest("details")!.open = !getEndpoint();
+    byId<HTMLInputElement>("auth-password").value = "";
+    this.openDialog("auth-dialog");
   }
 
   private selectionStorageKey(): string { return `notepad.selection:${this.accountKey()}`; }
@@ -213,12 +252,8 @@ class NotePadApp {
     onClick("logout-button", () => this.logout());
     onClick("archive-notebook", () => this.archiveCurrentNotebook());
     onClick("delete-page", () => this.deleteCurrentPage());
-    onClick("cancel-auth", () => this.closeDialog("auth-dialog"));
     onClick("cancel-settings", () => this.closeDialog("settings-dialog"));
     onClick("cancel-notebook", () => this.closeDialog("notebook-dialog"));
-    onClick("cancel-migration", () => this.closeDialog("migration-dialog"));
-    onClick("keep-guest", () => this.finishMigration(false));
-    onClick("move-guest", () => this.finishMigration(true));
     onClick("browse-import", () => byId<HTMLInputElement>("import-input").click());
     onClick("settings-export", () => this.exportArchive());
     onClick("settings-share", () => this.shareArchive());
@@ -262,9 +297,7 @@ class NotePadApp {
       byId("color-preview").style.backgroundColor = argbToCSS(value);
       this.selectTool(this.selectedTool === "highlighter" || this.selectedTool === "line" ? this.selectedTool : "pen", value);
     }));
-    byId<HTMLFormElement>("auth-form").addEventListener("submit", (event) => { event.preventDefault(); void this.submitAuth(); });
-    byId<HTMLButtonElement>("register-mode").addEventListener("click", () => this.setAuthMode("register"));
-    byId<HTMLButtonElement>("login-mode").addEventListener("click", () => this.setAuthMode("login"));
+    this.bindAuthEvents();
     byId<HTMLFormElement>("settings-form").addEventListener("submit", (event) => { event.preventDefault(); void this.saveSettings(); });
     byId<HTMLFormElement>("notebook-form").addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -273,10 +306,6 @@ class NotePadApp {
       submit.disabled = true;
       try { await this.submitNotebookRename(); } finally { submit.disabled = false; }
     });
-    document.addEventListener("keydown", (event) => this.handleShortcut(event));
-    window.addEventListener("online", () => this.setState(this.auth.session ? { kind: "saved" } : { kind: "needs-login" }));
-    window.addEventListener("offline", () => this.setState({ kind: "offline" }));
-    window.addEventListener("pagehide", this.handlePageHide, { capture: true });
   }
 
   private async reload(selectID?: string, guard?: { store: NoteStore; generation: number }): Promise<boolean> {
@@ -284,7 +313,9 @@ class NotePadApp {
     const trashAtStart = this.showTrash;
     const store = this.store;
     const accountAtStart = this.accountKey();
-    const isSafe = (): boolean => store === this.store && accountAtStart === this.accountKey() && (!guard || (guard.store === this.store && guard.generation === this.editGeneration && this.unsavedPageID === null && !this.canvasInputActive() && searchAtStart === this.search && trashAtStart === this.showTrash));
+    const navigationAtStart = this.navigationGeneration;
+    const editGenerationAtStart = this.editGeneration;
+    const isSafe = (): boolean => store === this.store && accountAtStart === this.accountKey() && navigationAtStart === this.navigationGeneration && editGenerationAtStart === this.editGeneration && this.unsavedPageID === null && this.saveTimer === null && this.saveInFlight === null && !this.canvasInputActive() && searchAtStart === this.search && trashAtStart === this.showTrash && (!guard || (guard.store === this.store && guard.generation === this.editGeneration));
     if (!isSafe()) return false;
     const notebooks = await store.listNotebooks(trashAtStart);
     if (!isSafe()) return false;
@@ -323,7 +354,9 @@ class NotePadApp {
   }
 
   private async toggleTrash(): Promise<void> {
+    const navigation = ++this.navigationGeneration;
     if (!(await this.flushPendingSave())) return;
+    if (navigation !== this.navigationGeneration) return;
     this.showTrash = !this.showTrash;
     await this.reload();
   }
@@ -375,11 +408,12 @@ class NotePadApp {
     document.body.classList.toggle("drawer-open", sidebarOpen || inspectorOpen);
   }
 
-  private async closeDrawers(): Promise<void> {
-    if (!(await this.flushPendingSave())) return;
+  private async closeDrawers(flush = true): Promise<boolean> {
+    if (flush && !(await this.flushPendingSave())) return false;
     byId("sidebar").classList.remove("is-open");
     byId("inspector").classList.remove("is-open");
     this.syncDrawerState();
+    return true;
   }
 
   private openSettings(): void {
@@ -482,10 +516,17 @@ class NotePadApp {
   }
 
   private async openLibrary(): Promise<void> {
-    if (this.canvas?.isInputActive || !(await this.flushPendingSave())) return;
-    await this.closeDrawers();
+    if (this.canvas?.isInputActive) return;
+    const navigation = ++this.navigationGeneration;
+    if (!(await this.flushPendingSave())) return;
+    if (navigation !== this.navigationGeneration) return;
+    await this.closeDrawers(false);
+    if (navigation !== this.navigationGeneration) return;
     this.view = "library";
-    if (this.showTrash) { this.showTrash = false; await this.reload(); }
+    if (this.showTrash) {
+      this.showTrash = false;
+      if (!(await this.reload()) || navigation !== this.navigationGeneration) return;
+    }
     this.renderLibrary();
     this.renderEditor();
     byId("library-title").focus();
@@ -503,9 +544,23 @@ class NotePadApp {
     const query = byId<HTMLInputElement>("library-search").value.trim().toLocaleLowerCase();
     const favorites = this.favoriteIDs();
     const all = this.notebooks.filter((book) => !book.deletedAt);
+    const pagesByNotebook = new Map<string, NotePage[]>();
+    for (const page of this.allPages) {
+      if (page.deletedAt) continue;
+      const pages = pagesByNotebook.get(page.notebookId);
+      if (pages) pages.push(page);
+      else pagesByNotebook.set(page.notebookId, [page]);
+    }
+    const pagesForBook = (book: Notebook): NotePage[] => pagesByNotebook.get(book.id) ?? [];
+    const modifiedByNotebook = new Map<string, string>();
+    for (const book of all) {
+      let modified = book.updatedAt;
+      for (const page of pagesForBook(book)) if (page.updatedAt > modified) modified = page.updatedAt;
+      modifiedByNotebook.set(book.id, modified);
+    }
+    const modified = (book: Notebook): string => modifiedByNotebook.get(book.id) ?? book.updatedAt;
     const books = all.filter((book) => (this.libraryTab !== "favorites" || favorites.includes(book.id)) &&
-      (!query || book.title.toLocaleLowerCase().includes(query) || this.allPages.some((page) => page.notebookId === book.id && !page.deletedAt && `${page.title} ${page.text}`.toLocaleLowerCase().includes(query))));
-    const modified = (book: Notebook) => this.allPages.filter((page) => page.notebookId === book.id && !page.deletedAt).reduce((date, page) => page.updatedAt > date ? page.updatedAt : date, book.updatedAt);
+      (!query || book.title.toLocaleLowerCase().includes(query) || pagesForBook(book).some((page) => `${page.title} ${page.text}`.toLocaleLowerCase().includes(query))));
     const sort = byId<HTMLSelectElement>("library-sort").value;
     books.sort((a, b) => sort === "name" ? a.title.localeCompare(b.title) : modified(b).localeCompare(modified(a)) || a.title.localeCompare(b.title));
     byId("library-title").textContent = ({ documents: "Documents", favorites: "Favorites", search: "Search" })[this.libraryTab];
@@ -514,7 +569,7 @@ class NotePadApp {
     byId("library-empty").hidden = books.length !== 0;
     byId("library-empty").textContent = query ? "No matching notebooks. Try a notebook title, page title or typed text." : this.libraryTab === "favorites" ? "Your favorite notebooks will appear here. Tap the star on a notebook to add it." : "Create your first notebook. Choose New, then Notebook to get started.";
     byId("library-books").innerHTML = books.map((book) => {
-      const pages = this.allPages.filter((page) => page.notebookId === book.id && !page.deletedAt);
+      const pages = pagesForBook(book);
       const shade = [...book.id].reduce((sum, char) => sum + char.charCodeAt(0), 0) % 5;
       const starred = favorites.includes(book.id);
       const date = new Date(modified(book));
@@ -646,34 +701,61 @@ class NotePadApp {
   }
 
   private async selectNotebook(id: string): Promise<void> {
+    if (this.canvasInputActive()) return;
+    const navigation = ++this.navigationGeneration;
     if (!(await this.flushPendingSave())) return;
+    if (navigation !== this.navigationGeneration) return;
+    const store = this.store;
     this.editGeneration += 1;
-    this.currentNotebook = await this.store.getNotebook(id);
-    this.pages = this.currentNotebook ? await this.store.listPages(this.currentNotebook.id, this.showTrash) : [];
+    const editGeneration = this.editGeneration;
+    const canApply = (): boolean => navigation === this.navigationGeneration && store === this.store && editGeneration === this.editGeneration && this.unsavedPageID === null && this.saveTimer === null && this.saveInFlight === null && !this.canvasInputActive();
+    const notebook = await store.getNotebook(id);
+    if (!canApply()) return;
+    const pages = notebook ? await store.listPages(notebook.id, this.showTrash) : [];
+    if (!canApply()) return;
     const last = this.readSelection();
-    this.currentPage = this.showTrash
+    const page = this.showTrash
       ? this.allPages.find((page) => page.notebookId === id && this.isPageInTrash(page)) ?? null
-      : this.pages.find((page) => !page.deletedAt && last.notebookID === id && last.pageID === page.id) ?? this.pages.find((page) => !page.deletedAt) ?? null;
+      : pages.find((page) => !page.deletedAt && last.notebookID === id && last.pageID === page.id) ?? pages.find((page) => !page.deletedAt) ?? null;
+    this.currentNotebook = notebook;
+    this.pages = pages;
+    this.currentPage = page;
     this.view = "editor";
     this.renderLists();
     this.renderEditor();
     this.rememberSelection();
-    await this.closeDrawers();
+    await this.closeDrawers(false);
+    if (navigation !== this.navigationGeneration) return;
   }
 
   private async selectPage(id: string): Promise<void> {
+    if (this.canvasInputActive()) return;
+    const navigation = ++this.navigationGeneration;
     if (!(await this.flushPendingSave())) return;
+    if (navigation !== this.navigationGeneration) return;
+    const store = this.store;
     this.editGeneration += 1;
-    this.currentPage = await this.store.getPage(id);
-    this.view = "editor";
-    if (this.currentPage && this.currentPage.notebookId !== this.currentNotebook?.id) {
-      this.currentNotebook = await this.store.getNotebook(this.currentPage.notebookId);
-      this.pages = this.currentNotebook ? await this.store.listPages(this.currentNotebook.id, this.showTrash) : [];
+    const editGeneration = this.editGeneration;
+    const canApply = (): boolean => navigation === this.navigationGeneration && store === this.store && editGeneration === this.editGeneration && this.unsavedPageID === null && this.saveTimer === null && this.saveInFlight === null && !this.canvasInputActive();
+    const page = await store.getPage(id);
+    if (!canApply()) return;
+    let notebook = this.currentNotebook;
+    let pages = this.pages;
+    if (page && page.notebookId !== notebook?.id) {
+      notebook = await store.getNotebook(page.notebookId);
+      if (!canApply()) return;
+      pages = notebook ? await store.listPages(notebook.id, this.showTrash) : [];
+      if (!canApply()) return;
     }
+    this.currentPage = page;
+    this.currentNotebook = notebook;
+    this.pages = pages;
+    this.view = "editor";
     this.renderLists();
     this.renderEditor();
     this.rememberSelection();
-    await this.closeDrawers();
+    await this.closeDrawers(false);
+    if (navigation !== this.navigationGeneration) return;
   }
 
   private async createNotebook(title: string): Promise<void> {
@@ -752,9 +834,15 @@ class NotePadApp {
   private async saveCurrentPage(): Promise<boolean> {
     // A timer and a navigation can reach this method together. Serialize the
     // writes, then capture the newest page state after the older write settles.
-    if (this.saveInFlight) await this.saveInFlight;
-    if (!this.currentPage) return true;
-    const page = clonePage(this.currentPage);
+    while (this.saveInFlight) {
+      const inFlight = this.saveInFlight;
+      if (!(await inFlight)) return false;
+    }
+    // The awaited write already persisted this page when no edit arrived
+    // while it was in flight. Only write again for a still-dirty page.
+    const currentPage = this.currentPage;
+    if (!currentPage || this.unsavedPageID !== currentPage.id) return true;
+    const page = clonePage(currentPage);
     const store = this.store;
     const generation = this.editGeneration;
     const operation = (async (): Promise<boolean> => {
@@ -770,9 +858,9 @@ class NotePadApp {
         if (this.pendingRemoteRefresh) this.scheduleRemoteRefresh();
         const savedPage = { ...page, revision: result.revision ?? page.revision, updatedAt: savedAt };
         const listedIndex = this.pages.findIndex((item) => item.id === page.id);
-        if (listedIndex >= 0) this.pages[listedIndex] = clonePage(savedPage);
+        if (listedIndex >= 0) this.pages[listedIndex] = savedPage;
         const allIndex = this.allPages.findIndex((item) => item.id === page.id);
-        if (allIndex >= 0) this.allPages[allIndex] = clonePage(savedPage);
+        if (allIndex >= 0) this.allPages[allIndex] = savedPage;
         this.currentPage.revision = savedPage.revision;
         this.currentPage.updatedAt = savedAt;
         byId("page-revision").textContent = `revision ${this.currentPage.revision}`;
@@ -865,7 +953,8 @@ class NotePadApp {
   }
 
   private setState(state: SyncState): void {
-    const offlineAccountLabel = this.auth.workspaceKey !== "guest" && this.auth.workspaceIdentifier ? `Offline · ${this.auth.workspaceIdentifier} · sign in to sync` : "Guest · local only";
+    if (!document.getElementById("sync-button")) return;
+    const offlineAccountLabel = "Sign in required";
     const label = state.kind === "error" ? state.message : state.kind === "conflict" ? `${state.count} conflict${state.count === 1 ? "" : "s"}` : state.kind === "needs-login" ? offlineAccountLabel : state.kind === "offline" ? "Saved locally" : state.kind === "saving" ? "Saving…" : state.kind === "syncing" ? "Syncing…" : state.kind === "saved" ? "Saved locally" : "Ready";
     byId("sync-label").textContent = label;
     byId("sync-button").classList.toggle("is-busy", state.kind === "saving" || state.kind === "syncing");
@@ -903,6 +992,7 @@ class NotePadApp {
     }
     if (status.state === "needs-login") {
       this.setState({ kind: "needs-login" });
+      this.requireLogin();
       return;
     }
     if (status.state === "scheduled") {
@@ -1013,12 +1103,11 @@ class NotePadApp {
 
   private openAuthDialog(): void {
     if (this.auth.session) { this.openSettings(); return; }
-    this.setAuthMode("login");
-    this.openDialog("auth-dialog");
+    this.requireLogin();
   }
 
   private setAuthMode(mode: "login" | "register"): void {
-    byId("auth-dialog-title").textContent = mode === "login" ? "Sign in to sync" : "Create an account";
+    byId("auth-dialog-title").textContent = mode === "login" ? "Sign in to NotePad" : "Create an account";
     byId("auth-submit").textContent = mode === "login" ? "Sign in" : "Create account";
     byId("auth-form").dataset.mode = mode;
     byId("login-mode").classList.toggle("active", mode === "login");
@@ -1026,70 +1115,56 @@ class NotePadApp {
   }
 
   private async submitAuth(): Promise<void> {
-    if (!(await this.flushPendingSave())) return;
-    const identifier = byId<HTMLInputElement>("auth-identifier").value.trim();
-    const password = byId<HTMLInputElement>("auth-password").value;
-    if (!identifier || password.length < 12) { byId("auth-error").textContent = "Use an identifier and a password of at least 12 characters."; return; }
-    if (!getEndpoint()) { byId("auth-error").textContent = "Add the HTTPS server URL in Settings first."; return; }
-    const wasGuest = this.accountKey() === "guest";
-    const guestArchive = wasGuest ? await this.store.exportArchive() : null;
-    const mode = byId("auth-form").dataset.mode === "register" ? "register" : "login";
+    const button = byId<HTMLButtonElement>("auth-submit");
+    if (button.disabled) return;
+    button.disabled = true;
     try {
-      const response: AuthResponse = mode === "register" ? await this.authClient.register(identifier, password) : await this.authClient.login(identifier, password);
-      this.rememberSelection();
-      this.pauseCoordinatorForStoreSwitch();
+      if (!(await this.flushPendingSave())) throw new Error("Could not save your open note. Free device storage and try again.");
+      const identifier = byId<HTMLInputElement>("auth-identifier").value.trim();
+      const password = byId<HTMLInputElement>("auth-password").value;
+      if (!identifier || password.length < 12) throw new Error("Use an identifier and a password of at least 12 characters.");
+      const previous = getEndpoint();
+      if (!setEndpoint(byId<HTMLInputElement>("auth-endpoint").value)) {
+        setEndpoint(previous);
+        throw new Error("Enter a valid HTTPS server URL.");
+      }
+      const mode = byId("auth-form").dataset.mode;
+      const response = mode === "register" ? await this.authClient.register(identifier, password) : await this.authClient.login(identifier, password);
+      const nextStore = this.store?.accountKey === workspaceAccountKey(getEndpoint(), response.user.id)
+        ? this.store : await SQLiteNoteStore.open(workspaceAccountKey(getEndpoint(), response.user.id));
+      if (this.store && this.store !== nextStore) await this.store.close();
       this.auth.set(response);
-      this.useGuestWorkspace = false;
-      byId("account-name").textContent = response.user.identifier;
-      byId<HTMLButtonElement>("logout-button").hidden = false;
-      await this.store.close();
+      this.store = nextStore;
       this.currentNotebook = null;
       this.currentPage = null;
+      this.notebooks = [];
       this.pages = [];
       this.allPages = [];
-      this.store = await SQLiteNoteStore.open(this.accountKey());
-      this.pendingGuestArchive = guestArchive && guestArchive.pages.length > 0 ? guestArchive : null;
-      this.closeDialog("auth-dialog");
+      this.view = "library";
+      this.showTrash = false;
+      this.search = "";
+      this.canvas?.destroy();
+      this.renderShell();
       await this.reload();
+      this.loginRequired = false;
+      this.root.classList.remove("login-required");
       this.resumeCoordinatorAfterStoreSwitch();
-      if (this.pendingGuestArchive) this.openDialog("migration-dialog");
     } catch (error) {
       byId("auth-error").textContent = error instanceof Error ? error.message : "Sign-in failed.";
+      if (!byId<HTMLDialogElement>("auth-dialog").open) this.requireLogin();
+    } finally {
+      byId<HTMLButtonElement>("auth-submit").disabled = false;
     }
-  }
-
-  private async finishMigration(move: boolean): Promise<void> {
-    if (move && this.pendingGuestArchive) {
-      try {
-        await this.store.importArchive(this.pendingGuestArchive);
-      } catch (error) {
-        this.setState({ kind: "error", message: error instanceof Error ? error.message : "Could not move the guest notebook." });
-        return;
-      }
-    }
-    this.pendingGuestArchive = null;
-    this.closeDialog("migration-dialog");
-    await this.reload();
-    if (move) this.coordinator.notifyLocalWrite();
-    this.coordinator.request("migration");
   }
 
   private async logout(): Promise<void> {
     if (!(await this.flushPendingSave())) return;
-    this.pauseCoordinatorForStoreSwitch();
     const session = this.auth.session;
-    if (session) { try { await this.authClient.logout(session.sessionToken, this.auth.boundEndpoint ?? getEndpoint()); } catch { /* local logout still succeeds offline */ } }
+    const endpoint = this.auth.boundEndpoint ?? getEndpoint();
     this.rememberSelection();
-    await this.store.close();
-    this.auth.clear();
-    this.useGuestWorkspace = true;
-    this.store = await SQLiteNoteStore.open("guest");
-    await this.reload();
-    this.resumeCoordinatorAfterStoreSwitch();
-    this.closeDialog("settings-dialog");
-    byId("account-name").textContent = "Guest · this device";
-    byId<HTMLButtonElement>("logout-button").hidden = true;
-    this.setState({ kind: "needs-login" });
+    this.requireLogin();
+    // The account database stays available for unsent changes on the next login.
+    if (session) { try { await this.authClient.logout(session.sessionToken, endpoint); } catch { /* Local sign-out still succeeds offline. */ } }
   }
 
   private async archiveCurrentNotebook(): Promise<void> {
@@ -1113,30 +1188,15 @@ class NotePadApp {
     const previous = getEndpoint();
     const raw = byId<HTMLInputElement>("endpoint-input").value.trim();
     const next = setEndpoint(raw);
-    if (raw && !next) {
+    if (!next) {
       setEndpoint(previous);
       byId("settings-message").textContent = "Use an HTTPS URL. HTTP is allowed only for localhost development.";
       return;
     }
-    if (previous !== next && this.auth.boundEndpoint) {
-      // The token is bound to the endpoint used during login. Close it before
-      // clearing the token or identity so a changed server can never open or
-      // receive the old account session.
+    if (previous !== next) {
       this.rememberSelection();
-      this.pauseCoordinatorForStoreSwitch();
-      await this.store.close();
-      this.auth.clear();
-      this.useGuestWorkspace = true;
-      this.currentNotebook = null;
-      this.currentPage = null;
-      this.pages = [];
-      this.allPages = [];
-      this.store = await SQLiteNoteStore.open(this.accountKey());
-        await this.reload();
-      this.pendingRemoteRefresh = null;
-      this.resumeCoordinatorAfterStoreSwitch();
-      byId("account-name").textContent = "Guest · this device";
-      byId<HTMLButtonElement>("logout-button").hidden = true;
+      this.requireLogin();
+      return;
     }
     this.closeDialog("settings-dialog");
     this.setState(this.auth.session ? { kind: "saved" } : { kind: "needs-login" });
@@ -1295,7 +1355,7 @@ function shellMarkup(auth: AuthSession): string {
       <nav class="library-tabs" aria-label="Library sections"><button id="library-documents" aria-current="page"><span aria-hidden="true">▱</span>Documents</button><button id="library-tab-search" aria-current="false"><span aria-hidden="true">⌕</span>Search</button><button id="library-favorites" aria-current="false"><span aria-hidden="true">☆</span>Favorites</button></nav>
     </main>
     <main class="workspace" id="editor-workspace" hidden>
-      <header class="topbar"><div class="topbar-leading"><button class="back-library" id="back-library" aria-label="Back to Documents">‹ <span>Documents</span></button><button class="drawer-trigger" id="mobile-menu" aria-controls="sidebar" aria-expanded="false"><span class="drawer-trigger-icon">☰</span><span>Pages</span></button><div class="crumbs"><span class="eyebrow">NOTEBOOK</span><button class="notebook-title-button" id="rename-notebook" aria-label="Rename notebook"><strong id="notebook-name">My notebook</strong><span aria-hidden="true">✎</span></button></div></div><div class="top-actions"><button class="text-toggle" id="text-toggle" aria-label="Text and page details" aria-controls="inspector" aria-expanded="false"><span aria-hidden="true">T</span><span>Text</span></button><button class="sync-status" id="sync-button" aria-label="Guest local mode"><span id="sync-icon">·</span><span id="sync-label">Guest · local only</span></button><button class="avatar-button" id="auth-button" aria-label="Account">○</button></div></header>
+      <header class="topbar"><div class="topbar-leading"><button class="back-library" id="back-library" aria-label="Back to Documents">‹ <span>Documents</span></button><button class="drawer-trigger" id="mobile-menu" aria-controls="sidebar" aria-expanded="false"><span class="drawer-trigger-icon">☰</span><span>Pages</span></button><div class="crumbs"><span class="eyebrow">NOTEBOOK</span><button class="notebook-title-button" id="rename-notebook" aria-label="Rename notebook"><strong id="notebook-name">My notebook</strong><span aria-hidden="true">✎</span></button></div></div><div class="top-actions"><button class="text-toggle" id="text-toggle" aria-label="Text and page details" aria-controls="inspector" aria-expanded="false"><span aria-hidden="true">T</span><span>Text</span></button><button class="sync-status" id="sync-button" aria-label="Sign in required"><span id="sync-icon">·</span><span id="sync-label">Sign in required</span></button><button class="avatar-button" id="auth-button" aria-label="Account">○</button></div></header>
       <section class="editor-layout">
         <div class="editor-stage" id="editor-content">
       <div class="editor-toolbar" role="toolbar" aria-label="Writing tools">
@@ -1321,7 +1381,7 @@ function shellMarkup(auth: AuthSession): string {
           <div class="page-bar"><button class="page-title-button" id="rename-page" aria-label="Rename page"><span class="page-title-kicker">PAGE</span><strong id="page-title-label">First page</strong><span aria-hidden="true">✎</span></button><div class="page-navigation"><button class="quiet-button" id="previous-page" aria-label="Previous page">‹</button><span id="page-position" aria-live="polite">1 / 1</span><button class="quiet-button" id="next-page" aria-label="Next page">›</button><button class="quiet-button add-page" id="add-page" aria-label="Add page" title="Add page with the same paper">＋</button></div></div>
           <div class="paper-viewport" id="paper-viewport"><div class="paper" id="paper"><canvas id="ink-canvas" aria-label="Note page drawing surface"></canvas></div></div>
           <div class="print-note" aria-hidden="true"><h1 id="print-title"></h1><p id="print-text"></p></div>
-          <div class="stage-foot"><span id="tool-name" aria-live="polite">Pen</span><div class="view-controls"><button class="quiet-button" id="zoom-out" aria-label="Zoom out">−</button><span class="zoom-label" id="zoom-label">100%</span><button class="quiet-button" id="zoom-in" aria-label="Zoom in">＋</button><button class="quiet-button" id="fit-button" aria-label="Fit page width">Fit width</button><button class="quiet-button" id="fit-whole-page" aria-label="Fit whole page">Full page</button></div><span id="page-revision">revision 0</span></div>
+           <div class="stage-foot" title="Two fingers to move or zoom · Hand tool for one-finger pan"><span id="tool-name" aria-live="polite">Pen</span><small class="gesture-hint">2 fingers: move / zoom · Hand: 1-finger pan</small><div class="view-controls"><button class="quiet-button" id="zoom-out" aria-label="Zoom out">−</button><span class="zoom-label" id="zoom-label">100%</span><button class="quiet-button" id="zoom-in" aria-label="Zoom in">＋</button><button class="quiet-button" id="fit-button" aria-label="Fit page width">Fit width</button><button class="quiet-button" id="fit-whole-page" aria-label="Fit whole page">Full page</button></div><span id="page-revision">revision 0</span></div>
         </div>
         <div class="empty-editor hidden" id="editor-empty"><div class="empty-orbit">✦</div><h1>Choose a page</h1><p>Your paper is waiting in the left rail.</p></div>
       <aside class="inspector" id="inspector" aria-label="Text and page details" aria-hidden="true"><div class="inspector-head"><div><span class="eyebrow">TEXT & DETAILS</span><strong class="inspector-title">Page tools</strong></div><button class="icon-button" id="close-inspector" aria-label="Close text panel">×</button></div><label class="title-field"><span>Page title</span><input id="page-title" type="text" placeholder="Untitled page" /></label><label class="text-field"><span>Typed note</span><textarea id="page-text" rows="8" placeholder="Type in Thai or English…" dir="auto"></textarea></label><label class="select-field"><span>Paper</span><select id="background-select"><option value="blank">Blank</option><option value="ruled">Ruled lines</option><option value="grid">Grid</option></select></label><div class="inspector-actions"><button class="outline-button" id="duplicate-page">Duplicate page</button><button class="outline-button" id="delete-page">Move page to trash</button><button class="outline-button" id="archive-notebook" title="Archive or restore notebook" aria-label="Archive or restore notebook">Archive notebook</button><button class="outline-button" id="print-button">Print / PDF</button><button class="outline-button" id="share-button">Share archive</button><button class="outline-button" id="export-button">Export backup</button></div><p class="inspector-note">Changes save locally after each edit. Sync uses the configured server only when you sign in.</p></aside>
@@ -1332,16 +1392,20 @@ function shellMarkup(auth: AuthSession): string {
   </div>`;
 }
 
+function authMarkup(): string {
+  return `<dialog class="dialog" id="auth-dialog"><form class="dialog-form" id="auth-form" data-mode="login"><div class="dialog-head"><div><span class="eyebrow">ACCOUNT</span><h2 id="auth-dialog-title">Sign in to NotePad</h2></div></div><div class="mode-switch"><button type="button" id="login-mode" class="active">Sign in</button><button type="button" id="register-mode">Create account</button></div><label>Identifier<input id="auth-identifier" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="you@example.com or username" required /></label><label>Password<input id="auth-password" type="password" autocomplete="current-password" minlength="12" placeholder="12 characters minimum" required /></label><p class="form-hint">Sign in with the same account on each device to keep your notebooks together.</p><details><summary>Sync server</summary><label>Server URL<input id="auth-endpoint" type="url" required placeholder="https://notes.example.com" /></label></details><p class="form-error" id="auth-error" role="alert"></p><button class="primary-button" id="auth-submit" type="submit">Sign in</button></form></dialog>`;
+}
+
 function dialogMarkup(auth: AuthSession): string {
-  return `<dialog class="dialog" id="auth-dialog"><form class="dialog-form" id="auth-form" data-mode="login"><div class="dialog-head"><div><span class="eyebrow">ACCOUNT</span><h2 id="auth-dialog-title">Sign in to sync</h2></div><button type="button" class="icon-button" id="cancel-auth" aria-label="Close">×</button></div><div class="mode-switch"><button type="button" id="login-mode" class="active">Sign in</button><button type="button" id="register-mode">Create account</button></div><label>Identifier<input id="auth-identifier" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="you@example.com or username" required /></label><label>Password<input id="auth-password" type="password" autocomplete="current-password" minlength="12" placeholder="12 characters minimum" required /></label><p class="form-hint">Your guest notebook stays on this device. After sign-in, you choose whether to move it into the account.</p><p class="form-error" id="auth-error" role="alert"></p><button class="primary-button" id="auth-submit" type="submit">Sign in</button></form></dialog>
-  <dialog class="dialog" id="settings-dialog"><form class="dialog-form" id="settings-form"><div class="dialog-head"><div><span class="eyebrow">SETTINGS</span><h2>Keep your paper close</h2></div><button type="button" class="icon-button" id="cancel-settings" aria-label="Close">×</button></div><label>Sync server URL<input id="endpoint-input" type="url" inputmode="url" placeholder="https://notes.example.com" /></label><p class="form-hint">Leave this empty for private guest mode. Use an HTTPS URL for login and sync. A temporary tunnel is only available while its server is running.</p><p class="form-message offline-cache-status" id="offline-cache-status" role="status">Preparing offline cache…</p><div class="settings-actions"><button class="outline-button" type="button" id="browse-import">Import backup</button><button class="outline-button" type="button" id="settings-export">Export backup</button><button class="outline-button" type="button" id="settings-share">Share backup</button></div><input id="import-input" type="file" accept="application/json,.json,.notepad" hidden /><p class="form-message" id="settings-message"></p>${thisAccountMarkup(auth)}<button class="primary-button" type="submit">Save settings</button></form></dialog>
+  return `${authMarkup()}
+  <dialog class="dialog" id="settings-dialog"><form class="dialog-form" id="settings-form"><div class="dialog-head"><div><span class="eyebrow">SETTINGS</span><h2>Keep your paper close</h2></div><button type="button" class="icon-button" id="cancel-settings" aria-label="Close">×</button></div><label>Sync server URL<input id="endpoint-input" type="url" inputmode="url" placeholder="https://notes.example.com" /></label><p class="form-hint">Use the same HTTPS server on every device. Changing servers requires signing in again.</p><p class="form-message offline-cache-status" id="offline-cache-status" role="status">Preparing offline cache…</p><div class="settings-actions"><button class="outline-button" type="button" id="browse-import">Import backup</button><button class="outline-button" type="button" id="settings-export">Export backup</button><button class="outline-button" type="button" id="settings-share">Share backup</button></div><input id="import-input" type="file" accept="application/json,.json,.notepad" hidden /><p class="form-message" id="settings-message"></p>${thisAccountMarkup(auth)}<button class="primary-button" type="submit">Save settings</button></form></dialog>
   <dialog class="dialog" id="notebook-dialog"><form class="dialog-form" id="notebook-form"><div class="dialog-head"><div><span class="eyebrow">NOTEBOOK</span><h2>Rename notebook</h2></div><button type="button" class="icon-button" id="cancel-notebook" aria-label="Close">×</button></div><label>Name<input id="notebook-title" type="text" maxlength="500" autocomplete="off" required /></label><div id="new-notebook-options" hidden><label>Paper<select id="new-paper"><option value="blank">Blank</option><option value="ruled" selected>Ruled lines</option><option value="grid">Grid</option></select></label><div class="paper-choices" role="group" aria-label="Paper preview"><button type="button" class="paper-sample paper-blank" data-paper="blank" aria-pressed="false">Blank</button><button type="button" class="paper-sample paper-ruled" data-paper="ruled" aria-pressed="true">Ruled</button><button type="button" class="paper-sample paper-grid" data-paper="grid" aria-pressed="false">Grid</button></div></div><p class="form-error" id="notebook-error" role="alert"></p><button class="primary-button" type="submit">Save name</button></form></dialog>
-  <dialog class="dialog" id="migration-dialog"><div class="dialog-form"><div class="dialog-head"><div><span class="eyebrow">GUEST NOTEBOOK</span><h2>Move your local paper?</h2></div><button type="button" class="icon-button" id="cancel-migration" aria-label="Close">×</button></div><p class="migration-copy">You have notes in guest mode. Move a copy into the signed-in account, or keep the guest notebook on this device for later.</p><div class="migration-actions"><button class="outline-button" id="keep-guest">Keep guest notes</button><button class="primary-button" id="move-guest">Move a copy into account</button></div></div></dialog>`;
+`;
 }
 
 function thisAccountMarkup(auth: AuthSession): string {
   const user = auth.user;
-  return `<div class="account-line"><span>Account</span><strong id="account-name">${escapeHTML(auth.workspaceIdentifier ?? "Guest · this device")}</strong><button type="button" class="outline-button compact" id="logout-button"${user ? "" : " hidden"}>Sign out</button></div><div id="workspace-recovery"></div>`;
+  return `<div class="account-line"><span>Account</span><strong id="account-name">${escapeHTML(auth.workspaceIdentifier ?? "Sign in required")}</strong><button type="button" class="outline-button compact" id="logout-button"${user ? "" : " hidden"}>Sign out</button></div><div id="workspace-recovery"></div>`;
 }
 
 function loadingMarkup(): string { return `<div class="loading-screen"><span class="brand-mark">N</span><p>Opening your paper…</p></div>`; }

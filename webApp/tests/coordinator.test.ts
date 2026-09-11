@@ -110,6 +110,23 @@ describe("automatic sync coordinator", () => {
     coordinator.stop();
   });
 
+  it("resumes polling after a save returns false and pulls every five seconds without edits", async () => {
+    vi.useFakeTimers();
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const store = fakeStore();
+    const sync = vi.fn(async () => ({ pushed: 0, pulled: 1, conflicts: 0 }));
+    const before = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+    const coordinator = new SyncCoordinator({ getStore: () => store, getSession: () => session, client: { sync } as unknown as SyncClient, onBeforeSync: before });
+    coordinator.start();
+    await settle();
+    expect(sync).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(sync).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(sync).toHaveBeenCalledTimes(2);
+    coordinator.stop();
+  });
+
   it("reports a failed editor flush without an unhandled retry loop", async () => {
     vi.useFakeTimers();
     localStorage.setItem("notepad.endpoint", "https://sync.example.test");

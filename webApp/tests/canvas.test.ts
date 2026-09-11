@@ -51,6 +51,19 @@ beforeEach(() => {
 afterEach(() => { document.body.innerHTML = ""; vi.unstubAllGlobals(); });
 
 describe("PaperCanvas pointer contract", () => {
+  it("keeps point times monotonic across stale coalesced samples and pointerup", () => {
+    const { canvas, changes, canvasController } = setup();
+    canvas.dispatchEvent(pointer("pointerdown", { timeStamp: 100, clientX: 10 }));
+    canvas.dispatchEvent(pointer("pointermove", { timeStamp: 140, getCoalescedEvents: () => [
+      pointer("pointermove", { timeStamp: 130, clientX: 20 }),
+      pointer("pointermove", { timeStamp: 120, clientX: 30 }),
+    ] }));
+    canvas.dispatchEvent(pointer("pointerup", { timeStamp: 110, clientX: 40 }));
+    expect(changes.mock.lastCall![0][0].points.map((point: { time: number }) => point.time)).toEqual([0, 30, 30, 30]);
+    expect(changes.mock.lastCall![0][0].points.map((point: { x: number }) => point.x)).toEqual([20, 40, 60, 80]);
+    canvasController.destroy();
+  });
+
   it("stores translucent highlighter strokes and round-trips undo/redo", () => {
     const { canvas, changes, canvasController } = setup();
     canvasController.setTool({ kind: "highlighter", color: 0xfff2ca52, width: 18 });
@@ -214,22 +227,128 @@ describe("PaperCanvas pointer contract", () => {
     expect(changes).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps input active for touch navigation until the last finger ends", () => {
+  it("keeps one-finger touch inert in writing mode while allowing a two-finger pinch", () => {
+    const { canvas, paper, canvasController } = setup();
+    const before = transformOf(paper);
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 50, pointerType: "touch", clientX: 300, clientY: 300 }));
+    expect(canvasController.isInputActive).toBe(false);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 50, pointerType: "touch", clientX: 320, clientY: 320 }));
+    expect(transformOf(paper)).toEqual(before);
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 51, pointerType: "touch", clientX: 500, clientY: 300 }));
+    expect(canvasController.isInputActive).toBe(true);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 50, pointerType: "touch", clientX: 200, clientY: 300 }));
+    expect(transformOf(paper).scale).toBeGreaterThan(before.scale);
+    const afterPinch = transformOf(paper);
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 50, pointerType: "touch", clientX: 200, clientY: 300 }));
+    expect(canvasController.isInputActive).toBe(false);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 51, pointerType: "touch", clientX: 700, clientY: 300 }));
+    expect(transformOf(paper)).toEqual(afterPinch);
+    expect(canvasController.isInputActive).toBe(false);
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 51, pointerType: "touch", clientX: 700, clientY: 300 }));
+    canvasController.destroy();
+  });
+
+  it("gives pen hover and contact priority over pending and remaining palm touch", () => {
+    const { canvas, paper, changes, canvasController } = setup();
+    const before = transformOf(paper);
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 60, pointerType: "touch", clientX: 300, clientY: 300 }));
+    canvas.dispatchEvent(pointer("pointerover", { pointerId: 61, pointerType: "pen", buttons: 0, clientX: 100, clientY: 100 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 61, pointerType: "pen", buttons: 0, clientX: 100, clientY: 100 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 60, pointerType: "touch", clientX: 500, clientY: 500 }));
+    expect(transformOf(paper)).toEqual(before);
+    expect(canvasController.isInputActive).toBe(false);
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 61, pointerType: "pen", clientX: 100, clientY: 100 }));
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 62, pointerType: "touch", clientX: 200, clientY: 200 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 62, pointerType: "touch", clientX: 600, clientY: 600 }));
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 61, pointerType: "pen", clientX: 100, clientY: 100 }));
+    expect(changes).toHaveBeenCalledTimes(1);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 62, pointerType: "touch", clientX: 700, clientY: 700 }));
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 62, pointerType: "touch", clientX: 700, clientY: 700 }));
+    expect(transformOf(paper)).toEqual(before);
+    expect(canvasController.isInputActive).toBe(false);
+    canvasController.destroy();
+  });
+
+  it("cancels input on lost capture, window blur, and hidden visibility", () => {
+    const { canvas, paper, changes, canvasController } = setup();
+    const before = transformOf(paper);
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 70, pointerType: "pen" }));
+    canvas.dispatchEvent(pointer("lostpointercapture", { pointerId: 70, pointerType: "pen" }));
+    expect(canvasController.isInputActive).toBe(false);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 70, pointerType: "pen", clientX: 500 }));
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 70, pointerType: "pen", clientX: 500 }));
+    expect(changes).not.toHaveBeenCalled();
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 71, pointerType: "touch", clientX: 300, clientY: 300 }));
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 72, pointerType: "touch", clientX: 500, clientY: 300 }));
+    window.dispatchEvent(new Event("blur"));
+    expect(canvasController.isInputActive).toBe(false);
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 73, pointerType: "pen" }));
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(canvasController.isInputActive).toBe(false);
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 73, pointerType: "pen", clientX: 500 }));
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 73, pointerType: "pen", clientX: 500 }));
+    expect(transformOf(paper)).toEqual(before);
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    canvasController.destroy();
+  });
+
+  it("suppresses selection and context menus on canvas chrome but preserves form selection", () => {
+    const { canvas, canvasController } = setup();
+    const chrome = document.createElement("div");
+    chrome.className = "editor-toolbar";
+    const input = document.createElement("textarea");
+    chrome.append(input);
+    document.body.append(chrome);
+    const canvasMenu = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    canvas.dispatchEvent(canvasMenu);
+    expect(canvasMenu.defaultPrevented).toBe(true);
+    const chromeMenu = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    chrome.dispatchEvent(chromeMenu);
+    expect(chromeMenu.defaultPrevented).toBe(true);
+    const inputMenu = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    input.dispatchEvent(inputMenu);
+    expect(inputMenu.defaultPrevented).toBe(false);
+    const editable = document.createElement("div");
+    editable.setAttribute("contenteditable", "plaintext-only");
+    chrome.append(editable);
+    const editableMenu = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    editable.dispatchEvent(editableMenu);
+    expect(editableMenu.defaultPrevented).toBe(false);
+    const selectStart = new Event("selectstart", { bubbles: true, cancelable: true });
+    chrome.dispatchEvent(selectStart);
+    expect(selectStart.defaultPrevented).toBe(true);
+    const inputSelectStart = new Event("selectstart", { bubbles: true, cancelable: true });
+    input.dispatchEvent(inputSelectStart);
+    expect(inputSelectStart.defaultPrevented).toBe(false);
+    canvasController.destroy();
+  });
+
+  it("rebuilds the page once after replacing page input", () => {
+    const { canvasController } = setup();
+    const render = vi.spyOn(canvasController as unknown as { render: () => void }, "render");
+    canvasController.setPage("next", 1024, 1366, "ruled", []);
+    expect(render).toHaveBeenCalledTimes(1);
+    canvasController.destroy();
+  });
+
+  it("counts two-finger writing navigation as active until one finger remains", () => {
     const { canvas, canvasController } = setup();
     canvas.dispatchEvent(pointer("pointerdown", { pointerId: 41, pointerType: "touch", clientX: 250, clientY: 250 }));
     canvas.dispatchEvent(pointer("pointerdown", { pointerId: 42, pointerType: "touch", clientX: 450, clientY: 250 }));
     expect(canvasController.isInputActive).toBe(true);
     canvas.dispatchEvent(pointer("pointerup", { pointerId: 41, pointerType: "touch", clientX: 250, clientY: 250 }));
-    expect(canvasController.isInputActive).toBe(true);
+    expect(canvasController.isInputActive).toBe(false);
     canvas.dispatchEvent(pointer("pointerup", { pointerId: 42, pointerType: "touch", clientX: 450, clientY: 250 }));
     expect(canvasController.isInputActive).toBe(false);
   });
 
   it("fits writing view to width and keeps a dragged page reachable", () => {
-    const { canvas, paper, viewportRect } = setup();
+    const { canvas, paper, viewportRect, canvasController } = setup();
     const initial = transformOf(paper);
     expect(initial.scale).toBeCloseTo((viewportRect.width - PAN_MARGIN * 2) / 1024, 6);
 
+    canvasController.setTool({ kind: "hand" });
     canvas.dispatchEvent(pointer("pointerdown", { pointerId: 11, pointerType: "touch", clientX: 300, clientY: 300 }));
     canvas.dispatchEvent(pointer("pointermove", { pointerId: 11, pointerType: "touch", clientX: 5300, clientY: 5300 }));
     const dragged = transformOf(paper);
@@ -281,7 +400,8 @@ describe("PaperCanvas pointer contract", () => {
   });
 
   it("rebases a one-finger pan after pinch and pointer cancel", () => {
-    const { canvas, paper } = setup();
+    const { canvas, paper, canvasController } = setup();
+    canvasController.setTool({ kind: "hand" });
     canvas.dispatchEvent(pointer("pointerdown", { pointerId: 31, pointerType: "touch", clientX: 300, clientY: 300 }));
     canvas.dispatchEvent(pointer("pointermove", { pointerId: 31, pointerType: "touch", clientX: 340, clientY: 320 }));
     canvas.dispatchEvent(pointer("pointerdown", { pointerId: 32, pointerType: "touch", clientX: 500, clientY: 320 }));

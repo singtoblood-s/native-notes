@@ -4,7 +4,7 @@ import { NoteStore } from "./storage";
 import { SyncClient, SyncHttpError, SyncReport } from "./sync";
 
 const DEFAULT_DEBOUNCE_MS = 750;
-const DEFAULT_INTERVAL_MS = 60_000;
+const DEFAULT_INTERVAL_MS = 5_000;
 const INITIAL_BACKOFF_MS = 2_000;
 const MAX_BACKOFF_MS = 5 * 60_000;
 
@@ -221,6 +221,8 @@ export class SyncCoordinator {
     }
     if (!maySync) {
       this.publishIfCurrent(generation, { state: "idle", reason, error: null });
+      // A failed local save must not permanently cancel remote polling.
+      if (this.started && generation === this.generation && !this.requested) this.schedule(this.intervalMs, "periodic");
       return;
     }
     if (!this.isRunCurrent(generation, store, session)) return;

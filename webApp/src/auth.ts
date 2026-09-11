@@ -80,9 +80,7 @@ function persistWorkspaceIdentities(identities: Map<string, WorkspaceIdentity>):
 export class AuthSession {
   private current: StoredSession | null;
   /**
-   * The identity survives an expired browser session so its local database can
-   * still be opened offline. Explicit sign-out selects guest while preserving
-   * the account namespace for recovery or export.
+   * Remember account namespaces for recovery after reauthentication.
    */
   private identity: WorkspaceIdentity | null;
   private readonly identities: Map<string, WorkspaceIdentity>;
@@ -110,9 +108,9 @@ export class AuthSession {
 
   get session(): AuthResponse | null { return this.activeSession(); }
   get user(): User | null { return this.activeSession()?.user ?? null; }
-  get workspaceKey(): string {
+  get workspaceKey(): string | null {
     const session = this.activeSession();
-    return session ? workspaceAccountKey(session.endpoint, session.user.id) : this.identity ? workspaceAccountKey(this.identity.endpoint, this.identity.userID) : "guest";
+    return session ? workspaceAccountKey(session.endpoint, session.user.id) : this.identity ? workspaceAccountKey(this.identity.endpoint, this.identity.userID) : null;
   }
   get workspaceIdentifier(): string | null { return this.activeSession()?.user.identifier ?? this.identity?.identifier ?? null; }
   get boundEndpoint(): string | null { return this.activeSession()?.endpoint ?? this.identity?.endpoint ?? null; }
@@ -141,8 +139,7 @@ export class AuthSession {
       sessionStorage.setItem(SESSION_KEY, JSON.stringify(stored));
     } else {
       sessionStorage.removeItem(SESSION_KEY);
-      // Keep account databases and outboxes. Explicit sign-out selects guest
-      // but never destroys a local account workspace.
+      // Preserve account databases and outboxes for the next authenticated login.
       localStorage.removeItem(ACTIVE_WORKSPACE_KEY);
       localStorage.removeItem(WORKSPACE_KEY);
       this.identity = null;
@@ -171,8 +168,7 @@ export function getEndpoint(): string {
 
 export function setEndpoint(endpoint: string): string {
   const normalized = canonicalizeEndpoint(endpoint);
-  // An explicit blank disables the build-time endpoint for private guest mode.
-  // Keeping the empty override also prevents a token from being sent to a
+  // Keeping an explicit empty override prevents a token from being sent to a
   // build default after the user intentionally clears Settings.
   localStorage.setItem(ENDPOINT_KEY, normalized);
   return normalized;

@@ -50,7 +50,7 @@ describe("account-bound browser sessions", () => {
     setEndpoint("https://two.example.test");
     expect(session.session).toBeNull();
     // Keep the old workspace selected in memory until the UI deliberately
-    // switches to guest; it must never be sent to the new server.
+    // locks the editor; it must never be sent to the new server.
     expect(session.workspaceKey).toBe("https://one.example.test:first");
   });
 
@@ -62,7 +62,7 @@ describe("account-bound browser sessions", () => {
     session.set(response("SECOND"));
 
     session.clear();
-    expect(session.workspaceKey).toBe("guest");
+    expect(session.workspaceKey).toBeNull();
     expect(session.savedWorkspaces.map((item) => `${item.endpoint}:${item.userID}`)).toEqual([
       "https://one.example.test:first",
       "https://two.example.test:second",
@@ -84,7 +84,7 @@ describe("account-bound browser sessions", () => {
     expect(restored.boundEndpoint).toBe("https://sync.example.test");
 
     restored.clear();
-    expect(restored.workspaceKey).toBe("guest");
+    expect(restored.workspaceKey).toBeNull();
     expect(restored.workspaceIdentifier).toBeNull();
     expect(restored.boundEndpoint).toBeNull();
     expect(localStorage.getItem("notepad.workspace")).toBeNull();

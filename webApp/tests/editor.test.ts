@@ -6,7 +6,7 @@ vi.mock("../src/coordinator", () => ({ SyncCoordinator: class {
   start() {} stop() {} notifyLocalWrite() {}
 } }));
 vi.mock("../src/storage", () => ({ SQLiteNoteStore: { open: async () => ({
-  accountKey: "guest",
+  accountKey: "https://sync.example.test:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   listNotebooks: async () => structuredClone(data.notebooks),
   listPages: async (id: string) => structuredClone(data.pages.filter((page) => page.notebookId === id)),
   getNotebook: async (id: string) => structuredClone(data.notebooks.find((notebook) => notebook.id === id)),
@@ -26,6 +26,9 @@ vi.mock("../src/storage", () => ({ SQLiteNoteStore: { open: async () => ({
 
 it("creates notebooks, preserves tool settings, duplicates paper and prevents navigation after a failed save", async () => {
   localStorage.clear();
+  sessionStorage.clear();
+  localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+  sessionStorage.setItem("notepad.session", JSON.stringify({ endpoint: "https://sync.example.test", user: { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", identifier: "tester" }, sessionToken: "test-token", expiresAt: "2099-01-01T00:00:00Z" }));
   // Damaged optional settings must not stop the notebook from opening.
   localStorage.setItem("notepad.writing-tools", '{"kind":"unknown","settings":{"pen":{"width":-1}}}');
   const notebook = createNotebook("Original notebook");
@@ -113,6 +116,7 @@ it("creates notebooks, preserves tool settings, duplicates paper and prevents na
   } finally {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    sessionStorage.clear();
     localStorage.clear();
     document.body.innerHTML = "";
   }
