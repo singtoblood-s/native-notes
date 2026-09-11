@@ -450,3 +450,6 @@ body.drawer-open { overflow: hidden; }
   .inspector-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
   .inspector-note { display: none; }
 }
+
+/* Hide account contents while the required sign-in dialog is open. */
+.login-required .app-shell > :not(dialog) { visibility: hidden; }

@@ -617,17 +617,18 @@ export class PaperCanvas {
       const position = this.pagePoint(sample, rect);
       const timestamp = finite(sample.timeStamp) ? sample.timeStamp : performance.now();
       const pressure = finite(sample.pressure) && sample.pressure > 0 ? clamp(sample.pressure, 0, 1) : 0.5;
+      const previous = this.active.stroke.points.at(-1);
       const point: StrokePoint = {
         // Two decimals are sub-pixel at normal page zoom and keep dense ink
         // comfortably below the server's operation-size limit.
         x: roundTo(position.x, 2),
         y: roundTo(position.y, 2),
         pressure: this.tool.kind === "pen" && this.tool.pressureSensitive !== false ? roundTo(pressure, 3) : 1,
-        time: Math.max(0, Math.round(timestamp - this.active.startedAt)),
+        // Coalesced samples and pointerup can arrive with older timestamps.
+        time: Math.max(previous?.time ?? 0, Math.round(timestamp - this.active.startedAt)),
         tiltX: finite(sample.tiltX) ? roundTo(sample.tiltX, 1) : null,
         tiltY: finite(sample.tiltY) ? roundTo(sample.tiltY, 1) : null,
       };
-      const previous = this.active.stroke.points.at(-1);
       // A tap commonly arrives as a down and an up with an empty coalesced
       // array. Keep its single canonical point instead of duplicating it.
       if (!previous || Math.hypot(previous.x - point.x, previous.y - point.y) > 0.01) this.active.stroke.points.push(point);

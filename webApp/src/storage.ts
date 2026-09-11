@@ -144,7 +144,7 @@ function validateNotebookSnapshot(value: unknown, expectedID?: string): Notebook
   });
 }
 
-function validatePageSnapshot(value: unknown, expectedID?: string, expectedRevision?: number, allowConflictOf = true): NotePage {
+function validatePageSnapshot(value: unknown, expectedID?: string, expectedRevision?: number, allowConflictOf = true, timing: "strict" | "local" = "strict"): NotePage {
   const raw = record(value, "Page snapshot");
   const pageID = requireUUID(raw.id, "Page ID");
   if (expectedID && pageID !== requireUUID(expectedID, "Entity ID")) throw new Error("Page payload ID does not match entity ID");
@@ -183,7 +183,10 @@ function validatePageSnapshot(value: unknown, expectedID?: string, expectedRevis
       const x = finiteNumber(point.x, "Point x");
       const y = finiteNumber(point.y, "Point y");
       const pressure = finiteNumber(point.pressure, "Point pressure");
-      const time = nonNegativeInteger(point.time, "Point time");
+      let time = nonNegativeInteger(point.time, "Point time");
+      // Repair browser event ordering on local saves without changing ink geometry.
+      // Remote snapshots and immutable outbox operations remain strictly validated.
+      if (timing === "local") time = Math.max(previousTime, time);
       if (pressure < 0 || pressure > 1 || time < previousTime) throw new Error("Stroke point values are invalid");
       previousTime = time;
       for (const tiltName of ["tiltX", "tiltY"] as const) {
@@ -582,7 +585,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
   }
 
   private savePageRow(page: NotePage, queue: boolean): SaveResult {
-    const normalized = validatePageSnapshot(page, page.id);
+    const normalized = validatePageSnapshot(page, page.id, undefined, true, "local");
     const existing = this.pageFromRow(this.row(normalized.id, "pages"));
     // Local edits do not mint server revisions. Keep the last acknowledged one.
     const baseRevision = existing?.revision ?? normalized.revision;

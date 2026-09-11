@@ -51,6 +51,19 @@ beforeEach(() => {
 afterEach(() => { document.body.innerHTML = ""; vi.unstubAllGlobals(); });
 
 describe("PaperCanvas pointer contract", () => {
+  it("keeps point times monotonic across stale coalesced samples and pointerup", () => {
+    const { canvas, changes, canvasController } = setup();
+    canvas.dispatchEvent(pointer("pointerdown", { timeStamp: 100, clientX: 10 }));
+    canvas.dispatchEvent(pointer("pointermove", { timeStamp: 140, getCoalescedEvents: () => [
+      pointer("pointermove", { timeStamp: 130, clientX: 20 }),
+      pointer("pointermove", { timeStamp: 120, clientX: 30 }),
+    ] }));
+    canvas.dispatchEvent(pointer("pointerup", { timeStamp: 110, clientX: 40 }));
+    expect(changes.mock.lastCall![0][0].points.map((point: { time: number }) => point.time)).toEqual([0, 30, 30, 30]);
+    expect(changes.mock.lastCall![0][0].points.map((point: { x: number }) => point.x)).toEqual([20, 40, 60, 80]);
+    canvasController.destroy();
+  });
+
   it("stores translucent highlighter strokes and round-trips undo/redo", () => {
     const { canvas, changes, canvasController } = setup();
     canvasController.setTool({ kind: "highlighter", color: 0xfff2ca52, width: 18 });
