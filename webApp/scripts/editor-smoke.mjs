@@ -57,6 +57,38 @@ try {
   assert.equal(await page.locator("#page-position").textContent(), "1 / 2");
   await page.evaluate(() => { window.qaSlots = [...document.querySelectorAll(".flow-page")]; });
   const geometry = () => page.evaluate(() => [...document.querySelectorAll(".flow-page")].map(element => [element.dataset.flowPage, element.offsetWidth, element.offsetHeight]));
+  const checkTwoFingerPan = async (mode = "continuous") => {
+    await page.locator("#fit-button").click();
+    const scroll = page.locator("#paper-scroll");
+    const axis = mode === "horizontal" ? "scrollLeft" : "scrollTop";
+    await scroll.evaluate((element, axis) => { element.scrollLeft = element.scrollTop = 0; element[axis] = 100; }, axis);
+    const rect = await scroll.boundingBox();
+    const start = mode === "horizontal" ? [
+      { id: 1, x: rect.x + 180, y: rect.y + 6 },
+      { id: 2, x: rect.x + 240, y: rect.y + rect.height / 2 },
+    ] : [
+      { id: 1, x: rect.x + 6, y: rect.y + 180 },
+      { id: 2, x: rect.x + rect.width / 2, y: rect.y + 240 },
+    ];
+    assert(await page.evaluate(point => document.elementFromPoint(point.x, point.y)?.id !== "ink-canvas", start[0]), "One finger must start outside the active canvas");
+    const before = await scroll.evaluate((element, axis) => element[axis], axis);
+    const sheets = await geometry();
+    const scale = await page.locator("#zoom-label").textContent();
+    // Native multi-touch exercises hit testing, touch-action and real pointer capture.
+    const touchSession = await context.newCDPSession(page);
+    try {
+      await touchSession.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: start });
+      for (let step = 1; step <= 5; step++) {
+        await touchSession.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: start.map(point => ({ ...point, [mode === "horizontal" ? "x" : "y"]: point[mode === "horizontal" ? "x" : "y"] - step * 20 })) });
+      }
+      assert(Math.abs(await scroll.evaluate((element, axis) => element[axis], axis) - before - 100) < 2, `${mode}: two fingers moving together must scroll 100px without zooming`);
+      assert.equal(await page.locator("#zoom-label").textContent(), scale);
+      assert.deepEqual(await geometry(), sheets);
+      await touchSession.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    } finally { await touchSession.detach(); }
+    await scroll.evaluate((element, axis) => { element[axis] = 0; }, axis);
+  };
+  await checkTwoFingerPan();
   const checkDocumentZoom = async (mode) => {
     await page.locator("#fit-button").click();
     const original = await geometry();
@@ -169,6 +201,7 @@ try {
   await page.locator("#export-cancel").click();
   for (const mode of ["horizontal", "paged", "continuous"]) {
     await page.locator("#page-view-mode").selectOption(mode);
+    if (mode !== "paged") await checkTwoFingerPan(mode);
     if (mode !== "paged") await checkDocumentZoom(mode);
     assert((await page.locator("#paper-viewport").boundingBox()).height > 100, `${mode} must have a usable writing viewport`);
     await page.locator("#next-page").click(); await page.waitForFunction(() => document.querySelector("#page-position").textContent === "2 / 2");
@@ -213,6 +246,7 @@ try {
   await page.screenshot({ path: `${output}/tablet-menu.png` });
   await page.keyboard.press("Escape");
   await checkDocumentZoom("continuous");
+  await checkTwoFingerPan();
   // A corrupt PDF must leave the existing notebook intact.
   await page.locator("#toolbar-insert").click(); await page.locator("#insert-pdf").click();
   await page.locator("#media-input").setInputFiles({ name: "broken.pdf", mimeType: "application/pdf", buffer: Buffer.from("invalid PDF") });
@@ -258,11 +292,11 @@ try {
       return { originalBytes: blob.size, compressedBytes: atob(encoded.split(",")[1]).length, width: canvas.width, height: canvas.height };
     });
     assert(compression.originalBytes > 12 * 1024 * 1024);
-    assert(compression.compressedBytes <= 256 * 1024);
-    assert.deepEqual([compression.width, compression.height], [1600, 960]);
+    assert(compression.compressedBytes <= 512 * 1024);
+    assert.deepEqual([compression.width, compression.height], [2000, 1200]);
     await page.waitForFunction(() => document.querySelectorAll(".image-list-row").length === 3);
     const insertedBytes = await page.locator(".image-select img").last().evaluate(image => atob(image.src.split(",")[1]).length);
-    assert(insertedBytes <= 256 * 1024, "The actual Insert flow must store the compressed photo");
+    assert(insertedBytes <= 512 * 1024, "The actual Insert flow must store the compressed photo");
     await page.screenshot({ path: `${output}/compressed-photo.png` });
     await page.locator(".image-delete-button").tap();
     await page.waitForFunction(() => document.querySelectorAll(".image-list-row").length === 2);

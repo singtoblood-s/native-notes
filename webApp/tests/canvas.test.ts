@@ -24,7 +24,7 @@ function setup(): {
   paper.append(canvas);
   document.body.append(viewport);
   const viewportRect = { width: 800, height: 600, top: 0 };
-  Object.defineProperty(viewport, "getBoundingClientRect", { value: () => ({ left: 0, top: viewportRect.top, width: viewportRect.width, height: viewportRect.height, right: viewportRect.width, bottom: viewportRect.height }) });
+  Object.defineProperty(viewport, "getBoundingClientRect", { configurable: true, value: () => ({ left: 0, top: viewportRect.top, width: viewportRect.width, height: viewportRect.height, right: viewportRect.width, bottom: viewportRect.height }) });
   Object.defineProperty(canvas, "getBoundingClientRect", { value: () => ({ left: 0, top: 0, width: 512, height: 683, right: 512, bottom: 683 }) });
   const changes = vi.fn();
   const canvasController = new PaperCanvas(canvas, paper, viewport, { onChange: changes, onZoom: vi.fn() });
@@ -87,6 +87,33 @@ describe("PaperCanvas pointer contract", () => {
     const before = transformOf(paper);
     canvasController.setPage("next", 1024, 1366, "blank", []);
     expect(transformOf(paper)).toEqual(before);
+    canvasController.destroy();
+  });
+  it.each(["continuous", "horizontal"] as const)("pans with two fingers across page previews and gutters in %s mode", (mode) => {
+    const { canvasController, canvas, viewport, changes } = setup();
+    const scroll = document.createElement("div");
+    const preview = document.createElement("canvas");
+    document.body.append(scroll);
+    scroll.append(viewport, preview);
+    Object.defineProperty(scroll, "getBoundingClientRect", { value: () => ({ width: 800, height: 600, left: 0, top: 0 }) });
+    Object.defineProperty(viewport, "getBoundingClientRect", { configurable: true, value: () => ({ width: 800, height: 1067, left: -scroll.scrollLeft, top: -scroll.scrollTop }) });
+    canvasController.setNavigationMode(mode, scroll);
+    canvasController.setPage("flow", 1024, 1366, "blank", []);
+    const scale = canvasController.currentScale;
+    preview.dispatchEvent(pointer("pointerdown", { pointerId: 90, pointerType: "touch", clientX: 300, clientY: 300 }));
+    scroll.dispatchEvent(pointer("pointerdown", { pointerId: 91, pointerType: "touch", clientX: 500, clientY: 300 }));
+    // Each finger reports separately, and the page origin moves with the scroller.
+    preview.dispatchEvent(pointer("pointermove", { pointerId: 90, pointerType: "touch", clientX: 250, clientY: 200 }));
+    scroll.dispatchEvent(pointer("pointermove", { pointerId: 91, pointerType: "touch", clientX: 450, clientY: 200 }));
+    expect(canvasController.currentScale).toBeCloseTo(scale);
+    expect(scroll.scrollLeft).toBeCloseTo(50);
+    expect(scroll.scrollTop).toBeCloseTo(100);
+    preview.dispatchEvent(pointer("pointercancel", { pointerId: 90, pointerType: "touch" }));
+    scroll.dispatchEvent(pointer("pointercancel", { pointerId: 91, pointerType: "touch" }));
+    expect(canvasController.isInputActive).toBe(false);
+    expect(changes).not.toHaveBeenCalled();
+    canvas.dispatchEvent(new WheelEvent("wheel", { deltaX: 20, deltaY: 30, bubbles: true, cancelable: true }));
+    expect(scroll.scrollLeft).toBeCloseTo(70);
     canvasController.destroy();
   });
   it.each(["continuous", "horizontal"] as const)("keeps shared zoom for mixed page sizes in %s mode", (mode) => {

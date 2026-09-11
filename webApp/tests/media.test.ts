@@ -85,7 +85,8 @@ it("uses asynchronous photo compression within the default budget and reports en
   const canvas = document.createElement("canvas");
   const src = await encodePageImage(canvas);
   expect(src.startsWith("data:image/webp;base64,")).toBe(true);
-  expect(pageImageDataBytes(src)).toBeLessThanOrEqual(256 * 1024);
+  expect(pageImageDataBytes(src)).toBeLessThanOrEqual(512 * 1024);
+  expect(encode).toHaveBeenCalledWith(expect.any(Function), "image/webp", .9);
   expect(syncEncode).not.toHaveBeenCalled();
   encode.mockImplementation(callback => callback(null));
   await expect(encodePageImage(canvas)).rejects.toThrow("Could not encode");

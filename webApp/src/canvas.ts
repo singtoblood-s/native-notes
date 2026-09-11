@@ -225,6 +225,11 @@ export class PaperCanvas {
     const staticContext = this.staticCanvas.getContext("2d");
     if (!staticContext) throw new Error("This browser cannot create an off-screen canvas.");
     this.staticContext = staticContext;
+    // Let the compositor retain the page image underneath live ink. Copying the
+    // entire page into the input canvas on every highlight frame is costly on iPad.
+    this.staticCanvas.className = "paper-background-canvas";
+    this.staticCanvas.setAttribute("aria-hidden", "true");
+    this.paper.insertBefore(this.staticCanvas, this.canvas);
     // The canvas owns all touch gestures. This also prevents browser navigation
     // and native page scrolling from stealing a pen/pinch sequence.
     this.updateTouchAction();
@@ -240,7 +245,7 @@ export class PaperCanvas {
     this.canvas.addEventListener("pointerenter", this.handlePenPresence);
     this.canvas.addEventListener("pointerout", this.handlePointerOut);
     this.canvas.addEventListener("pointerleave", this.handlePointerOut);
-    this.canvas.addEventListener("wheel", this.handleWheel, { passive: false });
+    this.bindScrollGestures(this.scrollViewport);
     document.addEventListener("contextmenu", this.handleContextMenu);
     document.addEventListener("selectstart", this.handleSelectStart);
     window.addEventListener("blur", this.handleWindowBlur);
@@ -294,7 +299,11 @@ export class PaperCanvas {
     this.navigationMode = mode;
     this.needsFit = true;
     this.stopMomentum();
-    if (scrollViewport) this.scrollViewport = scrollViewport;
+    if (scrollViewport && scrollViewport !== this.scrollViewport) {
+      this.unbindScrollGestures(this.scrollViewport);
+      this.scrollViewport = scrollViewport;
+      this.bindScrollGestures(this.scrollViewport);
+    }
     this.resizeObserver?.disconnect();
     this.resizeObserver?.observe(this.navigationMode === "paged" ? this.viewport : this.scrollViewport);
     this.clearTouchNavigation();
@@ -429,6 +438,9 @@ export class PaperCanvas {
   destroy(): void {
     this.stopMomentum();
     this.cancelActiveInput(false, false);
+    this.staticCanvas.remove();
+    this.staticCanvas.width = this.staticCanvas.height = 1;
+    this.imageCache.clear();
     window.removeEventListener("resize", this.handleResize);
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
@@ -444,7 +456,7 @@ export class PaperCanvas {
     this.canvas.removeEventListener("pointerenter", this.handlePenPresence);
     this.canvas.removeEventListener("pointerout", this.handlePointerOut);
     this.canvas.removeEventListener("pointerleave", this.handlePointerOut);
-    this.canvas.removeEventListener("wheel", this.handleWheel);
+    this.unbindScrollGestures(this.scrollViewport);
     document.removeEventListener("contextmenu", this.handleContextMenu);
     document.removeEventListener("selectstart", this.handleSelectStart);
     window.removeEventListener("blur", this.handleWindowBlur);
@@ -525,10 +537,37 @@ export class PaperCanvas {
   // touch-action:none and pointer-event preventDefault already in place:
   // https://mikepk.com/2020/10/iOS-safari-scribble-bug/
   // Keep this on the active canvas: Pointer Events own its ink/pan/pinch,
-  // while neighbouring page previews still need native finger scrolling.
+  // while neighbouring page previews share the outer surface's pointer gestures.
   // This does not disable Scribble or recover events the OS never dispatches.
   private readonly handleNativeTouchMove = (event: TouchEvent): void => {
     if (event.cancelable) event.preventDefault();
+  };
+
+  private bindScrollGestures(surface: HTMLElement): void {
+    for (const type of ["pointerdown", "pointermove", "pointerup", "pointercancel"] as const) {
+      surface.addEventListener(type, this.handleSurfaceTouch, { capture: true, passive: false });
+    }
+    surface.addEventListener("wheel", this.handleWheel, { passive: false });
+  }
+
+  private unbindScrollGestures(surface: HTMLElement): void {
+    for (const type of ["pointerdown", "pointermove", "pointerup", "pointercancel"] as const) {
+      surface.removeEventListener(type, this.handleSurfaceTouch, true);
+    }
+    surface.removeEventListener("wheel", this.handleWheel);
+  }
+
+  /** Fingers can start on different sheets or in the gutter; they share one gesture. */
+  private readonly handleSurfaceTouch = (event: PointerEvent): void => {
+    if (event.pointerType !== "touch" || event.target === this.canvas) return;
+    if (event.type === "pointerdown") {
+      if (event.target instanceof Element && event.target.closest("button, input, select, textarea, a, .paper-image-object")) return;
+      this.handlePointerDown(event);
+    } else if (this.touchPointers.has(event.pointerId)) {
+      if (event.type === "pointermove") this.handlePointerMove(event);
+      else if (event.type === "pointerup") this.handlePointerUp(event);
+      else this.handlePointerCancel(event);
+    }
   };
 
   private readonly handlePointerDown = (event: PointerEvent): void => {
@@ -1111,7 +1150,6 @@ export class PaperCanvas {
     this.context.save();
     this.context.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     this.context.clearRect(0, 0, this.width, this.height);
-    this.context.drawImage(this.staticCanvas, 0, 0, this.width, this.height);
     if (this.active) this.renderStroke(this.context, this.active.stroke);
     this.renderedPointCount = this.active?.stroke.points.length ?? 0;
     this.context.restore();

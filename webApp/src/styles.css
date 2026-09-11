@@ -214,6 +214,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .flow-add-page:hover:not(:disabled) { border-color: var(--accent); background: var(--paper); }
 .page-flow[data-view-mode="paged"] .flow-page.flow-preview { display: none; }
 .paper-image-layer { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+.paper-background-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .paper-image-object { position: absolute; border: 2px solid transparent; touch-action: none; }
 .paper-image-object.selected { border-color: var(--accent); box-shadow: 0 0 0 1px #fff; }
 .image-delete-button { position: absolute; top: 4px; right: 4px; z-index: 2; width: 44px; height: 44px; padding: 0; border: 2px solid #fff; border-radius: 50%; background: var(--accent); color: #fff; font-size: 26px; line-height: 1; pointer-events: auto; cursor: pointer; touch-action: manipulation; }
@@ -560,7 +561,7 @@ body.drawer-open { overflow: hidden; }
 .flow-preview-canvas { height: 100%; aspect-ratio: inherit; }
 .flow-page.flow-preview { transition: none; }
 .flow-page.flow-preview:hover, .flow-page.flow-preview:focus-visible { transform: none; }
-.paper-scroll { overflow-anchor: none; }
+.paper-scroll { overflow-anchor: none; touch-action: none; }
 .quick-menu { max-height: min(70dvh, 540px); overflow-y: auto; }
 .quick-menu button { min-height: 44px; font-size: 13px; }
 .clipboard-menu { position: fixed; z-index: 150; max-width: calc(100vw - 16px); }
