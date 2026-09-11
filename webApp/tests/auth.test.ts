@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { AuthSession, getEndpoint, setEndpoint } from "../src/auth";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AuthSession, LEGACY_API_URL, getEndpoint, resolveStorageAccountKey, setEndpoint, workspaceAccountKey } from "../src/auth";
 
 const response = (id: string, identifier = `${id}@example.test`) => ({
   user: { id, identifier },
@@ -17,6 +17,7 @@ describe("account-bound browser sessions", () => {
   afterEach(() => {
     localStorage.clear();
     sessionStorage.clear();
+    vi.unstubAllEnvs();
   });
 
   it("normalizes HTTPS server paths and rejects remote HTTP", () => {
@@ -87,5 +88,60 @@ describe("account-bound browser sessions", () => {
     expect(restored.workspaceIdentifier).toBeNull();
     expect(restored.boundEndpoint).toBeNull();
     expect(localStorage.getItem("notepad.workspace")).toBeNull();
+  });
+
+  it("migrates a persisted legacy endpoint when the build has a valid canonical HTTPS endpoint", () => {
+    vi.stubEnv("VITE_API_URL", "https://d1.example.test/api/");
+    vi.stubEnv("VITE_LEGACY_API_URL", LEGACY_API_URL);
+    localStorage.setItem("notepad.endpoint", `${LEGACY_API_URL}/`);
+
+    expect(getEndpoint()).toBe("https://d1.example.test/api");
+    expect(localStorage.getItem("notepad.endpoint")).toBe("https://d1.example.test/api");
+  });
+
+  it("keeps a legacy account workspace offline under the canonical key and drops its old token", () => {
+    vi.stubEnv("VITE_API_URL", "https://d1.example.test");
+    vi.stubEnv("VITE_LEGACY_API_URL", LEGACY_API_URL);
+    const userID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    localStorage.setItem("notepad.endpoint", LEGACY_API_URL);
+    localStorage.setItem("notepad.workspaces", JSON.stringify([{ endpoint: LEGACY_API_URL, userID, identifier: "old@example.test" }]));
+    localStorage.setItem("notepad.active-workspace", `${LEGACY_API_URL}:${userID}`);
+    sessionStorage.setItem("notepad.session", JSON.stringify({ ...response(userID), endpoint: LEGACY_API_URL }));
+
+    const restored = new AuthSession();
+
+    expect(restored.session).toBeNull();
+    expect(restored.workspaceKey).toBe(`https://d1.example.test:${userID}`);
+    expect(restored.boundEndpoint).toBe("https://d1.example.test");
+    expect(sessionStorage.getItem("notepad.session")).toBeNull();
+    expect(localStorage.getItem("notepad.endpoint")).toBe("https://d1.example.test");
+    expect(localStorage.getItem("notepad.active-workspace")).toBe(`https://d1.example.test:${userID}`);
+    expect(restored.savedWorkspaces[0]).toMatchObject({ endpoint: "https://d1.example.test", userID });
+  });
+
+  it("maps only the canonical account namespace to the known legacy endpoint", () => {
+    vi.stubEnv("VITE_API_URL", "https://d1.example.test");
+    vi.stubEnv("VITE_LEGACY_API_URL", LEGACY_API_URL);
+    const userID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    expect(resolveStorageAccountKey(workspaceAccountKey("https://d1.example.test", userID))).toBe(`${LEGACY_API_URL}:${userID}`);
+    expect(resolveStorageAccountKey(workspaceAccountKey("https://other.example.test", userID))).toBe(`https://other.example.test:${userID}`);
+  });
+
+  it("does not alias the legacy namespace without the explicit migration flag", () => {
+    vi.stubEnv("VITE_API_URL", "https://d1.example.test");
+    vi.stubEnv("VITE_LEGACY_API_URL", "");
+    const userID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    localStorage.removeItem("notepad.endpoint");
+    expect(getEndpoint()).toBe("https://d1.example.test");
+    expect(resolveStorageAccountKey(workspaceAccountKey("https://d1.example.test", userID))).toBe(`https://d1.example.test:${userID}`);
+    expect(setEndpoint(LEGACY_API_URL)).toBe(LEGACY_API_URL);
+  });
+
+  it("rejects an arbitrary legacy value even when the migration flag is present", () => {
+    vi.stubEnv("VITE_API_URL", "https://d1.example.test");
+    vi.stubEnv("VITE_LEGACY_API_URL", "https://old.example.test");
+    const userID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    expect(resolveStorageAccountKey(workspaceAccountKey("https://d1.example.test", userID))).toBe(`https://d1.example.test:${userID}`);
+    expect(setEndpoint(LEGACY_API_URL)).toBe(LEGACY_API_URL);
   });
 });

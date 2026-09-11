@@ -25,6 +25,9 @@ node_modules/
 .idea/
 .vscode/
 .local/
+.wrangler/
+__pycache__/
+*.py[cod]
 .swiftpm/
 DerivedData/
 *.xcuserstate

@@ -1,5 +1,6 @@
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import sqliteWasmUrl from "@sqlite.org/sqlite-wasm/sqlite3.wasm?url";
+import { resolveStorageAccountKey } from "./auth";
 import {
   ConflictCopy,
   INK_FORMAT_VERSION,
@@ -360,7 +361,7 @@ async function acquireExclusiveLock(name: string): Promise<ExclusiveLock> {
 export async function accountNamespace(accountKey: string): Promise<string> {
   const subtle = globalThis.crypto?.subtle;
   if (!subtle) throw new PersistenceUnavailableError("Web Crypto is required for account-isolated storage");
-  const encoded = new TextEncoder().encode(`inknote:v1:${accountKey}`);
+  const encoded = new TextEncoder().encode(`inknote:v1:${resolveStorageAccountKey(accountKey)}`);
   const digest = await subtle.digest("SHA-256", encoded);
   return Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, "0")).join("");
 }

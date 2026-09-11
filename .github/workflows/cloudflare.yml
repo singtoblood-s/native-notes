@@ -1,0 +1,37 @@
+name: NotePad Cloudflare worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cloudflare/**"
+      - "scripts/export-d1.py"
+      - ".github/workflows/cloudflare.yml"
+  pull_request:
+    paths:
+      - "cloudflare/**"
+      - "scripts/export-d1.py"
+      - ".github/workflows/cloudflare.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloudflare
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cloudflare/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: python3 scripts/export-d1.py --self-test
+        working-directory: .

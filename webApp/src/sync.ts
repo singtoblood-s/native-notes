@@ -12,9 +12,10 @@ import {
 import { fetchWithTimeout, getEndpoint, parseJSON, readError } from "./auth";
 import { NoteStore } from "./storage";
 
-const MAX_PUSH_OPERATIONS = 100;
+const MAX_PUSH_OPERATIONS = 10;
+const MAX_PULL_CHANGES = 100;
 const MAX_PUSH_BYTES = 3 * 1024 * 1024;
-const MAX_OPERATION_PAYLOAD_BYTES = 2 * 1024 * 1024;
+const MAX_OPERATION_PAYLOAD_BYTES = 1_900_000;
 const MAX_PULL_PAGES = 1000;
 
 export interface SyncReport {
@@ -188,7 +189,7 @@ export class SyncClient {
       const cursor = await store.getCursor();
       let pull: PullResponse;
       try {
-        pull = await this.request<PullResponse>(`${endpoint}/v1/sync/pull?cursor=${encodeURIComponent(String(cursor))}&limit=${MAX_PUSH_OPERATIONS}`, token, { method: "GET" });
+        pull = await this.request<PullResponse>(`${endpoint}/v1/sync/pull?cursor=${encodeURIComponent(String(cursor))}&limit=${MAX_PULL_CHANGES}`, token, { method: "GET" });
       } catch (error) {
         if (error instanceof SyncHttpError && error.status === 409 && error.code === "cursor_expired" && !cursorReset) {
           cursorReset = true;
