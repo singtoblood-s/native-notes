@@ -409,6 +409,8 @@ class NotePadApp {
     }, { signal });
     onClick("browse-import", () => byId<HTMLInputElement>("import-input").click());
     onClick("settings-export", () => this.exportArchive());
+    onClick("saved-versions", () => { void this.openSavedVersions(); });
+    onClick("close-versions", () => this.closeDialog("versions-dialog"));
     onClick("settings-share", () => this.shareArchive());
     onClick("reload-app", () => { void this.reloadApp(); });
     byId<HTMLInputElement>("import-input").addEventListener("change", (event) => this.importArchive(event));
@@ -675,6 +677,31 @@ class NotePadApp {
   private async selectPageForAction(id: string): Promise<void> {
     if (id === this.currentPage?.id) return;
     await this.selectPage(id);
+  }
+
+  private async openSavedVersions(): Promise<void> {
+    const store = this.store;
+    try {
+      const versions = await store.listConflicts();
+      if (store !== this.store || !this.auth.session) return;
+      byId("versions-list").innerHTML = versions.length ? [...versions].reverse().map(version => `<div class="recovery-row"><span><strong>${escapeHTML(String(version.payload.title || "Untitled"))}</strong><small>${escapeHTML(version.entityType)} · ${escapeHTML(new Date(version.createdAt).toLocaleString())}</small></span><button type="button" class="outline-button compact" data-export-version="${escapeAttr(version.id)}">Export</button></div>`).join("") : "<p>No saved versions yet.</p>";
+      byId("versions-list").onclick = async event => {
+        const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-export-version]");
+        const version = versions.find(item => item.id === button?.dataset.exportVersion);
+        if (!version || store !== this.store || !this.auth.session) return;
+        try {
+          const notebook = version.entityType === "notebook" ? version.payload as unknown as Notebook
+            : await store.getNotebook(String(version.payload.notebookId)) ?? { ...createNotebook("Restored notes"), id: String(version.payload.notebookId) };
+          const archive: Archive = { version: 1, exportedAt: now(), account: store.accountKey,
+            notebooks: [{ ...notebook, deletedAt: null }],
+            pages: version.entityType === "page" ? [{ ...version.payload as unknown as NotePage, deletedAt: null, conflictOf: undefined }] : [] };
+          if (store !== this.store || !this.auth.session) return;
+          download(new Blob([JSON.stringify(archive)], { type: "application/json" }), `saved-version-${version.id}.notepad.json`);
+        } catch (error) { byId("versions-message").textContent = error instanceof Error ? error.message : "Could not export this version."; }
+      };
+      byId("versions-message").textContent = "";
+      this.openDialog("versions-dialog");
+    } catch (error) { byId("settings-message").textContent = error instanceof Error ? error.message : "Could not read saved versions."; }
   }
 
   private openSettings(): void {
@@ -2277,18 +2304,18 @@ class NotePadApp {
   private async afterCoordinatorSyncAtGeneration(context: SyncCompleteContext, expectedGeneration: number): Promise<void> {
     if (context.store !== this.store) return;
     if (this.canvasInputActive() || expectedGeneration !== this.editGeneration || this.unsavedPageID !== null || this.saveTimer !== null || this.saveInFlight !== null) {
-      if (context.report.pulled > 0 || context.report.conflicts > 0) this.queueRemoteRefresh(context);
+      if (context.report.pulled > 0 || context.report.conflicts > 0 || (context.report.cleaned ?? 0) > 0) this.queueRemoteRefresh(context);
       return;
     }
     if (context.store !== this.store || expectedGeneration !== this.editGeneration || this.unsavedPageID !== null || this.saveTimer !== null || this.saveInFlight !== null || this.canvasInputActive()) {
-      if (context.report.pulled > 0 || context.report.conflicts > 0) this.queueRemoteRefresh(context);
+      if (context.report.pulled > 0 || context.report.conflicts > 0 || (context.report.cleaned ?? 0) > 0) this.queueRemoteRefresh(context);
       return;
     }
-    if (context.report.pulled > 0 || context.report.conflicts > 0) {
+    if (context.report.pulled > 0 || context.report.conflicts > 0 || (context.report.cleaned ?? 0) > 0) {
       const generation = this.editGeneration;
       const reloaded = await this.reload(this.currentPage?.id, { store: context.store, generation });
       if (!reloaded) {
-        if (context.report.pulled > 0 || context.report.conflicts > 0) this.queueRemoteRefresh(context);
+        if (context.report.pulled > 0 || context.report.conflicts > 0 || (context.report.cleaned ?? 0) > 0) this.queueRemoteRefresh(context);
         return;
       }
     }
@@ -2296,7 +2323,7 @@ class NotePadApp {
   }
 
   private queueRemoteRefresh(context: SyncCompleteContext): void {
-    if (context.store !== this.store || (context.report.pulled === 0 && context.report.conflicts === 0)) return;
+    if (context.store !== this.store || (context.report.pulled === 0 && context.report.conflicts === 0 && !context.report.cleaned)) return;
     this.pendingRemoteRefresh = { store: context.store, conflicts: context.report.conflicts };
     this.scheduleRemoteRefresh();
   }
@@ -2564,8 +2591,21 @@ class NotePadApp {
   }
 }
 
-function toolIcon(name: "hand" | "pen" | "highlighter" | "eraser" | "line"): string {
+function toolIcon(name: "hand" | "pen" | "highlighter" | "eraser" | "line" | "book" | "search" | "star" | "settings" | "user" | "trash" | "list" | "picture" | "file" | "upload" | "plus" | "undo" | "redo"): string {
   const paths = {
+    book: '<rect x="4" y="3" width="16" height="19" rx="2"/><path d="M8 3v19M12 8h4M12 12h4"/>',
+    search: '<circle cx="10" cy="10" r="6.5"/><path d="m15 15 6 6"/>',
+    star: '<path d="m12 3 3 6 7 1-5 5 1 7-6-3-6 3 1-7-5-5 7-1Z"/>',
+    settings: '<path d="M4 7h16M4 13h16M4 19h16"/><path d="M8 4v6M16 10v6M10 16v6"/>',
+    user: '<circle cx="12" cy="8" r="4"/><path d="M4 22v-2a8 8 0 0 1 16 0v2"/>',
+    trash: '<path d="M3 6h18M9 6V3h6v3M5 6l1 16h12l1-16M10 10v8M14 10v8"/>',
+    list: '<path d="M9 6h12M9 13h12M9 20h12M3 6h1M3 13h1M3 20h1"/>',
+    picture: '<rect x="3" y="4" width="18" height="18" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m3 19 6-5 4 3 4-6 4 6"/>',
+    file: '<path d="M14 3H5v20h14V8l-5-5Zm0 0v5h5M8 13h8M8 17h6"/>',
+    upload: '<path d="M12 17V3m-5 5 5-5 5 5M4 16v6h16v-6"/>',
+    plus: '<path d="M12 5v16M4 13h16"/>',
+    undo: '<path d="m8 5-5 5 5 5M3 10h11a7 7 0 0 1 0 14"/>',
+    redo: '<path d="m16 5 5 5-5 5M21 10H10a7 7 0 0 0 0 14"/>',
     hand: '<path d="M8 13V6a2 2 0 0 1 4 0v6-8a2 2 0 0 1 4 0v8-5a2 2 0 0 1 4 0v8c0 5-3 7-6 7h-1c-2 0-3-1-5-3l-4-5a2 2 0 0 1 3-2l1 1Z"/>',
     pen: '<path d="m4 20 2-7L17 2l5 5L11 18l-7 2Zm2-7 5 5M14 5l5 5M4 20l4-4"/>',
     highlighter: '<path d="m5 12 9-10 7 7-9 10-7-7Zm2 2-4 5 2 2 5-4M2 23h17"/>',
@@ -2587,28 +2627,28 @@ function shellMarkup(auth: AuthSession): string {
       <div class="sidebar-bottom"><button class="utility-row" id="recovery-toggle" aria-pressed="false"><span>↺</span><span id="recovery-label">Recovered copies</span><span class="utility-count" id="recovery-count" hidden>0</span></button><button class="utility-row" id="trash-toggle" aria-pressed="false"><span>♢</span><span id="trash-label">Trash</span></button><button class="utility-row" id="settings-button"><span>⌘</span> Settings</button></div>
     </aside>
     <main class="library" id="library" aria-label="Notebook library">
-      <header class="library-header"><a class="library-brand" href="${BASE}">NotePad</a><div><button class="sync-status" id="library-sync-button" data-sync-button aria-label="Sign in required"><span id="library-sync-icon" data-sync-icon>·</span><span id="library-sync-label" data-sync-label>Sign in required</span></button><button id="library-trash" class="library-icon" aria-label="Open trash">♢</button><button id="library-settings" class="library-icon" aria-label="Library settings">⚙</button><button id="library-account" class="library-icon" aria-label="Library account">○</button></div></header>
-      <section class="library-body"><div class="library-heading"><div><h1 id="library-title" tabindex="-1">Documents</h1><span id="library-count">0 notebooks</span></div><button class="library-new" id="library-new">＋ New…</button></div>
-        <div class="library-controls"><label class="library-search"><span aria-hidden="true">⌕</span><input type="search" id="library-search" aria-label="Search library" placeholder="Search notebooks and typed notes" /></label><label class="library-sort">Sort by <select id="library-sort" aria-label="Sort notebooks"><option value="modified">Last edited</option><option value="name">Name</option></select></label><button class="library-icon" id="library-layout" aria-label="List view" aria-pressed="false">☷</button></div>
+      <header class="library-header"><a class="library-brand" href="${BASE}"><span class="library-brand-mark" aria-hidden="true">${toolIcon("book")}</span>NotePad</a><div><button class="sync-status" id="library-sync-button" data-sync-button aria-label="Sign in required"><span id="library-sync-icon" data-sync-icon>·</span><span id="library-sync-label" data-sync-label>Sign in required</span></button><button id="library-trash" class="library-icon" aria-label="Open trash">${toolIcon("trash")}</button><button id="library-settings" class="library-icon" aria-label="Library settings">${toolIcon("settings")}</button><button id="library-account" class="library-icon" aria-label="Library account">${toolIcon("user")}</button></div></header>
+      <section class="library-body"><div class="library-heading"><div><span class="library-kicker">YOUR WORKSPACE</span><h1 id="library-title" tabindex="-1">Documents</h1><span id="library-count">0 notebooks</span></div><button class="library-new" id="library-new">${toolIcon("plus")}<span>New document</span></button></div>
+        <div class="library-controls"><label class="library-search"><span aria-hidden="true">${toolIcon("search")}</span><input type="search" id="library-search" aria-label="Search library" placeholder="Search notebooks and typed notes" /></label><label class="library-sort">Sort by <select id="library-sort" aria-label="Sort notebooks"><option value="modified">Last edited</option><option value="name">Name</option></select></label><button class="library-icon" id="library-layout" aria-label="List view" aria-pressed="false">${toolIcon("list")}</button></div>
         <div class="library-books" id="library-books"></div><p class="library-empty" id="library-empty" role="status" hidden></p>
       </section>
-      <nav class="library-tabs" aria-label="Library sections"><button id="library-documents" aria-current="page"><span aria-hidden="true">▱</span>Documents</button><button id="library-tab-search" aria-current="false"><span aria-hidden="true">⌕</span>Search</button><button id="library-favorites" aria-current="false"><span aria-hidden="true">☆</span>Favorites</button></nav>
+      <nav class="library-tabs" aria-label="Library sections"><button id="library-documents" aria-current="page"><span aria-hidden="true">${toolIcon("book")}</span>Documents</button><button id="library-tab-search" aria-current="false"><span aria-hidden="true">${toolIcon("search")}</span>Search</button><button id="library-favorites" aria-current="false"><span aria-hidden="true">${toolIcon("star")}</span>Favorites</button></nav>
     </main>
     <main class="workspace" id="editor-workspace" hidden>
-      <header class="topbar"><div class="topbar-leading"><button class="back-library" id="back-library" aria-label="Back to Documents">‹ <span>Documents</span></button><button class="drawer-trigger" id="mobile-menu" aria-controls="sidebar" aria-expanded="false"><span class="drawer-trigger-icon">☰</span><span>Pages</span></button><div class="crumbs"><span class="eyebrow">NOTEBOOK</span><button class="notebook-title-button" id="rename-notebook" aria-label="Rename notebook"><strong id="notebook-name">My notebook</strong><span aria-hidden="true">✎</span></button><button class="menu-trigger" id="notebook-menu" data-menu-button aria-label="Notebook actions">⋯</button><div class="quick-menu top-quick-menu" id="notebook-menu-popup" hidden><button data-action="rename-notebook" data-notebook="">Rename notebook</button><button data-action="duplicate-notebook" data-notebook="">Duplicate notebook</button><button data-action="trash-notebook" data-notebook="">Move notebook to trash</button></div></div></div><div class="top-actions"><button class="text-toggle" id="text-toggle" aria-label="Text and page details" aria-controls="inspector" aria-expanded="false"><span aria-hidden="true">T</span><span>Text</span></button><button class="sync-status" id="sync-button" data-sync-button aria-label="Sign in required"><span id="sync-icon" data-sync-icon>·</span><span id="sync-label" data-sync-label>Sign in required</span></button><button class="avatar-button" id="auth-button" aria-label="Account">○</button></div></header>
+      <header class="topbar"><div class="topbar-leading"><button class="back-library" id="back-library" aria-label="Back to Documents">‹ <span>Documents</span></button><button class="drawer-trigger" id="mobile-menu" aria-controls="sidebar" aria-expanded="false"><span class="drawer-trigger-icon">☰</span><span>Pages</span></button><div class="crumbs"><span class="eyebrow">NOTEBOOK</span><button class="notebook-title-button" id="rename-notebook" aria-label="Rename notebook"><strong id="notebook-name">My notebook</strong><span aria-hidden="true">✎</span></button><button class="menu-trigger" id="notebook-menu" data-menu-button aria-label="Notebook actions">⋯</button><div class="quick-menu top-quick-menu" id="notebook-menu-popup" hidden><button data-action="rename-notebook" data-notebook="">Rename notebook</button><button data-action="duplicate-notebook" data-notebook="">Duplicate notebook</button><button data-action="trash-notebook" data-notebook="">Move notebook to trash</button></div></div></div><div class="top-actions"><button class="text-toggle" id="text-toggle" aria-label="Text and page details" aria-controls="inspector" aria-expanded="false"><span aria-hidden="true">T</span><span>Text</span></button><button class="sync-status" id="sync-button" data-sync-button aria-label="Sign in required"><span id="sync-icon" data-sync-icon>·</span><span id="sync-label" data-sync-label>Sign in required</span></button><button class="avatar-button" id="auth-button" aria-label="Account">${toolIcon("user")}</button></div></header>
       <section class="editor-layout">
         <div class="editor-stage" id="editor-content">
-      <div class="editor-toolbar" role="toolbar" aria-label="Writing tools">
+      <div class="editor-toolbar" role="toolbar" aria-label="Writing tools"><div id="insert-menu" class="quick-menu" hidden><button id="insert-picture">Picture from device</button><button id="insert-pdf">Import PDF pages</button><button id="insert-paste">Paste picture / text</button></div>
         <div class="tool-group primary-tools">
-          <button class="tool-button" id="hand-tool" aria-label="Read and pan" title="Read & pan (V)">${toolIcon("hand")}</button>
+          <button class="tool-button" id="hand-tool" aria-label="Read and pan" title="Read & pan (V)">${toolIcon("hand")}<span class="tool-label">Read</span></button>
           <span class="toolbar-divider"></span>
-          <button class="tool-button active" id="pen-tool" aria-label="Pen tool" title="Pen (P)">${toolIcon("pen")}</button>
-          <button class="tool-button" id="highlighter-tool" aria-label="Highlighter tool" title="Highlighter (H)">${toolIcon("highlighter")}</button>
-          <button class="tool-button" id="eraser-tool" aria-label="Whole stroke eraser" title="Stroke eraser (E)">${toolIcon("eraser")}</button>
-          <button class="tool-button" id="line-tool" aria-label="Straight line tool" title="Straight line (L)">${toolIcon("line")}</button>
+          <button class="tool-button active" id="pen-tool" aria-label="Pen tool" title="Pen (P)">${toolIcon("pen")}<span class="tool-label">Pen</span></button>
+          <button class="tool-button" id="highlighter-tool" aria-label="Highlighter tool" title="Highlighter (H)">${toolIcon("highlighter")}<span class="tool-label">Highlight</span></button>
+          <button class="tool-button" id="eraser-tool" aria-label="Whole stroke eraser" title="Stroke eraser (E)">${toolIcon("eraser")}<span class="tool-label">Erase</span></button>
+          <button class="tool-button" id="line-tool" aria-label="Straight line tool" title="Straight line (L)">${toolIcon("line")}<span class="tool-label">Line</span></button>
           <span class="toolbar-divider"></span>
-          <button class="quiet-button" id="toolbar-insert" data-menu-button aria-controls="insert-menu" aria-expanded="false" aria-label="Insert picture, PDF or paste" title="Insert">⊕</button><div id="insert-menu" class="quick-menu" hidden><button id="insert-picture">Picture from device</button><button id="insert-pdf">Import PDF pages</button><button id="insert-paste">Paste picture / text</button></div><button class="quiet-button" id="toolbar-export" aria-label="Export PDF or picture" title="Export">↥</button><button class="quiet-button" id="undo-button" aria-label="Undo" title="Undo (Ctrl/⌘ Z)" disabled>↶</button>
-          <button class="quiet-button" id="redo-button" aria-label="Redo" title="Redo (Ctrl/⌘ Shift Z)" disabled>↷</button>
+          <button class="quiet-button" id="toolbar-insert" data-menu-button aria-controls="insert-menu" aria-expanded="false" aria-label="Insert picture, PDF or paste" title="Insert">${toolIcon("plus")}</button><button class="quiet-button" id="toolbar-export" aria-label="Export PDF or picture" title="Export">${toolIcon("upload")}</button><button class="quiet-button" id="undo-button" aria-label="Undo" title="Undo (Ctrl/⌘ Z)" disabled>${toolIcon("undo")}</button>
+          <button class="quiet-button" id="redo-button" aria-label="Redo" title="Redo (Ctrl/⌘ Shift Z)" disabled>${toolIcon("redo")}</button>
         </div>
         <div class="tool-group ink-options" id="ink-options">
           <select id="pen-style" aria-label="Pen style"><option value="fountain">Fountain pen</option><option value="ball">Ball pen</option></select>
@@ -2632,18 +2672,19 @@ function shellMarkup(auth: AuthSession): string {
     <dialog class="dialog" id="paste-dialog"><div class="dialog-form"><div class="dialog-head"><h2>Paste</h2><button class="icon-button" id="paste-fallback-close" aria-label="Close paste">×</button></div><p>Touch and hold the field below, then choose Paste. You can also press Ctrl/Cmd+V.</p><textarea id="paste-target" aria-label="Paste picture or text here" placeholder="Touch and hold here to paste" rows="4"></textarea></div></dialog>
     <dialog class="dialog" id="media-dialog"><div class="dialog-form"><div class="dialog-head"><h2 id="media-title">Import picture / PDF</h2><button class="icon-button" id="media-cancel" aria-label="Cancel import">×</button></div><p>Import each file or PDF page as a writable page. Handwriting stays editable. PDF text, links and forms become a page image.</p><p class="form-hint">Up to 100 pages per import. PDF: 50 MB per file. Picture: 12 MB per file. Prepared pages: 38 MB total.</p><button class="primary-button" id="media-choose">Choose files</button><input type="file" id="media-input" accept="application/pdf,.pdf,image/png,image/jpeg,image/webp,image/gif" multiple hidden /><p id="media-status" class="media-status" role="status" aria-live="polite"></p></div></dialog>
     <dialog class="dialog" id="export-dialog"><div class="dialog-form"><div class="dialog-head"><h2>Export</h2><button class="icon-button" id="export-cancel" aria-label="Cancel export">×</button></div><p>Includes paper, pictures, typed text and handwriting. PDF and PNG are flattened copies; use Export backup to keep editable notes. Text beyond the paper edge remains in the backup.</p><button class="outline-button" id="export-png">Current page · PNG picture</button><button class="outline-button" id="export-page-pdf">Current page · PDF</button><button class="outline-button" id="export-book-pdf">Whole notebook · PDF</button><p id="export-status" class="media-status" role="status" aria-live="polite"></p></div></dialog>
-    <dialog class="dialog new-document-dialog" id="new-document-dialog" aria-label="New document"><div class="dialog-form"><div class="dialog-head"><h2>New…</h2><button class="icon-button" id="cancel-new-document" aria-label="Close new document">×</button></div><button id="new-document-notebook" class="new-document-option"><span aria-hidden="true">▱</span><span><strong>Notebook</strong><small>Choose your paper and start writing</small></span><span aria-hidden="true">›</span></button><button id="new-document-picture" class="new-document-option"><span>▧</span><span><strong>Picture</strong><small>Import pictures as writable pages</small></span><span>›</span></button><button id="new-document-pdf" class="new-document-option"><span>PDF</span><span><strong>PDF</strong><small>Import PDF pages and write on them</small></span><span>›</span></button><button id="new-document-import" class="new-document-option"><span aria-hidden="true">↥</span><span><strong>Import backup</strong><small>Open a NotePad archive</small></span><span aria-hidden="true">›</span></button></div></dialog>
+    <dialog class="dialog new-document-dialog" id="new-document-dialog" aria-label="New document"><div class="dialog-form"><div class="dialog-head"><div><span class="eyebrow">ADD TO YOUR LIBRARY</span><h2>New document</h2></div><button class="icon-button" id="cancel-new-document" aria-label="Close new document">×</button></div><button id="new-document-notebook" class="new-document-option"><span aria-hidden="true">${toolIcon("book")}</span><span><strong>Notebook</strong><small>Choose your paper and start writing</small></span><span aria-hidden="true">›</span></button><button id="new-document-picture" class="new-document-option"><span aria-hidden="true">${toolIcon("picture")}</span><span><strong>Picture</strong><small>Import pictures as writable pages</small></span><span>›</span></button><button id="new-document-pdf" class="new-document-option"><span aria-hidden="true">${toolIcon("file")}</span><span><strong>PDF</strong><small>Import PDF pages and write on them</small></span><span>›</span></button><button id="new-document-import" class="new-document-option"><span aria-hidden="true">${toolIcon("upload")}</span><span><strong>Import backup</strong><small>Open a NotePad archive</small></span><span aria-hidden="true">›</span></button></div></dialog>
     ${dialogMarkup(auth)}
   </div>`;
 }
 
 function authMarkup(): string {
-  return `<dialog class="dialog" id="auth-dialog"><form class="dialog-form" id="auth-form" data-mode="login"><div class="dialog-head"><div><span class="eyebrow">ACCOUNT</span><h2 id="auth-dialog-title">Sign in to NotePad</h2></div></div><div class="mode-switch"><button type="button" id="login-mode" class="active">Sign in</button><button type="button" id="register-mode">Create account</button></div><label>Identifier<input id="auth-identifier" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="you@example.com or username" required /></label><label>Password<input id="auth-password" type="password" autocomplete="current-password" minlength="12" placeholder="12 characters minimum" required /></label><p class="form-hint">Sign in with the same account on each device to keep your notebooks together.</p><details><summary>Sync server</summary><label>Server URL<input id="auth-endpoint" type="url" required placeholder="https://notes.example.com" /></label></details><p class="form-error" id="auth-error" role="alert"></p><button class="primary-button" id="auth-submit" type="submit">Sign in</button></form></dialog>`;
+  return `<dialog class="dialog" id="auth-dialog"><form class="dialog-form" id="auth-form" data-mode="login"><div class="dialog-head"><div><span class="auth-brand">${toolIcon("book")} NotePad</span><h2 id="auth-dialog-title">Sign in to NotePad</h2></div></div><div class="mode-switch"><button type="button" id="login-mode" class="active">Sign in</button><button type="button" id="register-mode">Create account</button></div><label>Identifier<input id="auth-identifier" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="you@example.com or username" required /></label><label>Password<input id="auth-password" type="password" autocomplete="current-password" minlength="12" placeholder="12 characters minimum" required /></label><p class="form-hint">Sign in with the same account on each device to keep your notebooks together.</p><details><summary>Sync server</summary><label>Server URL<input id="auth-endpoint" type="url" required placeholder="https://notes.example.com" /></label></details><p class="form-error" id="auth-error" role="alert"></p><button class="primary-button" id="auth-submit" type="submit">Sign in</button></form></dialog>`;
 }
 
 function dialogMarkup(auth: AuthSession): string {
   return `${authMarkup()}
-  <dialog class="dialog" id="settings-dialog"><form class="dialog-form" id="settings-form"><div class="dialog-head"><div><span class="eyebrow">SETTINGS</span><h2>Keep your paper close</h2></div><button type="button" class="icon-button" id="cancel-settings" aria-label="Close">×</button></div><label>Sync server URL<input id="endpoint-input" type="url" inputmode="url" placeholder="https://notes.example.com" /></label><p class="form-hint">Use the same HTTPS server on every device. Changing servers requires signing in again.</p><div class="account-line"><span>Sync</span><strong id="settings-sync-label" aria-live="polite" title="Sign in required">Sign in required</strong><button class="outline-button compact" type="button" id="settings-sync-button">Sync now</button></div><p class="form-message offline-cache-status" id="offline-cache-status" role="status">Preparing offline cache…</p><div class="settings-actions"><button class="outline-button" type="button" id="browse-import">Import backup</button><button class="outline-button" type="button" id="settings-export">Export backup</button><button class="outline-button" type="button" id="settings-share">Share backup</button></div><input id="import-input" type="file" accept="application/json,.json,.notepad" hidden /><p class="form-message" id="settings-message"></p>${thisAccountMarkup(auth)}<div class="app-build"><span>Web app build ${APP_BUILD}</span><button class="outline-button compact" type="button" id="reload-app">Reload app</button></div><button class="primary-button" type="submit">Save settings</button></form></dialog>
+  <dialog class="dialog" id="versions-dialog"><div class="dialog-form"><div class="dialog-head"><h2>Saved versions</h2><button type="button" class="icon-button" id="close-versions" aria-label="Close saved versions">×</button></div><p>Sync resolves simultaneous edits without creating extra notebooks. Earlier versions stay on this device. Export a version and use Import backup to restore it.</p><div id="versions-list"></div><p id="versions-message" role="status"></p></div></dialog>
+  <dialog class="dialog" id="settings-dialog"><form class="dialog-form" id="settings-form"><div class="dialog-head"><div><span class="eyebrow">SETTINGS</span><h2>Sync & backup</h2></div><button type="button" class="icon-button" id="cancel-settings" aria-label="Close">×</button></div><label>Sync server URL<input id="endpoint-input" type="url" inputmode="url" placeholder="https://notes.example.com" /></label><p class="form-hint">Use the same HTTPS server on every device. Changing servers requires signing in again.</p><div class="account-line"><span>Sync</span><strong id="settings-sync-label" aria-live="polite" title="Sign in required">Sign in required</strong><button class="outline-button compact" type="button" id="settings-sync-button">Sync now</button></div><p class="form-message offline-cache-status" id="offline-cache-status" role="status">Preparing offline cache…</p><div class="settings-actions"><button class="outline-button" type="button" id="browse-import">Import backup</button><button class="outline-button" type="button" id="settings-export">Export backup</button><button class="outline-button" type="button" id="settings-share">Share backup</button><button class="outline-button" type="button" id="saved-versions">Saved versions</button></div><input id="import-input" type="file" accept="application/json,.json,.notepad" hidden /><p class="form-message" id="settings-message"></p>${thisAccountMarkup(auth)}<div class="app-build"><span>Web app build ${APP_BUILD}</span><button class="outline-button compact" type="button" id="reload-app">Reload app</button></div><button class="primary-button" type="submit">Save settings</button></form></dialog>
   <dialog class="dialog" id="notebook-dialog"><form class="dialog-form" id="notebook-form"><div class="dialog-head"><div><span class="eyebrow">NOTEBOOK</span><h2>Rename notebook</h2></div><button type="button" class="icon-button" id="cancel-notebook" aria-label="Close">×</button></div><label>Name<input id="notebook-title" type="text" maxlength="500" autocomplete="off" required /></label><div id="new-notebook-options" hidden><label>Paper<select id="new-paper"><option value="blank">Blank</option><option value="ruled" selected>Ruled lines</option><option value="grid">Grid</option></select></label><div class="paper-choices" role="group" aria-label="Paper preview"><button type="button" class="paper-sample paper-blank" data-paper="blank" aria-pressed="false">Blank</button><button type="button" class="paper-sample paper-ruled" data-paper="ruled" aria-pressed="true">Ruled</button><button type="button" class="paper-sample paper-grid" data-paper="grid" aria-pressed="false">Grid</button></div></div><p class="form-error" id="notebook-error" role="alert"></p><button class="primary-button" type="submit">Save name</button></form></dialog>
 `;
 }

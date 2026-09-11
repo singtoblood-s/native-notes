@@ -104,7 +104,7 @@ describe("sync durability protocol", () => {
     await expect(client.sync(fake.store, session)).rejects.toThrow("Network unavailable");
     const retried = await client.sync(fake.store, session);
     expect(retried.conflicts).toBe(1);
-    expect(retried.blockedReason).toContain("Recovered copies");
+    expect(retried.blockedReason).toContain("Saved versions");
     expect((await client.sync(fake.store, session)).conflicts).toBe(0);
     expect(fake.store.createConflictCopyFromOperation).toHaveBeenCalledTimes(1);
   });
@@ -151,7 +151,7 @@ describe("sync durability protocol", () => {
     const client = new SyncClient();
     const report = await client.sync(fake.store, session);
     expect(report).toMatchObject({ pushed: 1, conflicts: 1 });
-    expect(report.blockedReason).toContain("Recovered copies");
+    expect(report.blockedReason).toContain("Saved versions");
     expect(fake.store.createConflictCopyFromOperation).toHaveBeenCalledWith(expect.objectContaining({ opId: operationID }), notebookID, false);
     expect(fake.remaining()).toHaveLength(0);
     expect(fake.pulled).toHaveLength(1);

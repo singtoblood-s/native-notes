@@ -28,6 +28,7 @@ export interface SyncReport {
   pulled: number;
   conflicts: number;
   blockedReason?: string;
+  cleaned?: number;
 }
 
 export class SyncHttpError extends Error {
@@ -156,6 +157,8 @@ export class SyncClient {
       try {
         await this.pushAll(store, endpoint, session.sessionToken, report);
         await this.pullAll(store, endpoint, session.sessionToken, report);
+        const cleaned = await store.archiveEmptyConflictNotebooks?.() ?? 0;
+        if (cleaned) report.cleaned = cleaned;
       } catch (error) {
         this.rememberPartialPull(store, expectedAccountKey, report);
         throw error;
@@ -240,7 +243,7 @@ export class SyncClient {
         await store.createConflictCopyFromOperation(operation, operation.entityId, false);
         await store.markOperationAcked(result.opId, undefined, false);
         report.conflicts += 1;
-        report.blockedReason = `A change needs review (${result.code ?? "rejected"}). A local recovery copy was kept. Review Recovered copies / Documents; other notes can still sync.`;
+        report.blockedReason = `A change needs review (${result.code ?? "rejected"}). The local version was kept in Settings → Saved versions; other notes can still sync.`;
       }
       // PushResponse.cursor is only an informational high-water mark. Pull is
       // the sole owner of the local cursor because it returns every change.

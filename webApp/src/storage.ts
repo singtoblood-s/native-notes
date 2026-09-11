@@ -42,10 +42,6 @@ const MAX_STROKES = 10_000;
 const MAX_POINTS = 200_000;
 const CONFLICT_SUFFIX = " · conflict";
 
-function conflictTitle(title: string, maxLength: number): string {
-  return `${title.slice(0, Math.max(0, maxLength - CONFLICT_SUFFIX.length))}${CONFLICT_SUFFIX}`;
-}
-
 function compareNotebookOrder(left: Notebook, right: Notebook): number {
   return compareStrings(left.createdAt, right.createdAt) || compareStrings(left.id, right.id);
 }
@@ -75,6 +71,7 @@ export interface Archive {
   account: string;
   notebooks: Notebook[];
   pages: NotePage[];
+  versions?: ConflictCopy[];
 }
 
 export type OperationState = "pending" | "sending";
@@ -93,7 +90,6 @@ export interface NoteStore {
   restorePage(id: string): Promise<SaveResult>;
   archiveNotebook(id: string): Promise<SaveResult>;
   restoreNotebook(id: string): Promise<SaveResult>;
-  createConflictCopy(page: NotePage, originalPageID: string): Promise<NotePage>;
   createConflictCopyFromOperation(operation: SyncOperation, originalPageID?: string, queueRecovery?: boolean): Promise<void>;
   pendingOperations(limit?: number): Promise<SyncOperation[]>;
   getOperation(opID: string): Promise<SyncOperation | null>;
@@ -106,6 +102,7 @@ export interface NoteStore {
   getCursor(): Promise<number>;
   setCursor(cursor: number): Promise<void>;
   resetCursor?(): Promise<void>;
+  archiveEmptyConflictNotebooks?(): Promise<number>;
   listConflicts(): Promise<ConflictCopy[]>;
   deleteConflict(conflictID: string): Promise<void>;
   exportArchive(): Promise<Archive>;
@@ -486,7 +483,6 @@ export class SQLiteNoteStoreEngine implements NoteStore {
 
       const store = new SQLiteNoteStoreEngine(sqlite, db, accountKey, persistence, namespace, lock);
       store.initializeSchema();
-      if (store.migrateUnqueuedConflictCopies() && persistence === "indexeddb") await store.persistSnapshot();
       return store;
     } catch (error) {
       lock.release();
@@ -540,38 +536,6 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     const outboxColumns = this.query<{ name: unknown }>("PRAGMA table_info(outbox)");
     if (!outboxColumns.some((column) => column.name === "state")) this.db.exec("ALTER TABLE outbox ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'");
     this.db.exec("CREATE INDEX IF NOT EXISTS outbox_entity_state_idx ON outbox(entity_type, entity_id, state, created_at)");
-  }
-
-  /** Queue pre-upgrade recovered pages once so they converge across devices. */
-  private migrateUnqueuedConflictCopies(): boolean {
-    let changed = false;
-    const rows = this.query<{ id: unknown; json: unknown }>("SELECT id, json FROM pages WHERE revision = 0 AND deleted_at IS NULL");
-    for (const row of rows) {
-      if (typeof row.id !== "string" || typeof row.json !== "string") continue;
-      if (this.query("SELECT 1 FROM metadata WHERE key = ?", [`local-recovery:${row.id}`]).length > 0) continue;
-      let page: NotePage;
-      try {
-        const decoded = JSON.parse(row.json) as Partial<NotePage>;
-        if (!isUUID(decoded.conflictOf)) continue;
-        page = validatePageSnapshot(decoded, row.id, undefined, true, "local");
-      } catch {
-        continue;
-      }
-      const notebook = this.notebookFromRow(this.row(page.notebookId, "notebooks"));
-      if (!notebook) continue;
-      if (notebook.revision === 0) {
-        const parentQueued = this.query("SELECT 1 FROM outbox WHERE entity_type = 'notebook' AND entity_id = ? LIMIT 1", [notebook.id]).length === 0;
-        if (parentQueued) {
-          this.queueOperation({ entityType: "notebook", entityId: notebook.id, baseRevision: 0, action: "upsert", payload: notebook as unknown as Record<string, unknown> });
-          changed = true;
-        }
-      }
-      const queued = this.query("SELECT 1 FROM outbox WHERE entity_type = 'page' AND entity_id = ? LIMIT 1", [page.id]).length > 0;
-      if (queued) continue;
-      this.queueOperation({ entityType: "page", entityId: page.id, baseRevision: 0, action: "upsert", payload: toWirePage(page) as unknown as Record<string, unknown> });
-      changed = true;
-    }
-    return changed;
   }
 
   private query<T extends Record<string, unknown>>(sql: string, bind: unknown[] = []): T[] {
@@ -838,57 +802,37 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     return this.saveNotebook({ ...notebook, deletedAt: null });
   }
 
-  async createConflictCopy(page: NotePage, originalPageID: string): Promise<NotePage> {
-    const copy = sanitizePage({ ...page, id: id(), title: conflictTitle(page.title, MAX_PAGE_TITLE), revision: 0, conflictOf: originalPageID, deletedAt: null });
-    // Recovery copies are durable notebook pages. Queue them so another device
-    // sees the same recoverable note after the next sync.
-    await this.savePage(copy, true);
-    return copy;
-  }
-
-  async createConflictCopyFromOperation(operation: SyncOperation, originalPageID = operation.entityId, queueRecovery = true): Promise<void> {
+  async createConflictCopyFromOperation(operation: SyncOperation, _originalPageID = operation.entityId, _queueRecovery = true): Promise<void> {
     const operationID = requireUUID(operation.opId, "Operation ID");
     await this.transaction(() => {
-      // Conflict recovery runs before the outbox row is acknowledged. The
-      // marker makes that recovery idempotent if the app stops between these
-      // two durable operations, while preserving any copy the user edited or
-      // deleted before the retry.
       if (this.hasConflictRecoveryMarkerDirect(operationID)) return;
-      if (operation.entityType === "page") {
-        const page = validatePageSnapshot(operation.payload, operation.entityId);
-        const notebook = this.notebookFromRow(this.row(page.notebookId, "notebooks"));
-        let notebookID = page.notebookId;
-        if (!queueRecovery || !notebook || notebook.deletedAt) {
-          const recoveredNotebook = notebook
-            ? { ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() }
-            : createNotebook("Recovered page");
-          // A recovered page may be edited immediately. Persist the parent
-          // upload before exposing the page so its later operation cannot reach
-          // the server with a notebook ID the server has never seen.
-          this.saveNotebookRow(recoveredNotebook, true);
-          notebookID = recoveredNotebook.id;
-        }
-        const copy = sanitizePage({ ...page, id: id(), notebookId: notebookID, title: conflictTitle(page.title, MAX_PAGE_TITLE), revision: 0, conflictOf: originalPageID, deletedAt: null });
-        this.savePageRow(copy, false);
-        if (!queueRecovery) this.db.exec({ sql: "INSERT INTO metadata(key, value) VALUES(?, '1') ON CONFLICT(key) DO NOTHING", bind: [`local-recovery:${copy.id}`] });
-        if (queueRecovery && typeof this.queueOperation === "function") this.queueOperation({
-          entityType: "page",
-          entityId: copy.id,
-          baseRevision: 0,
-          action: "upsert",
-          // savePageRow assigns an append order to a newly recovered page;
-          // queue the persisted snapshot so every device gets that same order.
-          payload: toWirePage(this.pageFromRow(this.row(copy.id, "pages")) ?? copy) as unknown as Record<string, unknown>,
-        });
-      } else if (operation.entityType === "notebook") {
-        const notebook = validateNotebookSnapshot(operation.payload, operation.entityId);
-        // The recovered notebook is a valid place for the user to create a new
-        // page immediately, so make its server-side parent durable first.
-        this.saveNotebookRow({ ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() }, queueRecovery);
-      } else {
-        this.insertConflictDirect(operation.entityType, operation.entityId, operation.payload, "rejected local operation", 0);
-      }
+      validateSnapshotPayload(operation.entityType, operation.action, operation.payload, operation.entityId);
+      this.insertConflictDirect(operation.entityType, operation.entityId, operation.payload, "Local version before automatic sync resolution", 0);
       this.markConflictRecoveryDirect(operationID);
+    });
+  }
+
+  /** Soft-delete only empty legacy copies, after a complete pull. Never match a page count from the UI. */
+  async archiveEmptyConflictNotebooks(): Promise<number> {
+    return this.transaction(() => {
+      let count = 0;
+      const rows = this.query("SELECT json FROM notebooks WHERE deleted_at IS NULL");
+      for (const row of rows) {
+        const notebook = this.notebookFromRow(row);
+        if (!notebook || notebook.revision === 0 || !notebook.title.endsWith(CONFLICT_SUFFIX)) continue;
+        // Include trashed pages and pending writes: neither is an empty, settled copy.
+        if (this.query("SELECT 1 FROM pages WHERE notebook_id = ? LIMIT 1", [notebook.id]).length > 0) continue;
+        if (this.query("SELECT 1 FROM outbox WHERE entity_type = 'notebook' AND entity_id = ? LIMIT 1", [notebook.id]).length > 0) continue;
+        // A user who explicitly restores or renames a copy opts it out permanently.
+        if (this.query("SELECT 1 FROM metadata WHERE key = ?", [`legacy-copy-cleaned:${notebook.id}`]).length > 0) continue;
+        this.insertConflictDirect("notebook", notebook.id, notebook as unknown as Record<string, unknown>, "Old empty sync copy moved to Trash", 0);
+        // Remove only the generated suffix, so a restore on another device is not cleaned again.
+        const title = notebook.title.replace(/(?: · conflict)+$/, "") || "Recovered notebook";
+        this.saveNotebookRow({ ...notebook, title, deletedAt: now() }, true);
+        this.db.exec({ sql: "INSERT INTO metadata(key, value) VALUES(?, '1')", bind: [`legacy-copy-cleaned:${notebook.id}`] });
+        count++;
+      }
+      return count;
     });
   }
 
@@ -1008,7 +952,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
   async exportArchive(): Promise<Archive> {
     const notebooks = await this.listNotebooks(true);
     const pages = (await Promise.all(notebooks.map((notebook) => this.listPages(notebook.id, true)))).flat();
-    return { version: 1, exportedAt: now(), account: this.accountKey, notebooks, pages };
+    return { version: 1, exportedAt: now(), account: this.accountKey, notebooks, pages, versions: await this.listConflicts() };
   }
 
   async importArchive(archive: Archive): Promise<{ notebooks: number; pages: number }> {
@@ -1046,6 +990,15 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       pageIDs.add(page.id);
       if (!notebookIDs.has(page.notebookId)) throw new Error(`Archive page ${index + 1} refers to a missing notebook`);
     });
+    const versions = rawArchive.versions ?? [];
+    if (!Array.isArray(versions) || versions.length > MAX_ARCHIVE_PAGES) throw new Error("Archive versions are invalid");
+    const checkedVersions = versions.map(value => {
+      const version = record(value, "Saved version");
+      if (version.entityType !== "page" && version.entityType !== "notebook") throw new Error("Saved version type is invalid");
+      const entityId = requireUUID(version.entityId, "Saved version entity ID");
+      const payload = version.entityType === "page" ? validatePageSnapshot(version.payload, entityId) : validateNotebookSnapshot(version.payload, entityId);
+      return { entityType: version.entityType, entityId, payload };
+    });
     return this.transaction(() => {
       const occupied = new Set<string>();
       for (const row of this.query<{ id: unknown }>("SELECT id FROM notebooks UNION SELECT id FROM pages")) if (typeof row.id === "string") occupied.add(row.id);
@@ -1072,6 +1025,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       }));
       inputNotebooks.forEach((notebook) => this.saveNotebookRow(notebook, true));
       inputPages.forEach((page) => this.savePageRow(page, true));
+      checkedVersions.forEach(version => this.insertConflictDirect(version.entityType as SyncEntityType, version.entityId, version.payload as unknown as Record<string, unknown>, "Imported saved version", 0));
       return { notebooks: inputNotebooks.length, pages: inputPages.length };
     });
   }
@@ -1215,51 +1169,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       [entityType, entityID, sequence],
     ).length > 0) return;
     this.db.exec({ sql: "INSERT INTO conflicts(id, entity_type, entity_id, payload, created_at, reason, sequence) VALUES(?, ?, ?, ?, ?, ?, ?)", bind: [id(), entityType, entityID, JSON.stringify(payload), now(), reason, sequence] });
-    // Keep the conflict recoverable through the normal notebook/page lists and
-    // archive export. A newly recovered parent is also queued in this same
-    // transaction so a later page edit has a server-side owner.
-    if (entityType === "notebook") {
-      const notebook = validateNotebookSnapshot(payload, entityID);
-      const recoveredNotebook = sanitizeNotebook({ ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() });
-      this.upsertNotebookDirect(recoveredNotebook);
-      this.queueOperation({
-        entityType: "notebook",
-        entityId: recoveredNotebook.id,
-        baseRevision: 0,
-        action: "upsert",
-        payload: recoveredNotebook as unknown as Record<string, unknown>,
-      });
-      return;
-    }
-    const page = validatePageSnapshot(payload, entityID, undefined, true);
-    const notebook = this.notebookFromRow(this.row(page.notebookId, "notebooks"));
-    let notebookID = page.notebookId;
-    if (!notebook || notebook.deletedAt) {
-      const recoveredNotebook = notebook
-        ? { ...notebook, id: id(), title: conflictTitle(notebook.title, MAX_NOTEBOOK_TITLE), revision: 0, deletedAt: null, updatedAt: now() }
-        : createNotebook("Recovered page");
-      const savedNotebook = sanitizeNotebook(recoveredNotebook);
-      this.upsertNotebookDirect(savedNotebook);
-      // Keep both the recovery parent and page in the normal sync drain so all
-      // devices expose the same recoverable copy.
-      this.queueOperation({
-        entityType: "notebook",
-        entityId: savedNotebook.id,
-        baseRevision: 0,
-        action: "upsert",
-        payload: savedNotebook as unknown as Record<string, unknown>,
-      });
-      notebookID = savedNotebook.id;
-    }
-    const recoveredPage = sanitizePage({ ...page, id: id(), notebookId: notebookID, title: conflictTitle(page.title, MAX_PAGE_TITLE), revision: 0, deletedAt: null, conflictOf: entityID, updatedAt: now() });
-    this.upsertPageDirect(recoveredPage);
-    this.queueOperation({
-      entityType: "page",
-      entityId: recoveredPage.id,
-      baseRevision: 0,
-      action: "upsert",
-      payload: toWirePage(recoveredPage) as unknown as Record<string, unknown>,
-    });
+    // Versions stay local and never create notebook/page IDs or new sync work.
   }
 
   private upsertPageDirect(page: NotePage): void {
@@ -1379,7 +1289,6 @@ export class SQLiteNoteStore implements NoteStore {
   restorePage(entityID: string): Promise<SaveResult> { return this.rpc("restorePage", [entityID]); }
   archiveNotebook(entityID: string): Promise<SaveResult> { return this.rpc("archiveNotebook", [entityID]); }
   restoreNotebook(entityID: string): Promise<SaveResult> { return this.rpc("restoreNotebook", [entityID]); }
-  createConflictCopy(page: NotePage, originalPageID: string): Promise<NotePage> { return this.rpc("createConflictCopy", [page, originalPageID]); }
   createConflictCopyFromOperation(operation: SyncOperation, originalPageID?: string, queueRecovery = true): Promise<void> { return this.rpc("createConflictCopyFromOperation", [operation, originalPageID, queueRecovery]); }
   pendingOperations(limit = 50): Promise<SyncOperation[]> { return this.rpc("pendingOperations", [limit]); }
   getOperation(opID: string): Promise<SyncOperation | null> { return this.rpc("getOperation", [opID]); }
@@ -1392,6 +1301,7 @@ export class SQLiteNoteStore implements NoteStore {
   getCursor(): Promise<number> { return this.rpc("getCursor"); }
   setCursor(cursor: number): Promise<void> { return this.rpc("setCursor", [cursor]); }
   resetCursor(): Promise<void> { return this.rpc("resetCursor"); }
+  archiveEmptyConflictNotebooks(): Promise<number> { return this.rpc("archiveEmptyConflictNotebooks"); }
   listConflicts(): Promise<ConflictCopy[]> { return this.rpc("listConflicts"); }
   deleteConflict(conflictID: string): Promise<void> { return this.rpc("deleteConflict", [conflictID]); }
   exportArchive(): Promise<Archive> { return this.rpc("exportArchive"); }

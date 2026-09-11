@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createNotebook, createPage, Notebook, PullChange, SyncOperation, toWirePayload } from "../src/models";
+import { createNotebook, createPage, PullChange, SyncOperation, toWirePayload } from "../src/models";
 import { SQLiteNoteStoreEngine } from "../src/storage";
 
 const pageID = "11111111-1111-4111-8111-111111111111";
@@ -60,91 +60,25 @@ describe("conflict recovery storage", () => {
     expect(() => method.call(fake, page, true)).toThrow("Stroke point values are invalid");
   });
 
-  it("queues a missing parent before creating a recovered page", async () => {
-    const transaction = vi.fn(async (body: () => unknown) => body());
+  it.each(["page", "notebook"] as const)("keeps %s sync versions without making library entries or uploading copies", async entityType => {
+    const operation = entityType === "page" ? pageOperation() : { ...pageOperation(), entityType, entityId: notebookID, payload: createNotebook("Notebook") as unknown as Record<string, unknown> };
+    operation.payload.id = operation.entityId;
+    let marked = false;
+    const insertConflictDirect = vi.fn();
     const saveNotebookRow = vi.fn();
     const savePageRow = vi.fn();
     const fake = Object.assign(Object.create(SQLiteNoteStoreEngine.prototype), {
-      transaction,
-      query: vi.fn(() => []),
-      row: vi.fn(() => null),
-      notebookFromRow: vi.fn(() => null),
-      saveNotebookRow,
-      savePageRow,
-      db: { exec: vi.fn() },
-    }) as unknown as SQLiteNoteStoreEngine;
-    const method = (SQLiteNoteStoreEngine.prototype as unknown as {
-      createConflictCopyFromOperation(this: SQLiteNoteStoreEngine, operation: SyncOperation, originalPageID?: string): Promise<void>;
-    }).createConflictCopyFromOperation;
-
-    await method.call(fake, pageOperation());
-
-    expect(saveNotebookRow).toHaveBeenCalledWith(expect.objectContaining({ title: "Recovered page", revision: 0 }), true);
-    const saveCall = (saveNotebookRow.mock.calls as unknown as Array<[{ id: string }, boolean]>)[0]!;
-    const recoveredNotebookID = saveCall[0].id;
-    expect(savePageRow).toHaveBeenCalledWith(expect.objectContaining({ notebookId: recoveredNotebookID }), false);
-  });
-
-  it("replays the same page conflict recovery without replacing an edited copy", async () => {
-    const operation = pageOperation();
-    const state: { marked: boolean; page: Record<string, unknown> | null } = { marked: false, page: null };
-    const makeEngine = (): SQLiteNoteStoreEngine => Object.assign(Object.create(SQLiteNoteStoreEngine.prototype), {
-      transaction: vi.fn(async (body: () => unknown) => body()),
-      query: vi.fn((sql: string) => sql.includes("FROM metadata") && state.marked ? [{ value: "1" }] : []),
-      row: vi.fn(() => null),
-      notebookFromRow: vi.fn(() => null),
-      saveNotebookRow: vi.fn(),
-      savePageRow: vi.fn((page: Record<string, unknown>) => { state.page = page; }),
-      db: { exec: vi.fn((statement: { sql?: string }) => { if (statement.sql?.includes("INSERT INTO metadata")) state.marked = true; }) },
-    }) as unknown as SQLiteNoteStoreEngine;
-    const method = (SQLiteNoteStoreEngine.prototype as unknown as {
-      createConflictCopyFromOperation(this: SQLiteNoteStoreEngine, operation: SyncOperation, originalPageID?: string): Promise<void>;
-    }).createConflictCopyFromOperation;
-
-    await method.call(makeEngine(), operation);
-    expect(state.page).toEqual(expect.objectContaining({ conflictOf: pageID }));
-    const savedPage = state.page!;
-    savedPage.title = "Edited recovery";
-    await method.call(makeEngine(), operation);
-
-    expect(state.page).toBe(savedPage);
-    expect(state.page?.title).toBe("Edited recovery");
-  });
-
-  it("replays the same notebook conflict recovery without creating another parent", async () => {
-    const notebook = createNotebook("Notebook conflict");
-    notebook.id = notebookID;
-    const operation: SyncOperation = {
-      opId: "44444444-4444-4444-8444-444444444444",
-      entityType: "notebook",
-      entityId: notebookID,
-      baseRevision: 1,
-      action: "upsert",
-      payload: notebook as unknown as Record<string, unknown>,
-      createdAt: notebook.updatedAt,
-      state: "sending",
-    };
-    const state = { marked: false, notebook: null as Notebook | null };
-    const saveNotebookRow = vi.fn((value: Notebook) => { state.notebook = value; });
-    const makeEngine = (): SQLiteNoteStoreEngine => Object.assign(Object.create(SQLiteNoteStoreEngine.prototype), {
-      transaction: vi.fn(async (body: () => unknown) => body()),
-      query: vi.fn((sql: string) => sql.includes("FROM metadata") && state.marked ? [{ value: "1" }] : []),
-      saveNotebookRow,
-      db: { exec: vi.fn((statement: { sql?: string }) => { if (statement.sql?.includes("INSERT INTO metadata")) state.marked = true; }) },
-    }) as unknown as SQLiteNoteStoreEngine;
-    const method = (SQLiteNoteStoreEngine.prototype as unknown as {
-      createConflictCopyFromOperation(this: SQLiteNoteStoreEngine, operation: SyncOperation, originalPageID?: string): Promise<void>;
-    }).createConflictCopyFromOperation;
-
-    await method.call(makeEngine(), operation);
-    expect(state.notebook).toEqual(expect.objectContaining({ title: "Notebook conflict · conflict", revision: 0 }));
-    const savedNotebook = state.notebook!;
-    savedNotebook.title = "Edited recovery notebook";
-    await method.call(makeEngine(), operation);
-
-    expect(saveNotebookRow).toHaveBeenCalledTimes(1);
-    expect(state.notebook).toBe(savedNotebook);
-    expect(state.notebook?.title).toBe("Edited recovery notebook");
+      transaction: async (body: () => unknown) => body(),
+      query: (sql: string) => sql.includes("FROM metadata") && marked ? [{ value: "1" }] : [],
+      insertConflictDirect, saveNotebookRow, savePageRow,
+      db: { exec: (statement: { sql: string }) => { if (statement.sql.includes("INSERT INTO metadata")) marked = true; } },
+    }) as SQLiteNoteStoreEngine;
+    await fake.createConflictCopyFromOperation(operation);
+    await fake.createConflictCopyFromOperation(operation);
+    expect(insertConflictDirect).toHaveBeenCalledTimes(1);
+    expect(insertConflictDirect).toHaveBeenCalledWith(entityType, operation.entityId, operation.payload, expect.any(String), 0);
+    expect(saveNotebookRow).not.toHaveBeenCalled();
+    expect(savePageRow).not.toHaveBeenCalled();
   });
 
   it("does not repeat a sequence-less server conflict snapshot on retry", async () => {
@@ -178,57 +112,18 @@ describe("conflict recovery storage", () => {
     expect(insertConflictDirect).toHaveBeenCalledTimes(1);
   });
 
-  it("queues a recovered parent when a remote conflict arrives during a local edit", () => {
-    const queueOperation = vi.fn(() => "parent-operation");
-    const upsertPageDirect = vi.fn();
-    const fake = {
-      db: { exec: vi.fn() },
-      query: vi.fn(() => []),
-      row: vi.fn(() => null),
-      notebookFromRow: vi.fn(() => null),
-      upsertNotebookDirect: vi.fn(),
-      upsertPageDirect,
-      queueOperation,
-    } as unknown as SQLiteNoteStoreEngine;
-    const method = (SQLiteNoteStoreEngine.prototype as unknown as {
-      insertConflictDirect(this: SQLiteNoteStoreEngine, entityType: "page" | "notebook", entityID: string, payload: Record<string, unknown>, reason: string, sequence: number): void;
-    }).insertConflictDirect;
-
-    const page = pageOperation().payload;
-    method.call(fake, "page", pageID, page, "remote update while local edit is pending", 7);
-
-    const parentCall = (queueOperation.mock.calls as unknown as Array<[{ entityType: string; entityId: string; baseRevision: number; action: string; payload: { id: string } }]>)[0]!;
-    const parent = parentCall[0];
-    expect(parent).toMatchObject({ entityType: "notebook", baseRevision: 0, action: "upsert" });
-    expect(parent.entityId).toBe(parent.payload.id);
-    const pageCall = (queueOperation.mock.calls as unknown as Array<[{ entityType: string; entityId: string; payload: { formatVersion: number; conflictOf: string } }]>)[1]!;
-    expect(pageCall[0]).toMatchObject({ entityType: "page", payload: { formatVersion: 2, conflictOf: pageID } });
-    const recoveredPage = (upsertPageDirect.mock.calls as unknown as Array<[{ notebookId: string }]>)[0]![0];
-    expect(recoveredPage.notebookId).toBe(parent.entityId);
-  });
-
-  it("queues a recovered notebook conflict copy before it can own new pages", () => {
-    const queueOperation = vi.fn(() => "notebook-operation");
+  it.each(["page", "notebook"] as const)("stores remote %s history without queuing new entities", entityType => {
+    const queueOperation = vi.fn();
     const upsertNotebookDirect = vi.fn();
-    const fake = {
-      db: { exec: vi.fn() },
-      query: vi.fn(() => []),
-      upsertNotebookDirect,
-      queueOperation,
-    } as unknown as SQLiteNoteStoreEngine;
-    const method = (SQLiteNoteStoreEngine.prototype as unknown as {
-      insertConflictDirect(this: SQLiteNoteStoreEngine, entityType: "page" | "notebook", entityID: string, payload: Record<string, unknown>, reason: string, sequence: number): void;
-    }).insertConflictDirect;
-    const notebook = createNotebook("Notebook conflict");
-    notebook.id = notebookID;
-
-    method.call(fake, "notebook", notebookID, notebook as unknown as Record<string, unknown>, "remote update while local edit is pending", 8);
-
-    expect(upsertNotebookDirect).toHaveBeenCalledWith(expect.objectContaining({ id: expect.any(String), revision: 0, deletedAt: null }));
-    const operationCall = (queueOperation.mock.calls as unknown as Array<[{ entityType: string; entityId: string; baseRevision: number; action: string; payload: { id: string } }]>)[0]!;
-    const operation = operationCall[0];
-    expect(operation).toMatchObject({ entityType: "notebook", baseRevision: 0, action: "upsert" });
-    expect(operation.entityId).toBe(operation.payload.id);
+    const upsertPageDirect = vi.fn();
+    const insert = vi.fn();
+    const fake = { query: () => [], db: { exec: insert }, queueOperation, upsertNotebookDirect, upsertPageDirect };
+    const method = (SQLiteNoteStoreEngine.prototype as unknown as { insertConflictDirect: (...args: unknown[]) => void }).insertConflictDirect;
+    method.call(fake, entityType, pageID, pageOperation().payload, "Remote version", 7);
+    expect(insert).toHaveBeenCalledTimes(1);
+    expect(queueOperation).not.toHaveBeenCalled();
+    expect(upsertNotebookDirect).not.toHaveBeenCalled();
+    expect(upsertPageDirect).not.toHaveBeenCalled();
   });
 
   it("ignores an acknowledged server echo while a newer local edit is pending", () => {
@@ -399,32 +294,6 @@ describe("conflict recovery storage", () => {
     });
     expect(restored).not.toBeNull();
     expect(JSON.stringify(toWirePayload(restored!))).toBe(raw);
-  });
-
-  it("migrates an old local conflict page into one idempotent queued operation", () => {
-    const page = pageOperation().payload as unknown as ReturnType<typeof createPage>;
-    page.conflictOf = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    page.revision = 0;
-    const notebook = createNotebook("Recovered page");
-    notebook.id = notebookID;
-    const queued = new Set<string>();
-    const queueOperation = vi.fn((operation: { entityId: string }) => { queued.add(operation.entityId); return "queued"; });
-    const fake = Object.assign(Object.create(SQLiteNoteStoreEngine.prototype), {
-      query: vi.fn((sql: string, args?: unknown[]) => {
-        if (sql.includes("FROM pages WHERE revision")) return [{ id: page.id, json: JSON.stringify(page) }];
-        if (sql.includes("FROM outbox") && args?.[0]) return queued.has(String(args[0])) ? [{ value: 1 }] : [];
-        return [];
-      }),
-      row: vi.fn(() => ({ json: JSON.stringify(notebook), revision: notebook.revision })),
-      notebookFromRow: vi.fn(() => notebook),
-      queueOperation,
-    }) as SQLiteNoteStoreEngine;
-    const method = (SQLiteNoteStoreEngine.prototype as unknown as { migrateUnqueuedConflictCopies: (this: SQLiteNoteStoreEngine) => boolean }).migrateUnqueuedConflictCopies;
-
-    expect(method.call(fake)).toBe(true);
-    expect(method.call(fake)).toBe(false);
-    expect(queueOperation).toHaveBeenCalledTimes(2);
-    expect(queueOperation.mock.calls.map(([operation]) => operation.entityId)).toEqual([notebookID, page.id]);
   });
 
   it("appends new pages while preserving legacy order when an old page is edited", () => {

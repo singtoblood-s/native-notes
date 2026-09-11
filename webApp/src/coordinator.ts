@@ -287,7 +287,9 @@ export class SyncCoordinator {
   private async refreshPending(store: NoteStore, generation: number, conflictCount?: number): Promise<boolean> {
     try {
       const operations = await store.pendingOperations(100);
-      const conflicts = conflictCount ?? (await store.listConflicts()).length;
+      // Historical versions are not new sync conflicts, and may contain large
+      // images. Do not load the entire version archive on each polling tick.
+      const conflicts = conflictCount ?? 0;
       this.publishIfCurrent(generation, { pending: operations.length, pendingMayContinue: operations.length >= 100, conflicts });
       return true;
     } catch (error) {
