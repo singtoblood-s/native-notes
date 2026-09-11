@@ -51,6 +51,99 @@ beforeEach(() => {
 afterEach(() => { document.body.innerHTML = ""; vi.unstubAllGlobals(); });
 
 describe("PaperCanvas pointer contract", () => {
+  it("stores translucent highlighter strokes and round-trips undo/redo", () => {
+    const { canvas, changes, canvasController } = setup();
+    canvasController.setTool({ kind: "highlighter", color: 0xfff2ca52, width: 18 });
+    canvas.dispatchEvent(pointer("pointerdown", { pressure: 0.1 }));
+    canvas.dispatchEvent(pointer("pointermove", { clientX: 150, pressure: 0.9 }));
+    canvas.dispatchEvent(pointer("pointerup", { clientX: 200 }));
+    const strokes = changes.mock.lastCall![0];
+    expect(strokes[0]).toMatchObject({ color: 0x50f2ca52, width: 18 });
+    expect(strokes[0].points.every((point: { pressure: number }) => point.pressure === 1)).toBe(true);
+    canvasController.undo();
+    expect(changes.mock.lastCall![0]).toEqual([]);
+    canvasController.redo();
+    expect(changes.mock.lastCall![0]).toEqual(strokes);
+    canvasController.destroy();
+  });
+
+  it("keeps only endpoints for a straight line and constant pressure for ball pen", () => {
+    const { canvas, changes, canvasController } = setup();
+    canvasController.setTool({ kind: "line", color: 0xff252429, width: 3 });
+    canvas.dispatchEvent(pointer("pointerdown", { clientX: 10, clientY: 20 }));
+    canvas.dispatchEvent(pointer("pointermove", { clientX: 80, clientY: 100 }));
+    canvas.dispatchEvent(pointer("pointerup", { clientX: 120, clientY: 30 }));
+    expect(changes.mock.lastCall![0][0].points).toMatchObject([{ x: 20, y: 40 }, { x: 240, y: 60 }]);
+    canvasController.setTool({ kind: "pen", color: 0xff252429, width: 3, pressureSensitive: false });
+    canvas.dispatchEvent(pointer("pointerdown", { pressure: 0.1 }));
+    canvas.dispatchEvent(pointer("pointerup", { clientX: 120, pressure: 0.9 }));
+    expect(changes.mock.lastCall![0][1].points.map((point: { pressure: number }) => point.pressure)).toEqual([1, 1]);
+    canvasController.destroy();
+  });
+
+  it("pans in read mode without writing or allowing undo", () => {
+    const { canvas, paper, changes, canvasController } = setup();
+    canvas.dispatchEvent(pointer("pointerdown", {}));
+    canvas.dispatchEvent(pointer("pointerup", {}));
+    changes.mockClear();
+    canvasController.setTool({ kind: "hand" });
+    const before = paper.style.transform;
+    canvas.dispatchEvent(pointer("pointerdown", { pointerType: "mouse", clientY: 300 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerType: "mouse", clientY: 100 }));
+    canvas.dispatchEvent(pointer("pointerup", { pointerType: "mouse", clientY: 100 }));
+    expect(paper.style.transform).not.toBe(before);
+    canvasController.undo();
+    expect(changes).not.toHaveBeenCalled();
+    expect(canvasController.isInputActive).toBe(false);
+    canvasController.destroy();
+  });
+
+  it("ignores unrelated pointers and palm movement during erasing, and restores cancelled ink", () => {
+    const { canvas, paper, changes, canvasController } = setup();
+    canvas.dispatchEvent(pointer("pointerdown", {}));
+    canvas.dispatchEvent(pointer("pointerup", {}));
+    const original = changes.mock.lastCall![0];
+    changes.mockClear();
+    canvasController.setTool({ kind: "eraser", width: 6 });
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 7 }));
+    const before = paper.style.transform;
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 8, pointerType: "touch" }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 8, pointerType: "touch", clientY: 10 }));
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 9, pointerType: "mouse" }));
+    canvas.dispatchEvent(pointer("pointercancel", { pointerId: 9 }));
+    expect(canvasController.isInputActive).toBe(true);
+    expect(paper.style.transform).toBe(before);
+    expect(changes).not.toHaveBeenCalled();
+    canvas.dispatchEvent(pointer("pointercancel", { pointerId: 7 }));
+    expect(canvasController.isInputActive).toBe(false);
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 7 }));
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 7 }));
+    expect(changes.mock.lastCall![0]).toEqual([]);
+    canvasController.undo();
+    expect(changes.mock.lastCall![0]).toEqual(original);
+    canvasController.destroy();
+  });
+
+  it("renders only newly received opaque segments between animation frames", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => { frames.push(callback); return frames.length; });
+    const { canvas, canvasController } = setup();
+    const renderStroke = vi.spyOn(canvasController as unknown as { renderStroke: (ctx: unknown, stroke: { points: unknown[] }) => void }, "renderStroke");
+    canvas.dispatchEvent(pointer("pointerdown", { clientX: 10 }));
+    frames.shift()!(0);
+    for (let i = 1; i <= 100; i++) {
+      renderStroke.mockClear();
+      canvas.dispatchEvent(pointer("pointermove", { clientX: 10 + i }));
+      frames.shift()!(i);
+      expect(renderStroke).toHaveBeenCalledTimes(1);
+      expect(renderStroke.mock.calls[0]![1].points).toHaveLength(2);
+    }
+    const renderStatic = vi.spyOn(canvasController as unknown as { renderStatic: () => void }, "renderStatic");
+    canvas.dispatchEvent(pointer("pointerup", { clientX: 110 }));
+    expect(renderStatic).not.toHaveBeenCalled();
+    canvasController.destroy();
+  });
+
   it("keeps a tap when coalesced events is empty", () => {
     const { canvas, changes } = setup();
     const down = pointer("pointerdown", { clientX: 100, clientY: 100, timeStamp: 10 });

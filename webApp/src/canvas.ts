@@ -1,8 +1,9 @@
 import { InkStroke, PageBackground, StrokePoint, id } from "./models";
 
 export type CanvasTool =
-  | { kind: "pen"; color: number; width: number }
-  | { kind: "eraser"; width: number };
+  | { kind: "pen" | "highlighter" | "line"; color: number; width: number; pressureSensitive?: boolean }
+  | { kind: "eraser"; width: number }
+  | { kind: "hand" };
 
 interface ActiveStroke {
   pointerID: number;
@@ -113,6 +114,8 @@ export class PaperCanvas {
   private tool: CanvasTool = { kind: "pen", color: 0xff252429, width: 2.5 };
   private active: ActiveStroke | null = null;
   private eraserBefore: InkStroke[] | null = null;
+  private eraserPointerID: number | null = null;
+  private renderedPointCount = 0;
   private touchPointers = new Map<number, TouchPointer>();
   private panLast: TouchPointer | null = null;
   private pinchStart: {
@@ -194,7 +197,11 @@ export class PaperCanvas {
     this.render();
   }
 
-  setTool(tool: CanvasTool): void { this.tool = tool; }
+  setTool(tool: CanvasTool): void {
+    if (this.isInputActive) this.cancelActiveInput();
+    this.tool = tool;
+    this.canvas.style.cursor = tool.kind === "hand" ? "grab" : "crosshair";
+  }
 
   get currentScale(): number { return this.scale; }
   /** True while a stroke, erase gesture, or touch navigation gesture is active. */
@@ -205,6 +212,7 @@ export class PaperCanvas {
   get hasRedo(): boolean { return this.redoStack.length > 0; }
 
   undo(): void {
+    if (this.isInputActive || this.tool.kind === "hand") return;
     const previous = this.undoStack.pop();
     if (!previous) return;
     if (historyPointCount(this.strokes) <= MAX_HISTORY_POINTS) this.redoStack.push(cloneStrokes(this.strokes));
@@ -215,6 +223,7 @@ export class PaperCanvas {
   }
 
   redo(): void {
+    if (this.isInputActive || this.tool.kind === "hand") return;
     const next = this.redoStack.pop();
     if (!next) return;
     if (historyPointCount(this.strokes) <= MAX_HISTORY_POINTS) this.undoStack.push(cloneStrokes(this.strokes));
@@ -287,6 +296,7 @@ export class PaperCanvas {
   fitToViewport(): void { this.fitToWidth(); }
 
   destroy(): void {
+    this.cancelActiveInput();
     window.removeEventListener("resize", this.handleResize);
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
@@ -347,8 +357,9 @@ export class PaperCanvas {
 
   private readonly handlePointerDown = (event: PointerEvent): void => {
     event.preventDefault();
-    if (event.pointerType === "touch") {
-      if (this.active) return;
+    if (event.pointerType === "touch" || this.tool.kind === "hand") {
+      if (this.active || this.eraserBefore) return;
+      if (event.pointerType === "mouse" && event.button !== 0) return;
       this.touchPointers.set(event.pointerId, this.touchPoint(event));
       this.capturePointer(event.pointerId);
       this.rebaseTouchGesture();
@@ -356,29 +367,31 @@ export class PaperCanvas {
     }
     if (event.pointerType !== "pen" && event.pointerType !== "mouse") return;
     if (event.pointerType === "mouse" && event.button !== 0) return;
-    if (this.active) return;
+    if (this.active || this.eraserBefore) return;
     this.touchPointers.clear();
     this.panLast = null;
     this.pinchStart = null;
     this.capturePointer(event.pointerId);
     if (this.tool.kind === "eraser") {
       this.eraserBefore = cloneStrokes(this.strokes);
+      this.eraserPointerID = event.pointerId;
       this.eraseAt(this.pagePoint(event));
       return;
     }
     const timestamp = finite(event.timeStamp) ? event.timeStamp : performance.now();
+    this.renderedPointCount = 0;
     this.active = {
       pointerID: event.pointerId,
       startedAt: timestamp,
-      stroke: { id: id(), color: this.tool.color >>> 0, width: this.tool.width, points: [] },
+      stroke: { id: id(), color: this.tool.kind === "highlighter" ? ((this.tool.color & 0xffffff) | 0x50000000) >>> 0 : this.tool.color >>> 0, width: this.tool.width, points: [] },
     };
     this.addPoints(event);
   };
 
   private readonly handlePointerMove = (event: PointerEvent): void => {
     event.preventDefault();
-    if (event.pointerType === "touch") {
-      if (this.active) return;
+    if (event.pointerType === "touch" || this.touchPointers.has(event.pointerId)) {
+      if (this.active || this.eraserBefore) return;
       if (!this.touchPointers.has(event.pointerId)) return;
       this.touchPointers.set(event.pointerId, this.touchPoint(event));
       const values = [...this.touchPointers.values()];
@@ -395,7 +408,7 @@ export class PaperCanvas {
       return;
     }
     if (!this.active || this.active.pointerID !== event.pointerId) {
-      if (this.tool.kind === "eraser" && this.eraserBefore) this.eraseAt(this.pagePoint(event));
+      if (this.eraserPointerID === event.pointerId) this.eraseAt(this.pagePoint(event));
       return;
     }
     this.addPoints(event);
@@ -403,18 +416,21 @@ export class PaperCanvas {
 
   private readonly handlePointerUp = (event: PointerEvent): void => {
     event.preventDefault();
-    if (event.pointerType === "touch") {
-      if (this.active) return;
+    if (event.pointerType === "touch" || this.touchPointers.has(event.pointerId)) {
+      if (this.active || this.eraserBefore) return;
       this.endTouchPointer(event.pointerId);
       return;
     }
     if (this.tool.kind === "eraser") {
+      if (this.eraserPointerID !== event.pointerId) return;
+      this.eraseAt(this.pagePoint(event));
       if (this.eraserBefore && !sameStrokes(this.eraserBefore, this.strokes)) {
         this.pushUndo(this.eraserBefore);
         this.redoStack = [];
         this.callbacks.onChange(cloneStrokes(this.strokes));
       }
       this.eraserBefore = null;
+      this.eraserPointerID = null;
       this.render();
       return;
     }
@@ -426,8 +442,10 @@ export class PaperCanvas {
     // single-point tap or an empty stroke.
     this.pushUndo(before);
     this.redoStack = [];
+    // Commit just this stroke to the cached page, independent of page length.
+    this.renderStroke(this.staticContext, this.active.stroke);
     this.active = null;
-    this.render();
+    this.renderVisible();
     this.callbacks.onChange(cloneStrokes(this.strokes));
   };
 
@@ -437,7 +455,7 @@ export class PaperCanvas {
       this.endTouchPointer(pointerEvent.pointerId);
       return;
     }
-    if (this.active?.pointerID === pointerEvent.pointerId || this.eraserBefore) this.cancelActiveInput();
+    if (this.active?.pointerID === pointerEvent.pointerId || this.eraserPointerID === pointerEvent.pointerId) this.cancelActiveInput();
   };
 
   private touchPoint(event: PointerEvent): TouchPointer {
@@ -533,15 +551,19 @@ export class PaperCanvas {
   }
 
   private cancelActiveInput(): void {
-    if (this.active) {
-      try { this.canvas.releasePointerCapture(this.active.pointerID); } catch { /* capture may already be gone */ }
-    }
+    const pointers = [...this.touchPointers.keys()];
+    if (this.active) pointers.push(this.active.pointerID);
+    if (this.eraserPointerID !== null) pointers.push(this.eraserPointerID);
     this.active = null;
     if (this.eraserBefore) this.strokes = cloneStrokes(this.eraserBefore);
     this.eraserBefore = null;
+    this.eraserPointerID = null;
     this.touchPointers.clear();
     this.panLast = null;
     this.pinchStart = null;
+    for (const pointerID of pointers) {
+      try { this.canvas.releasePointerCapture(pointerID); } catch { /* capture may already be gone */ }
+    }
     if (this.activeFrame !== null) {
       cancelAnimationFrame(this.activeFrame);
       this.activeFrame = null;
@@ -573,8 +595,15 @@ export class PaperCanvas {
   }
 
   private readonly handleWheel = (event: WheelEvent): void => {
-    if (!event.ctrlKey && !event.metaKey) return;
     event.preventDefault();
+    if (this.isInputActive) return;
+    if (!event.ctrlKey && !event.metaKey) {
+      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? this.viewport.clientHeight : 1;
+      this.offsetX -= event.deltaX * unit;
+      this.offsetY -= event.deltaY * unit;
+      this.applyPan();
+      return;
+    }
     const rect = this.viewport.getBoundingClientRect();
     this.zoomTo(this.scale * (event.deltaY < 0 ? 1.08 : 0.92), { x: event.clientX - rect.left, y: event.clientY - rect.top });
   };
@@ -583,8 +612,9 @@ export class PaperCanvas {
     if (!this.active) return;
     const coalesced = typeof event.getCoalescedEvents === "function" ? event.getCoalescedEvents() : [];
     const events = coalesced.length > 0 ? coalesced : [event];
+    const rect = this.canvas.getBoundingClientRect();
     for (const sample of events) {
-      const position = this.pagePoint(sample);
+      const position = this.pagePoint(sample, rect);
       const timestamp = finite(sample.timeStamp) ? sample.timeStamp : performance.now();
       const pressure = finite(sample.pressure) && sample.pressure > 0 ? clamp(sample.pressure, 0, 1) : 0.5;
       const point: StrokePoint = {
@@ -592,7 +622,7 @@ export class PaperCanvas {
         // comfortably below the server's operation-size limit.
         x: roundTo(position.x, 2),
         y: roundTo(position.y, 2),
-        pressure: roundTo(pressure, 3),
+        pressure: this.tool.kind === "pen" && this.tool.pressureSensitive !== false ? roundTo(pressure, 3) : 1,
         time: Math.max(0, Math.round(timestamp - this.active.startedAt)),
         tiltX: finite(sample.tiltX) ? roundTo(sample.tiltX, 1) : null,
         tiltY: finite(sample.tiltY) ? roundTo(sample.tiltY, 1) : null,
@@ -601,6 +631,9 @@ export class PaperCanvas {
       // A tap commonly arrives as a down and an up with an empty coalesced
       // array. Keep its single canonical point instead of duplicating it.
       if (!previous || Math.hypot(previous.x - point.x, previous.y - point.y) > 0.01) this.active.stroke.points.push(point);
+      if (this.tool.kind === "line" && this.active.stroke.points.length > 2) {
+        this.active.stroke.points = [this.active.stroke.points[0]!, point];
+      }
     }
     this.scheduleActiveRender();
   }
@@ -614,8 +647,7 @@ export class PaperCanvas {
     }
   }
 
-  private pagePoint(event: PointerEvent): { x: number; y: number } {
-    const rect = this.canvas.getBoundingClientRect();
+  private pagePoint(event: PointerEvent, rect = this.canvas.getBoundingClientRect()): { x: number; y: number } {
     return {
       x: clamp((event.clientX - rect.left) * this.width / Math.max(1, rect.width), 0, this.width),
       y: clamp((event.clientY - rect.top) * this.height / Math.max(1, rect.height), 0, this.height),
@@ -672,6 +704,7 @@ export class PaperCanvas {
     this.context.clearRect(0, 0, this.width, this.height);
     this.context.drawImage(this.staticCanvas, 0, 0, this.width, this.height);
     if (this.active) this.renderStroke(this.context, this.active.stroke);
+    this.renderedPointCount = this.active?.stroke.points.length ?? 0;
     this.context.restore();
   }
 
@@ -679,7 +712,15 @@ export class PaperCanvas {
     if (this.activeFrame !== null) return;
     this.activeFrame = requestAnimationFrame(() => {
       this.activeFrame = null;
-      this.renderVisible();
+      const stroke = this.active?.stroke;
+      if (stroke && (stroke.color >>> 24) === 255 && this.tool.kind !== "line") {
+        // O(new samples) per frame for opaque ink; retain the preceding point
+        // to connect the next segment without redrawing the growing stroke.
+        if (stroke.points.length > this.renderedPointCount) {
+          this.renderStroke(this.context, { ...stroke, points: stroke.points.slice(Math.max(0, this.renderedPointCount - 1)) });
+          this.renderedPointCount = stroke.points.length;
+        }
+      } else this.renderVisible();
     });
   }
 
@@ -695,8 +736,18 @@ export class PaperCanvas {
     if (points.length === 1) {
       const point = points[0]!;
       context.beginPath();
-      context.arc(point.x, point.y, Math.max(0.5, stroke.width * (0.65 + point.pressure * 0.35)), 0, Math.PI * 2);
+      context.arc(point.x, point.y, Math.max(0.25, stroke.width * (0.65 + point.pressure * 0.35) / 2), 0, Math.PI * 2);
       context.fill();
+      return;
+    }
+    // One path gives translucent ink uniform opacity at segment joins.
+    // ARGB is already part of the archive and sync format; no schema change.
+    if (alpha < 1) {
+      context.lineWidth = stroke.width;
+      context.beginPath();
+      context.moveTo(points[0]!.x, points[0]!.y);
+      for (const point of points.slice(1)) context.lineTo(point.x, point.y);
+      context.stroke();
       return;
     }
     for (let index = 1; index < points.length; index += 1) {
