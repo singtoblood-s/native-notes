@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AuthResponse, PullChange, SyncOperation, toWirePayload } from "../src/models";
+import { AuthResponse, ConflictCopy, PullChange, SyncOperation, toWirePayload } from "../src/models";
 import { NoteStore } from "../src/storage";
 import { SyncClient, selectPushBatch } from "../src/sync";
 
@@ -162,12 +162,17 @@ describe("sync durability protocol", () => {
     expect(fake.store.applyRemoteBatch).toHaveBeenCalledWith([change], 1);
   });
 
-  it("keeps a pull count when post-pull conflict inspection fails", async () => {
+  it("does not turn historical conflict rows into a new sync conflict", async () => {
     localStorage.setItem("notepad.endpoint", "https://sync.example.test");
     const fake = fakeStore([]);
-    fake.store.listConflicts = vi.fn()
-      .mockRejectedValueOnce(new Error("Storage is busy"))
-      .mockResolvedValue([]);
+    fake.store.listConflicts = vi.fn(async (): Promise<ConflictCopy[]> => [{
+      id: "99999999-9999-4999-8999-999999999999",
+      entityType: "page",
+      entityId: pageID,
+      payload: {},
+      createdAt: "2026-01-01T00:00:00Z",
+      reason: "historical recovery",
+    }]);
     const change: PullChange = {
       sequence: 1,
       entityType: "notebook",
@@ -185,10 +190,14 @@ describe("sync durability protocol", () => {
     }));
 
     const client = new SyncClient();
-    await expect(client.sync(fake.store, session)).rejects.toThrow("Storage is busy");
     const report = await client.sync(fake.store, session);
 
     expect(report.pulled).toBe(1);
+    expect(report.conflicts).toBe(0);
+    expect(fake.store.listConflicts).not.toHaveBeenCalled();
+
+    const secondReport = await client.sync(fake.store, session);
+    expect(secondReport).toEqual({ pushed: 0, pulled: 0, conflicts: 0 });
   });
 
   it("does not carry a partial pull count into another account store", async () => {

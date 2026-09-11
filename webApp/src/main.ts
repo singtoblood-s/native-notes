@@ -48,6 +48,7 @@ class NotePadApp {
   private editGeneration = 0;
   private search = "";
   private showTrash = false;
+  private showRecovery = false;
   private view: "library" | "editor" = "library";
   private libraryTab: "documents" | "favorites" | "search" = "documents";
   private selectedTool: CanvasTool["kind"] = "pen";
@@ -184,6 +185,7 @@ class NotePadApp {
       if (!(await this.flushPendingSave())) return;
       this.view = "editor";
       this.showTrash = true;
+      this.showRecovery = false;
       await this.reload();
       await this.toggleDrawer("sidebar");
     });
@@ -215,6 +217,7 @@ class NotePadApp {
     onClick("new-notebook", () => this.openNotebookRename(true));
     onClick("new-page", () => this.createNewPage());
     onClick("trash-toggle", () => { void this.toggleTrash(); });
+    onClick("recovery-toggle", () => { void this.toggleRecovery(); });
     onClick("mobile-menu", () => { void this.toggleDrawer("sidebar"); });
     onClick("close-sidebar", () => { void this.closeDrawers(); });
     onClick("drawer-backdrop", () => { void this.closeDrawers(); });
@@ -254,6 +257,7 @@ class NotePadApp {
     onClick("logout-button", () => this.logout());
     onClick("archive-notebook", () => this.archiveCurrentNotebook());
     onClick("delete-page", () => this.deleteCurrentPage());
+    onClick("keep-page", () => { void this.keepCurrentPage(); });
     onClick("cancel-settings", () => this.closeDialog("settings-dialog"));
     onClick("cancel-notebook", () => this.closeDialog("notebook-dialog"));
     onClick("browse-import", () => byId<HTMLInputElement>("import-input").click());
@@ -313,13 +317,15 @@ class NotePadApp {
   private async reload(selectID?: string, guard?: { store: NoteStore; generation: number }): Promise<boolean> {
     const searchAtStart = this.search;
     const trashAtStart = this.showTrash;
+    const recoveryAtStart = this.showRecovery;
     const store = this.store;
     const accountAtStart = this.accountKey();
     const navigationAtStart = this.navigationGeneration;
     const editGenerationAtStart = this.editGeneration;
-    const isSafe = (): boolean => store === this.store && accountAtStart === this.accountKey() && navigationAtStart === this.navigationGeneration && editGenerationAtStart === this.editGeneration && this.unsavedPageID === null && this.saveTimer === null && this.saveInFlight === null && !this.canvasInputActive() && searchAtStart === this.search && trashAtStart === this.showTrash && (!guard || (guard.store === this.store && guard.generation === this.editGeneration));
+    const isSafe = (): boolean => store === this.store && accountAtStart === this.accountKey() && navigationAtStart === this.navigationGeneration && editGenerationAtStart === this.editGeneration && this.unsavedPageID === null && this.saveTimer === null && this.saveInFlight === null && !this.canvasInputActive() && searchAtStart === this.search && trashAtStart === this.showTrash && recoveryAtStart === this.showRecovery && (!guard || (guard.store === this.store && guard.generation === this.editGeneration));
     if (!isSafe()) return false;
-    const notebooks = await store.listNotebooks(trashAtStart);
+    const includeDeleted = trashAtStart || recoveryAtStart;
+    const notebooks = await store.listNotebooks(includeDeleted);
     if (!isSafe()) return false;
     const selection = this.readSelection();
     const preferredNotebookID = this.currentNotebook?.id ?? selection.notebookID;
@@ -327,21 +333,23 @@ class NotePadApp {
       ? preferredNotebookID : notebooks[0]?.id;
     const currentNotebook = notebookID ? await store.getNotebook(notebookID) : null;
     if (!isSafe()) return false;
-    const currentPages = currentNotebook ? await store.listPages(currentNotebook.id, trashAtStart) : [];
+    const currentPages = currentNotebook ? await store.listPages(currentNotebook.id, includeDeleted) : [];
     if (!isSafe()) return false;
-    const allPages = (await Promise.all(notebooks.map((notebook) => store.listPages(notebook.id, trashAtStart)))).flat();
+    const allPages = (await Promise.all(notebooks.map((notebook) => store.listPages(notebook.id, includeDeleted)))).flat();
     if (!isSafe()) return false;
     const preferredPageID = selectID ?? this.currentPage?.id ?? selection.pageID;
     let currentPage = preferredPageID ? await store.getPage(preferredPageID) : null;
     if (!isSafe()) return false;
-    const visiblePages = trashAtStart ? allPages.filter((page) => this.isPageInTrash(page, notebooks)) : searchAtStart ? allPages.filter((page) => !page.deletedAt) : currentPages;
+    const visiblePages = searchAtStart || recoveryAtStart
+      ? allPages.filter((page) => this.isPageVisible(page, notebooks))
+      : trashAtStart ? allPages.filter((page) => this.isPageInTrash(page, notebooks)) : currentPages.filter((page) => this.isPageVisible(page, notebooks));
     if (!currentPage || !visiblePages.some((item) => item.id === currentPage?.id)) currentPage = visiblePages[0] ?? null;
     let finalNotebook = currentNotebook;
     let finalPages = currentPages;
     if (currentPage && currentPage.notebookId !== currentNotebook?.id) {
       finalNotebook = await store.getNotebook(currentPage.notebookId);
       if (!isSafe()) return false;
-      finalPages = finalNotebook ? await store.listPages(finalNotebook.id, trashAtStart) : [];
+      finalPages = finalNotebook ? await store.listPages(finalNotebook.id, includeDeleted) : [];
     }
     if (!isSafe()) return false;
     this.notebooks = notebooks;
@@ -360,6 +368,16 @@ class NotePadApp {
     if (!(await this.flushPendingSave())) return;
     if (navigation !== this.navigationGeneration) return;
     this.showTrash = !this.showTrash;
+    this.showRecovery = false;
+    await this.reload();
+  }
+
+  private async toggleRecovery(): Promise<void> {
+    const navigation = ++this.navigationGeneration;
+    if (!(await this.flushPendingSave())) return;
+    if (navigation !== this.navigationGeneration) return;
+    this.showRecovery = !this.showRecovery;
+    this.showTrash = false;
     await this.reload();
   }
 
@@ -464,7 +482,7 @@ class NotePadApp {
   }
 
   private openNotebookRename(create = false): void {
-    if ((!create && !this.currentNotebook) || this.showTrash) return;
+    if ((!create && !this.currentNotebook) || this.showTrash || this.showRecovery) return;
     byId("notebook-form").dataset.mode = create ? "create" : "rename";
     byId("notebook-form").querySelector("h2")!.textContent = create ? "New notebook" : "Rename notebook";
     byId("notebook-form").querySelector('button[type="submit"]')!.textContent = create ? "Create notebook" : "Save name";
@@ -525,8 +543,9 @@ class NotePadApp {
     await this.closeDrawers(false);
     if (navigation !== this.navigationGeneration) return;
     this.view = "library";
-    if (this.showTrash) {
+    if (this.showTrash || this.showRecovery) {
       this.showTrash = false;
+      this.showRecovery = false;
       if (!(await this.reload()) || navigation !== this.navigationGeneration) return;
     }
     this.renderLibrary();
@@ -548,7 +567,7 @@ class NotePadApp {
     const all = this.notebooks.filter((book) => !book.deletedAt);
     const pagesByNotebook = new Map<string, NotePage[]>();
     for (const page of this.allPages) {
-      if (page.deletedAt) continue;
+      if (page.deletedAt || page.conflictOf) continue;
       const pages = pagesByNotebook.get(page.notebookId);
       if (pages) pages.push(page);
       else pagesByNotebook.set(page.notebookId, [page]);
@@ -591,7 +610,7 @@ class NotePadApp {
   private renderLists(): void {
     this.renderLibrary();
     const notebookList = byId("notebook-list");
-    const notebooks = this.notebooks.filter((notebook) => this.showTrash ? true : !notebook.deletedAt)
+    const notebooks = this.notebooks.filter((notebook) => this.showTrash || !notebook.deletedAt || (this.showRecovery && notebook.id === this.currentNotebook?.id))
       .filter((notebook) => !this.search || notebook.title.toLocaleLowerCase().includes(this.search));
     notebookList.innerHTML = notebooks.length ? notebooks.map((notebook) => `
       <button class="nav-row ${notebook.id === this.currentNotebook?.id ? "selected" : ""}" data-notebook="${escapeAttr(notebook.id)}" aria-current="${notebook.id === this.currentNotebook?.id ? "page" : "false"}">
@@ -600,23 +619,51 @@ class NotePadApp {
     notebookList.querySelectorAll<HTMLButtonElement>("[data-notebook]").forEach((button) => button.addEventListener("click", () => void this.selectNotebook(button.dataset.notebook!)));
 
     const pageList = byId("page-list");
-    const sourcePages = this.showTrash ? this.allPages : this.search ? this.allPages : this.pages;
-    const pages = sourcePages.filter((page) => this.showTrash ? this.isPageInTrash(page) : !page.deletedAt)
+    const sourcePages = this.showTrash || this.showRecovery || this.search ? this.allPages : this.pages;
+    const pages = sourcePages.filter((page) => this.isPageVisible(page))
       .filter((page) => !this.search || `${page.title} ${page.text}`.toLocaleLowerCase().includes(this.search));
     pageList.innerHTML = pages.length ? pages.map((page) => `
       <button class="page-row ${page.id === this.currentPage?.id ? "selected" : ""}" data-page="${escapeAttr(page.id)}" aria-current="${page.id === this.currentPage?.id ? "page" : "false"}">
-        <span class="page-index">${sourcePages.indexOf(page) + 1}</span><span class="page-copy"><strong>${escapeHTML(page.title || "Untitled page")}</strong><small>${pageNotebookLabel(page, this.notebooks)}${page.text.trim() ? ` · ${escapeHTML(preview(page.text))}` : ` · ${page.strokes.length} strokes`}</small></span>
-      </button>`).join("") : `<p class="empty-copy">${this.showTrash ? "No deleted pages." : "No pages yet."}</p>`;
+        <span class="page-index">${pages.indexOf(page) + 1}</span><span class="page-copy"><strong>${escapeHTML(page.title || "Untitled page")}</strong><small>${pageNotebookLabel(page, this.notebooks)}${page.text.trim() ? ` · ${escapeHTML(preview(page.text))}` : ` · ${page.strokes.length} strokes`}</small></span>
+      </button>`).join("") : `<p class="empty-copy">${this.showTrash ? "No deleted pages." : this.showRecovery ? "No recovered copies yet." : "No pages yet."}</p>`;
     pageList.querySelectorAll<HTMLButtonElement>("[data-page]").forEach((button) => button.addEventListener("click", () => void this.selectPage(button.dataset.page!)));
     byId("trash-toggle").classList.toggle("active", this.showTrash);
     byId("trash-toggle").setAttribute("aria-pressed", String(this.showTrash));
     byId("trash-label").textContent = this.showTrash ? "Back to notebook" : "Trash";
-    byId("new-page").toggleAttribute("disabled", this.showTrash || !this.currentNotebook);
-    byId("new-notebook").toggleAttribute("disabled", this.showTrash);
+    const recoveryToggle = byId<HTMLButtonElement>("recovery-toggle");
+    const recoveryCount = this.recoveryPageCount();
+    recoveryToggle.classList.toggle("active", this.showRecovery);
+    recoveryToggle.setAttribute("aria-pressed", String(this.showRecovery));
+    recoveryToggle.setAttribute("aria-label", `${this.showRecovery ? "Show notebook pages" : "Show recovered copies"}${recoveryCount ? ` · ${recoveryCount}` : ""}`);
+    byId("recovery-label").textContent = "Recovered copies";
+    const recoveryCountElement = byId("recovery-count");
+    recoveryCountElement.textContent = String(recoveryCount);
+    recoveryCountElement.toggleAttribute("hidden", recoveryCount === 0);
+    byId("new-page").toggleAttribute("disabled", this.showTrash || this.showRecovery || !this.currentNotebook);
+    byId("new-notebook").toggleAttribute("disabled", this.showTrash || this.showRecovery);
   }
 
   private pagesForNotebook(notebookID: string): number {
-    return this.pages.filter((page) => page.notebookId === notebookID && (this.showTrash ? this.isPageInTrash(page) : !page.deletedAt)).length;
+    return this.pages.filter((page) => page.notebookId === notebookID && this.isPageVisible(page)).length;
+  }
+
+  private recoveryPageCount(): number {
+    return this.allPages.filter((page) => this.isRecoveryPage(page)).length;
+  }
+
+  private isRecoveryPage(page: NotePage, notebooks = this.notebooks): boolean {
+    if (page.deletedAt || !page.conflictOf) return false;
+    return !notebooks.find((notebook) => notebook.id === page.notebookId)?.deletedAt;
+  }
+
+  private isPageVisible(page: NotePage, notebooks = this.notebooks): boolean {
+    if (this.showTrash) return this.isPageInTrash(page, notebooks);
+    if (page.deletedAt) return false;
+    return this.showRecovery ? this.isRecoveryPage(page, notebooks) : !page.conflictOf;
+  }
+
+  private editorPages(): NotePage[] {
+    return this.pages.filter((page) => this.isPageVisible(page));
   }
 
   private isPageInTrash(page: NotePage, notebooks = this.notebooks): boolean {
@@ -630,8 +677,11 @@ class NotePadApp {
     const page = this.currentPage;
     const hasPage = Boolean(page);
     document.body.classList.toggle("trash-mode", this.showTrash);
+    document.body.classList.toggle("recovery-mode", this.showRecovery);
     byId("editor-empty").classList.toggle("hidden", hasPage);
     byId("editor-content").classList.toggle("hidden", !hasPage);
+    byId("editor-empty-title").textContent = this.showRecovery ? "No recovered copies" : "Choose a page";
+    byId("editor-empty-copy").textContent = this.showRecovery ? "Recovered copies will appear here after a sync conflict." : "Your paper is waiting in the left rail.";
     byId("notebook-name").textContent = this.currentNotebook?.title ?? "No notebook";
     byId<HTMLButtonElement>("rename-notebook").disabled = !this.currentNotebook || this.showTrash;
     const notebookAction = byId<HTMLButtonElement>("archive-notebook");
@@ -646,6 +696,10 @@ class NotePadApp {
     byId<HTMLSelectElement>("background-select").disabled = !hasPage || this.showTrash;
     const pageAction = byId<HTMLButtonElement>("delete-page");
     pageAction.disabled = !hasPage;
+    const keepPage = byId<HTMLButtonElement>("keep-page");
+    keepPage.hidden = !page?.conflictOf || this.showTrash;
+    keepPage.disabled = !page?.conflictOf || this.showTrash;
+    byId("recovery-page-badge").toggleAttribute("hidden", !page?.conflictOf);
     if (!page) return;
     byId<HTMLInputElement>("page-title").value = page.title;
     byId<HTMLTextAreaElement>("page-text").value = page.text;
@@ -681,22 +735,48 @@ class NotePadApp {
     }
   }
 
+  private async keepCurrentPage(): Promise<void> {
+    const page = this.currentPage;
+    if (this.showTrash || !page?.conflictOf) return;
+    const store = this.store;
+    const accountAtStart = this.accountKey();
+    const navigation = this.navigationGeneration;
+    const generation = this.editGeneration;
+    const snapshot = clonePage(page);
+    const isCurrent = (): boolean => store === this.store && accountAtStart === this.accountKey() && navigation === this.navigationGeneration && generation === this.editGeneration && this.currentPage?.id === snapshot.id;
+    if (!(await this.flushPendingSave()) || !isCurrent()) return;
+    try {
+      const result = await store.savePage({ ...snapshot, conflictOf: undefined });
+      if (!isCurrent()) return;
+      if (result.status === "failed") {
+        this.setState({ kind: "error", message: result.message ?? "Could not keep page" });
+        return;
+      }
+      this.coordinator.notifyLocalWrite();
+      this.showRecovery = false;
+      await this.reload(page.id);
+    } catch (error) {
+      if (!isCurrent()) return;
+      this.setState({ kind: "error", message: error instanceof Error ? error.message : "Could not keep page" });
+    }
+  }
+
   private updateToolbar(): void {
     const readOnly = this.showTrash || this.selectedTool === "hand";
     byId<HTMLButtonElement>("undo-button").disabled = readOnly || !this.canvas?.hasUndo;
     byId<HTMLButtonElement>("redo-button").disabled = readOnly || !this.canvas?.hasRedo;
-    const pages = this.pages.filter((page) => !page.deletedAt);
+    const pages = this.editorPages();
     const index = pages.findIndex((page) => page.id === this.currentPage?.id);
-    byId("page-position").textContent = `${index + 1} / ${pages.length}`;
+    byId("page-position").textContent = `${index >= 0 ? index + 1 : 0} / ${pages.length}`;
     byId<HTMLButtonElement>("previous-page").disabled = this.showTrash || index <= 0;
     byId<HTMLButtonElement>("next-page").disabled = this.showTrash || index < 0 || index >= pages.length - 1;
-    byId<HTMLButtonElement>("add-page").disabled = this.showTrash || !this.currentNotebook;
-    byId<HTMLButtonElement>("duplicate-page").disabled = this.showTrash || !this.currentPage;
+    byId<HTMLButtonElement>("add-page").disabled = this.showTrash || this.showRecovery || !this.currentNotebook;
+    byId<HTMLButtonElement>("duplicate-page").disabled = this.showTrash || this.showRecovery || !this.currentPage;
   }
 
   private async turnPage(direction: number): Promise<void> {
     if (this.showTrash || this.canvas?.isInputActive) return;
-    const pages = this.pages.filter((page) => !page.deletedAt);
+    const pages = this.editorPages();
     const index = pages.findIndex((page) => page.id === this.currentPage?.id);
     const next = pages[index + direction];
     if (index >= 0 && next) await this.selectPage(next.id);
@@ -707,18 +787,22 @@ class NotePadApp {
     const navigation = ++this.navigationGeneration;
     if (!(await this.flushPendingSave())) return;
     if (navigation !== this.navigationGeneration) return;
+    if (this.view === "library") {
+      this.showTrash = false;
+      this.showRecovery = false;
+    }
     const store = this.store;
     this.editGeneration += 1;
     const editGeneration = this.editGeneration;
     const canApply = (): boolean => navigation === this.navigationGeneration && store === this.store && editGeneration === this.editGeneration && this.unsavedPageID === null && this.saveTimer === null && this.saveInFlight === null && !this.canvasInputActive();
     const notebook = await store.getNotebook(id);
     if (!canApply()) return;
-    const pages = notebook ? await store.listPages(notebook.id, this.showTrash) : [];
+    const pages = notebook ? await store.listPages(notebook.id, this.showTrash || this.showRecovery) : [];
     if (!canApply()) return;
     const last = this.readSelection();
     const page = this.showTrash
       ? this.allPages.find((page) => page.notebookId === id && this.isPageInTrash(page)) ?? null
-      : pages.find((page) => !page.deletedAt && last.notebookID === id && last.pageID === page.id) ?? pages.find((page) => !page.deletedAt) ?? null;
+      : pages.find((page) => this.isPageVisible(page) && last.notebookID === id && last.pageID === page.id) ?? pages.find((page) => this.isPageVisible(page)) ?? null;
     this.currentNotebook = notebook;
     this.pages = pages;
     this.currentPage = page;
@@ -746,7 +830,7 @@ class NotePadApp {
     if (page && page.notebookId !== notebook?.id) {
       notebook = await store.getNotebook(page.notebookId);
       if (!canApply()) return;
-      pages = notebook ? await store.listPages(notebook.id, this.showTrash) : [];
+      pages = notebook ? await store.listPages(notebook.id, this.showTrash || this.showRecovery) : [];
       if (!canApply()) return;
     }
     this.currentPage = page;
@@ -762,7 +846,7 @@ class NotePadApp {
 
   private async createNotebook(title: string): Promise<void> {
     if (!(await this.flushPendingSave())) return;
-    if (!title || this.showTrash) return;
+    if (!title || this.showTrash || this.showRecovery) return;
     const notebook = createNotebook(title);
     try {
       const result = await this.store.saveNotebook(notebook);
@@ -795,7 +879,7 @@ class NotePadApp {
 
   private async createNewPage(duplicate = false): Promise<void> {
     if (!(await this.flushPendingSave())) return;
-    if (!this.currentNotebook || this.showTrash) return;
+    if (!this.currentNotebook || this.showTrash || this.showRecovery) return;
     const source = this.currentPage;
     const page = createPage(this.currentNotebook.id, duplicate && source ? `${source.title} (copy)` : `Page ${this.pages.length + 1}`);
     if (source) {
@@ -956,8 +1040,8 @@ class NotePadApp {
 
   private setState(state: SyncState): void {
     const offlineAccountLabel = "Sign in required";
-    const label = state.kind === "error" ? state.message : state.kind === "conflict" ? `${state.count} conflict${state.count === 1 ? "" : "s"}` : state.kind === "needs-login" ? offlineAccountLabel : state.kind === "offline" ? "Saved locally" : state.kind === "saving" ? "Saving…" : state.kind === "syncing" ? "Syncing…" : state.kind === "saved" ? "Saved locally" : "Ready";
-    const icon = state.kind === "error" ? "!" : state.kind === "conflict" ? "!" : state.kind === "syncing" ? "↻" : state.kind === "needs-login" ? "·" : "✓";
+    const label = state.kind === "error" ? state.message : state.kind === "conflict" ? `${state.count} recovery cop${state.count === 1 ? "y" : "ies"}` : state.kind === "needs-login" ? offlineAccountLabel : state.kind === "offline" ? "Saved locally" : state.kind === "saving" ? "Saving…" : state.kind === "syncing" ? "Syncing…" : state.kind === "saved" ? "Saved locally" : "Ready";
+    const icon = state.kind === "error" ? "!" : state.kind === "conflict" ? "↺" : state.kind === "syncing" ? "↻" : state.kind === "needs-login" ? "·" : "✓";
     for (const button of document.querySelectorAll<HTMLButtonElement>("[data-sync-button]")) {
       button.classList.toggle("is-busy", state.kind === "saving" || state.kind === "syncing");
       button.setAttribute("aria-label", label);
@@ -1030,10 +1114,7 @@ class NotePadApp {
       this.setSyncLabels(label);
       return;
     }
-    if (status.conflicts > 0) {
-      this.setState({ kind: "conflict", count: status.conflicts });
-      return;
-    }
+    if (status.conflicts > 0) this.renderLists();
     if (!this.saveTimer && !this.saveInFlight && this.unsavedPageID === null) {
       this.setState(this.auth.session ? { kind: "saved" } : { kind: "needs-login" });
       if (this.pendingRemoteRefresh) {
@@ -1082,8 +1163,7 @@ class NotePadApp {
         return;
       }
     }
-    if (context.report.conflicts > 0) this.setState({ kind: "conflict", count: context.report.conflicts });
-    else this.setState({ kind: "saved" });
+    this.setState({ kind: "saved" });
   }
 
   private queueRemoteRefresh(context: SyncCompleteContext): void {
@@ -1119,8 +1199,7 @@ class NotePadApp {
       return;
     }
     if (this.pendingRemoteRefresh === pending) this.pendingRemoteRefresh = null;
-    if (pending.conflicts > 0) this.setState({ kind: "conflict", count: pending.conflicts });
-    else this.setState({ kind: "saved" });
+    this.setState({ kind: "saved" });
   }
 
   private canvasInputActive(): boolean {
@@ -1173,6 +1252,7 @@ class NotePadApp {
       this.allPages = [];
       this.view = "library";
       this.showTrash = false;
+      this.showRecovery = false;
       this.search = "";
       this.canvas?.destroy();
       this.renderShell();
@@ -1375,7 +1455,7 @@ function shellMarkup(auth: AuthSession): string {
       <label class="search-field"><span>⌕</span><input id="search-input" type="search" placeholder="Search notes" aria-label="Search notes" autocomplete="off" /></label>
       <div class="list-section"><div class="list-heading"><span>NOTEBOOKS</span><span class="rule"></span></div><nav id="notebook-list" aria-label="Notebooks"></nav></div>
       <div class="list-section pages-section"><div class="list-heading"><span>PAGES</span><button id="new-page" class="small-action" aria-label="New page">＋</button></div><nav id="page-list" aria-label="Pages"></nav></div>
-      <div class="sidebar-bottom"><button class="utility-row" id="trash-toggle" aria-pressed="false"><span>♢</span><span id="trash-label">Trash</span></button><button class="utility-row" id="settings-button"><span>⌘</span> Settings</button></div>
+      <div class="sidebar-bottom"><button class="utility-row" id="recovery-toggle" aria-pressed="false"><span>↺</span><span id="recovery-label">Recovered copies</span><span class="utility-count" id="recovery-count" hidden>0</span></button><button class="utility-row" id="trash-toggle" aria-pressed="false"><span>♢</span><span id="trash-label">Trash</span></button><button class="utility-row" id="settings-button"><span>⌘</span> Settings</button></div>
     </aside>
     <main class="library" id="library" aria-label="Notebook library">
       <header class="library-header"><a class="library-brand" href="${BASE}">NotePad</a><div><button class="sync-status" id="library-sync-button" data-sync-button aria-label="Sign in required"><span id="library-sync-icon" data-sync-icon>·</span><span id="library-sync-label" data-sync-label>Sign in required</span></button><button id="library-trash" class="library-icon" aria-label="Open trash">♢</button><button id="library-settings" class="library-icon" aria-label="Library settings">⚙</button><button id="library-account" class="library-icon" aria-label="Library account">○</button></div></header>
@@ -1409,13 +1489,13 @@ function shellMarkup(auth: AuthSession): string {
           <label class="width-control"><span id="width-value">3px</span><input id="width-range" type="range" min="1" max="12" step="0.5" value="3" aria-label="Stroke width" /></label>
         </div>
       </div>
-          <div class="page-bar"><button class="page-title-button" id="rename-page" aria-label="Rename page"><span class="page-title-kicker">PAGE</span><strong id="page-title-label">First page</strong><span aria-hidden="true">✎</span></button><div class="page-navigation"><button class="quiet-button" id="previous-page" aria-label="Previous page">‹</button><span id="page-position" aria-live="polite">1 / 1</span><button class="quiet-button" id="next-page" aria-label="Next page">›</button><button class="quiet-button add-page" id="add-page" aria-label="Add page" title="Add page with the same paper">＋</button></div></div>
+           <div class="page-bar"><button class="page-title-button" id="rename-page" aria-label="Rename page"><span class="page-title-kicker">PAGE</span><strong id="page-title-label">First page</strong><span aria-hidden="true">✎</span><span class="recovery-badge" id="recovery-page-badge" hidden>Recovered copy</span></button><div class="page-navigation"><button class="quiet-button" id="previous-page" aria-label="Previous page">‹</button><span id="page-position" aria-live="polite">1 / 1</span><button class="quiet-button" id="next-page" aria-label="Next page">›</button><button class="quiet-button add-page" id="add-page" aria-label="Add page" title="Add page with the same paper">＋</button></div></div>
           <div class="paper-viewport" id="paper-viewport"><div class="paper" id="paper"><canvas id="ink-canvas" aria-label="Note page drawing surface"></canvas></div></div>
           <div class="print-note" aria-hidden="true"><h1 id="print-title"></h1><p id="print-text"></p></div>
            <div class="stage-foot" title="Two fingers to move or zoom · Hand tool for one-finger pan"><span id="tool-name" aria-live="polite">Pen</span><small class="gesture-hint">2 fingers: move / zoom · Hand: 1-finger pan</small><div class="view-controls"><button class="quiet-button" id="zoom-out" aria-label="Zoom out">−</button><span class="zoom-label" id="zoom-label">100%</span><button class="quiet-button" id="zoom-in" aria-label="Zoom in">＋</button><button class="quiet-button" id="fit-button" aria-label="Fit page width">Fit width</button><button class="quiet-button" id="fit-whole-page" aria-label="Fit whole page">Full page</button></div><span id="page-revision">revision 0</span></div>
         </div>
-        <div class="empty-editor hidden" id="editor-empty"><div class="empty-orbit">✦</div><h1>Choose a page</h1><p>Your paper is waiting in the left rail.</p></div>
-      <aside class="inspector" id="inspector" aria-label="Text and page details" aria-hidden="true"><div class="inspector-head"><div><span class="eyebrow">TEXT & DETAILS</span><strong class="inspector-title">Page tools</strong></div><button class="icon-button" id="close-inspector" aria-label="Close text panel">×</button></div><label class="title-field"><span>Page title</span><input id="page-title" type="text" placeholder="Untitled page" /></label><label class="text-field"><span>Typed note</span><textarea id="page-text" rows="8" placeholder="Type in Thai or English…" dir="auto"></textarea></label><label class="select-field"><span>Paper</span><select id="background-select"><option value="blank">Blank</option><option value="ruled">Ruled lines</option><option value="grid">Grid</option></select></label><div class="inspector-actions"><button class="outline-button" id="duplicate-page">Duplicate page</button><button class="outline-button" id="delete-page">Move page to trash</button><button class="outline-button" id="archive-notebook" title="Archive or restore notebook" aria-label="Archive or restore notebook">Archive notebook</button><button class="outline-button" id="print-button">Print / PDF</button><button class="outline-button" id="share-button">Share archive</button><button class="outline-button" id="export-button">Export backup</button></div><p class="inspector-note">Changes save locally after each edit. Sync uses the configured server only when you sign in.</p></aside>
+         <div class="empty-editor hidden" id="editor-empty"><div class="empty-orbit">✦</div><h1 id="editor-empty-title">Choose a page</h1><p id="editor-empty-copy">Your paper is waiting in the left rail.</p></div>
+      <aside class="inspector" id="inspector" aria-label="Text and page details" aria-hidden="true"><div class="inspector-head"><div><span class="eyebrow">TEXT & DETAILS</span><strong class="inspector-title">Page tools</strong></div><button class="icon-button" id="close-inspector" aria-label="Close text panel">×</button></div><label class="title-field"><span>Page title</span><input id="page-title" type="text" placeholder="Untitled page" /></label><label class="text-field"><span>Typed note</span><textarea id="page-text" rows="8" placeholder="Type in Thai or English…" dir="auto"></textarea></label><label class="select-field"><span>Paper</span><select id="background-select"><option value="blank">Blank</option><option value="ruled">Ruled lines</option><option value="grid">Grid</option></select></label><div class="inspector-actions"><button class="outline-button" id="duplicate-page">Duplicate page</button><button class="outline-button" id="delete-page">Move page to trash</button><button class="outline-button" id="keep-page" hidden>Keep as normal page</button><button class="outline-button" id="archive-notebook" title="Archive or restore notebook" aria-label="Archive or restore notebook">Archive notebook</button><button class="outline-button" id="print-button">Print / PDF</button><button class="outline-button" id="share-button">Share archive</button><button class="outline-button" id="export-button">Export backup</button></div><p class="inspector-note">Changes save locally after each edit. Sync uses the configured server only when you sign in.</p></aside>
       </section>
     </main>
     <dialog class="dialog new-document-dialog" id="new-document-dialog" aria-label="New document"><div class="dialog-form"><div class="dialog-head"><h2>New…</h2><button class="icon-button" id="cancel-new-document" aria-label="Close new document">×</button></div><button id="new-document-notebook" class="new-document-option"><span aria-hidden="true">▱</span><span><strong>Notebook</strong><small>Choose your paper and start writing</small></span><span aria-hidden="true">›</span></button><button id="new-document-import" class="new-document-option"><span aria-hidden="true">↥</span><span><strong>Import backup</strong><small>Open a NotePad archive</small></span><span aria-hidden="true">›</span></button></div></dialog>
