@@ -117,6 +117,8 @@ export class PaperCanvas {
   private eraserPointerID: number | null = null;
   private renderedPointCount = 0;
   private touchPointers = new Map<number, TouchPointer>();
+  /** Pen hover/contact takes priority over touch navigation on writing tools. */
+  private penPointers = new Set<number>();
   private panLast: TouchPointer | null = null;
   private pinchStart: {
     distance: number;
@@ -159,8 +161,15 @@ export class PaperCanvas {
     this.canvas.addEventListener("pointerup", this.handlePointerUp, { passive: false });
     this.canvas.addEventListener("pointercancel", this.handlePointerCancel, { passive: false });
     this.canvas.addEventListener("lostpointercapture", this.handlePointerCancel);
+    this.canvas.addEventListener("pointerover", this.handlePenPresence);
+    this.canvas.addEventListener("pointerenter", this.handlePenPresence);
+    this.canvas.addEventListener("pointerout", this.handlePointerOut);
+    this.canvas.addEventListener("pointerleave", this.handlePointerOut);
     this.canvas.addEventListener("wheel", this.handleWheel, { passive: false });
-    this.canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+    document.addEventListener("contextmenu", this.handleContextMenu);
+    document.addEventListener("selectstart", this.handleSelectStart);
+    window.addEventListener("blur", this.handleWindowBlur);
+    document.addEventListener("visibilitychange", this.handleVisibilityChange);
     window.addEventListener("resize", this.handleResize, { passive: true });
     if (typeof ResizeObserver !== "undefined") {
       this.resizeObserver = new ResizeObserver(this.handleResize);
@@ -169,7 +178,7 @@ export class PaperCanvas {
   }
 
   setPage(pageID: string, width: number, height: number, background: PageBackground, strokes: InkStroke[]): void {
-    this.cancelActiveInput();
+    this.cancelActiveInput(false);
     const dimensionsChanged = this.width !== width || this.height !== height;
     const newPage = pageID !== this.pageKey;
     this.pageKey = pageID;
@@ -178,18 +187,19 @@ export class PaperCanvas {
     this.background = background;
     this.paper.style.width = `${width}px`;
     this.paper.style.height = `${height}px`;
-    if (dimensionsChanged || newPage) this.resizeCanvas();
-    this.setStrokes(strokes, newPage);
+    if (dimensionsChanged || newPage) this.resizeCanvas(false);
+    this.setStrokes(strokes, newPage, false);
     if (newPage || dimensionsChanged) this.fitToWidth();
+    this.render();
   }
 
-  setStrokes(strokes: InkStroke[], resetHistory = false): void {
+  setStrokes(strokes: InkStroke[], resetHistory = false, render = true): void {
     this.strokes = cloneStrokes(strokes);
     if (resetHistory) {
       this.undoStack = [];
       this.redoStack = [];
     }
-    this.render();
+    if (render) this.render();
   }
 
   setBackground(background: PageBackground): void {
@@ -198,15 +208,15 @@ export class PaperCanvas {
   }
 
   setTool(tool: CanvasTool): void {
-    if (this.isInputActive) this.cancelActiveInput();
+    if (this.isInputActive || this.touchPointers.size > 0) this.cancelActiveInput();
     this.tool = tool;
     this.canvas.style.cursor = tool.kind === "hand" ? "grab" : "crosshair";
   }
 
   get currentScale(): number { return this.scale; }
-  /** True while a stroke, erase gesture, or touch navigation gesture is active. */
+  /** True while a stroke, erase gesture, or intentional touch navigation is active. */
   get isInputActive(): boolean {
-    return this.active !== null || this.eraserBefore !== null || this.touchPointers.size > 0;
+    return this.active !== null || this.eraserBefore !== null || (this.tool.kind === "hand" ? this.touchPointers.size > 0 : this.touchPointers.size >= 2);
   }
   get hasUndo(): boolean { return this.undoStack.length > 0; }
   get hasRedo(): boolean { return this.redoStack.length > 0; }
@@ -305,7 +315,15 @@ export class PaperCanvas {
     this.canvas.removeEventListener("pointerup", this.handlePointerUp);
     this.canvas.removeEventListener("pointercancel", this.handlePointerCancel);
     this.canvas.removeEventListener("lostpointercapture", this.handlePointerCancel);
+    this.canvas.removeEventListener("pointerover", this.handlePenPresence);
+    this.canvas.removeEventListener("pointerenter", this.handlePenPresence);
+    this.canvas.removeEventListener("pointerout", this.handlePointerOut);
+    this.canvas.removeEventListener("pointerleave", this.handlePointerOut);
     this.canvas.removeEventListener("wheel", this.handleWheel);
+    document.removeEventListener("contextmenu", this.handleContextMenu);
+    document.removeEventListener("selectstart", this.handleSelectStart);
+    window.removeEventListener("blur", this.handleWindowBlur);
+    document.removeEventListener("visibilitychange", this.handleVisibilityChange);
   }
 
   private readonly handleResize = (): void => {
@@ -313,7 +331,7 @@ export class PaperCanvas {
     const previousSize = this.lastViewportSize ?? { width: currentRect.width, height: currentRect.height };
     const previousCenter = { x: previousSize.width / 2, y: previousSize.height / 2 };
     const previousWorld = worldPointAt(previousCenter, this.scale, this.offsetX, this.offsetY);
-    this.resizeCanvas();
+    this.resizeCanvas(false);
     const nextRect = this.viewport.getBoundingClientRect();
     if (this.pageKey && nextRect.width > 0 && nextRect.height > 0 && this.fitMode === "width") {
       this.fitToWidth();
@@ -342,7 +360,7 @@ export class PaperCanvas {
     this.render();
   };
 
-  private resizeCanvas(): void {
+  private resizeCanvas(render = true): void {
     this.dpr = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
     this.canvas.width = Math.round(this.width * this.dpr);
     this.canvas.height = Math.round(this.height * this.dpr);
@@ -352,14 +370,16 @@ export class PaperCanvas {
     this.staticCanvas.width = this.canvas.width;
     this.staticCanvas.height = this.canvas.height;
     this.staticContext.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    this.renderStatic();
+    if (render) this.renderStatic();
   }
 
   private readonly handlePointerDown = (event: PointerEvent): void => {
     event.preventDefault();
+    this.markPenPointer(event);
     if (event.pointerType === "touch" || this.tool.kind === "hand") {
       if (this.active || this.eraserBefore) return;
       if (event.pointerType === "mouse" && event.button !== 0) return;
+      if (event.pointerType === "touch" && this.tool.kind !== "hand" && this.penPointers.size > 0) return;
       this.touchPointers.set(event.pointerId, this.touchPoint(event));
       this.capturePointer(event.pointerId);
       this.rebaseTouchGesture();
@@ -390,6 +410,7 @@ export class PaperCanvas {
 
   private readonly handlePointerMove = (event: PointerEvent): void => {
     event.preventDefault();
+    this.markPenPointer(event);
     if (event.pointerType === "touch" || this.touchPointers.has(event.pointerId)) {
       if (this.active || this.eraserBefore) return;
       if (!this.touchPointers.has(event.pointerId)) return;
@@ -398,7 +419,7 @@ export class PaperCanvas {
       if (values.length >= 2) {
         if (!this.pinchStart) this.beginPinch();
         this.updatePinch();
-      } else if (values.length === 1 && this.panLast) {
+      } else if (values.length === 1 && this.tool.kind === "hand" && this.panLast) {
         const point = values[0]!;
         this.offsetX += point.x - this.panLast.x;
         this.offsetY += point.y - this.panLast.y;
@@ -416,6 +437,8 @@ export class PaperCanvas {
 
   private readonly handlePointerUp = (event: PointerEvent): void => {
     event.preventDefault();
+    const penPointer = event.pointerType === "pen" || this.penPointers.has(event.pointerId);
+    if (penPointer) this.penPointers.delete(event.pointerId);
     if (event.pointerType === "touch" || this.touchPointers.has(event.pointerId)) {
       if (this.active || this.eraserBefore) return;
       this.endTouchPointer(event.pointerId);
@@ -451,12 +474,52 @@ export class PaperCanvas {
 
   private readonly handlePointerCancel = (event: Event): void => {
     const pointerEvent = event as PointerEvent;
+    const penPointer = pointerEvent.pointerType === "pen" || this.penPointers.has(pointerEvent.pointerId);
+    if (penPointer) this.penPointers.delete(pointerEvent.pointerId);
     if (this.touchPointers.has(pointerEvent.pointerId) || pointerEvent.pointerType === "touch") {
       this.endTouchPointer(pointerEvent.pointerId);
       return;
     }
     if (this.active?.pointerID === pointerEvent.pointerId || this.eraserPointerID === pointerEvent.pointerId) this.cancelActiveInput();
   };
+
+  private readonly handlePointerOut = (event: Event): void => {
+    const pointerEvent = event as PointerEvent;
+    if (this.penPointers.has(pointerEvent.pointerId) && this.active?.pointerID !== pointerEvent.pointerId) this.penPointers.delete(pointerEvent.pointerId);
+  };
+
+  private readonly handlePenPresence = (event: Event): void => { this.markPenPointer(event as PointerEvent); };
+
+  private readonly handleWindowBlur = (): void => { this.cancelActiveInput(); };
+
+  private readonly handleVisibilityChange = (): void => {
+    if (document.visibilityState === "hidden") this.cancelActiveInput();
+  };
+
+  private readonly handleContextMenu = (event: MouseEvent): void => {
+    if (this.canvas.isConnected && isCanvasChromeTarget(event.target) && !isTextSelectionTarget(event.target)) event.preventDefault();
+  };
+
+  private readonly handleSelectStart = (event: Event): void => {
+    if (this.canvas.isConnected && isCanvasChromeTarget(event.target) && !isTextSelectionTarget(event.target)) event.preventDefault();
+  };
+
+  private markPenPointer(event: PointerEvent): void {
+    if (event.pointerType !== "pen") return;
+    this.penPointers.add(event.pointerId);
+    if (this.tool.kind !== "hand") this.blockTouchNavigation();
+  }
+
+  private blockTouchNavigation(): void {
+    if (this.tool.kind === "hand") return;
+    const pointers = [...this.touchPointers.keys()];
+    this.touchPointers.clear();
+    this.panLast = null;
+    this.pinchStart = null;
+    for (const pointerID of pointers) {
+      try { this.canvas.releasePointerCapture(pointerID); } catch { /* capture may already be gone */ }
+    }
+  }
 
   private touchPoint(event: PointerEvent): TouchPointer {
     const rect = this.viewport.getBoundingClientRect();
@@ -550,7 +613,7 @@ export class PaperCanvas {
     if (notifyZoom) this.callbacks.onZoom(this.scale);
   }
 
-  private cancelActiveInput(): void {
+  private cancelActiveInput(render = true): void {
     const pointers = [...this.touchPointers.keys()];
     if (this.active) pointers.push(this.active.pointerID);
     if (this.eraserPointerID !== null) pointers.push(this.eraserPointerID);
@@ -559,6 +622,7 @@ export class PaperCanvas {
     this.eraserBefore = null;
     this.eraserPointerID = null;
     this.touchPointers.clear();
+    this.penPointers.clear();
     this.panLast = null;
     this.pinchStart = null;
     for (const pointerID of pointers) {
@@ -568,7 +632,7 @@ export class PaperCanvas {
       cancelAnimationFrame(this.activeFrame);
       this.activeFrame = null;
     }
-    this.render();
+    if (render) this.render();
   }
 
   private pushUndo(snapshot: InkStroke[]): void {
@@ -761,6 +825,17 @@ export class PaperCanvas {
       context.stroke();
     }
   }
+}
+
+const CANVAS_CHROME_SELECTOR = ".library, .topbar, .editor-toolbar, .page-bar, .stage-foot, .sidebar, .drawer-backdrop, .inspector, .dialog, .paper-viewport, .paper, #ink-canvas, canvas";
+const TEXT_SELECTION_SELECTOR = "input, textarea, select, [contenteditable]:not([contenteditable=\"false\"])";
+
+function isCanvasChromeTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest(CANVAS_CHROME_SELECTOR) !== null;
+}
+
+function isTextSelectionTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest(TEXT_SELECTION_SELECTOR) !== null;
 }
 
 function cloneStrokes(strokes: InkStroke[]): InkStroke[] {

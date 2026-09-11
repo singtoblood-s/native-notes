@@ -35,10 +35,12 @@ it("requires authentication before opening data, blocks dismissal, and locks aga
   };
   try {
     await import("../src/main");
+    await vi.waitFor(() => expect(element<HTMLDialogElement>("auth-dialog")?.open).toBe(true));
     expect(element<HTMLDialogElement>("auth-dialog").open).toBe(true);
     expect(element("library")).toBeNull();
     expect(state.opened).not.toHaveBeenCalled();
     expect(element("cancel-auth")).toBeNull();
+    expect(element("export-legacy-notes")).toBeNull();
     const cancel = new Event("cancel", { cancelable: true });
     element("auth-dialog").dispatchEvent(cancel);
     expect(cancel.defaultPrevented).toBe(true);
@@ -49,6 +51,7 @@ it("requires authentication before opening data, blocks dismissal, and locks aga
     submit();
     await vi.waitFor(() => expect(state.start).toHaveBeenCalled());
     expect(element("library").hidden).toBe(false);
+    expect(element("export-legacy-notes")).toBeNull();
     expect(state.opened).toHaveBeenCalledTimes(1);
     expect(state.opened).toHaveBeenCalledWith("https://sync.example.test:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
     element("logout-button").click();
