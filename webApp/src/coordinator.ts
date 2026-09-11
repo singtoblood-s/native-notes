@@ -243,6 +243,11 @@ export class SyncCoordinator {
         this.scheduleRetry(generation);
         return;
       }
+      if (report.blockedReason) {
+        this.publishIfCurrent(generation, { state: "error", error: report.blockedReason });
+        this.scheduleRetry(generation);
+        return;
+      }
       this.retryCount = 0;
       this.publishIfCurrent(generation, { state: "idle", lastSuccessAt: now(), error: null });
       // Keep a local-write/auth request that arrived while the network was in

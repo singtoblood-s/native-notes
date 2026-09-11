@@ -15,13 +15,18 @@ import { NoteStore } from "./storage";
 const MAX_PUSH_OPERATIONS = 10;
 const MAX_PULL_CHANGES = 100;
 const MAX_PUSH_BYTES = 3 * 1024 * 1024;
-const MAX_OPERATION_PAYLOAD_BYTES = 1_900_000;
+const MAX_OPERATION_PAYLOAD_BYTES = 32 * 1024 * 1024;
+const MAX_LARGE_PUSH_BYTES = 34 * 1024 * 1024;
+const MAX_PENDING_OPERATIONS = 100;
 const MAX_PULL_PAGES = 1000;
+const PUSH_BLOCKED_REASON = "A note change exceeds the 32 MiB server limit; it remains queued.";
+const textEncoder = new TextEncoder();
 
 export interface SyncReport {
   pushed: number;
   pulled: number;
   conflicts: number;
+  blockedReason?: string;
 }
 
 export class SyncHttpError extends Error {
@@ -42,31 +47,61 @@ export class SyncHttpError extends Error {
  * durable retry record left behind when a previous request did not finish.
  */
 export function selectPushBatch(operations: SyncOperation[], maxBytes = MAX_PUSH_BYTES): SyncOperation[] {
+  return selectPushBatchDetails(operations, maxBytes).batch;
+}
+
+interface SizedOperation {
+  payloadBytes: number;
+  requestBytes: number;
+}
+
+interface PushBatchSelection {
+  batch: SyncOperation[];
+  skippedOversized: boolean;
+}
+
+function selectPushBatchDetails(operations: SyncOperation[], maxBytes: number): PushBatchSelection {
   const batch: SyncOperation[] = [];
   const entities = new Set<string>();
+  let skippedOversized = false;
   for (const operation of operations) {
-    const payloadBytes = new TextEncoder().encode(JSON.stringify(toWirePayload(operation))).byteLength;
-    if (payloadBytes > MAX_OPERATION_PAYLOAD_BYTES) throw new Error("A note change is larger than the server payload limit.");
+    const item = sizeOperation(operation);
     const entityKey = `${operation.entityType}:${operation.entityId}`;
     if (entities.has(entityKey)) continue;
-    if (new TextEncoder().encode(JSON.stringify(toWireOperation(operation))).byteLength > MAX_OPERATION_PAYLOAD_BYTES) {
-      throw new Error("A note change is larger than the server payload limit.");
+    entities.add(entityKey);
+    if (isOversized(item)) {
+      skippedOversized = true;
+      continue;
     }
     const candidate = [...batch, operation];
     const size = encodedPushSize(candidate);
     if (size > maxBytes) {
-      if (batch.length === 0) throw new Error("A note change is larger than the server request limit.");
+      if (batch.length === 0 && item.requestBytes > maxBytes) {
+        batch.push(operation);
+        return { batch, skippedOversized };
+      }
       break;
     }
     batch.push(operation);
-    entities.add(entityKey);
     if (batch.length >= MAX_PUSH_OPERATIONS) break;
   }
-  return batch;
+  return { batch, skippedOversized };
 }
 
 function encodedPushSize(operations: SyncOperation[]): number {
-  return new TextEncoder().encode(JSON.stringify({ operations: operations.map(toWireOperation) })).byteLength;
+  return textEncoder.encode(JSON.stringify({ operations: operations.map(toWireOperation) })).byteLength;
+}
+
+function sizeOperation(operation: SyncOperation): SizedOperation {
+  const payload = toWirePayload(operation);
+  return {
+    payloadBytes: textEncoder.encode(JSON.stringify(payload)).byteLength,
+    requestBytes: encodedPushSize([operation]),
+  };
+}
+
+function isOversized(operation: SizedOperation): boolean {
+  return operation.payloadBytes > MAX_OPERATION_PAYLOAD_BYTES || operation.requestBytes > MAX_LARGE_PUSH_BYTES;
 }
 
 function toWireOperation(operation: SyncOperation): Record<string, unknown> {
@@ -129,10 +164,12 @@ export class SyncClient {
     let rounds = 0;
     while (true) {
       if (++rounds > MAX_PULL_PAGES) throw new Error("Sync has too many pending note changes; try again later.");
-      const available = await store.pendingOperations(MAX_PUSH_OPERATIONS);
+      const available = await store.pendingOperations(MAX_PENDING_OPERATIONS);
       if (available.length === 0) return;
-      const batch = selectPushBatch(available);
-      if (batch.length === 0) throw new Error("Sync could not select a note change.");
+      const selection = selectPushBatchDetails(available, MAX_PUSH_BYTES);
+      if (selection.skippedOversized) report.blockedReason = PUSH_BLOCKED_REASON;
+      const batch = selection.batch;
+      if (batch.length === 0) return;
 
       // Mark before sending. A process kill now leaves a sending row that will
       // be retried with the same opId and immutable payload.
@@ -144,6 +181,14 @@ export class SyncClient {
         immutableBatch.push(stored);
       }
       if (immutableBatch.length === 0) continue;
+      const immutableSizes = immutableBatch.map(sizeOperation);
+      const requestLimit = immutableBatch.length === 1 && immutableSizes[0]!.requestBytes > MAX_PUSH_BYTES
+        ? MAX_LARGE_PUSH_BYTES
+        : MAX_PUSH_BYTES;
+      if (immutableSizes.some(isOversized) || encodedPushSize(immutableBatch) > requestLimit) {
+        report.blockedReason = PUSH_BLOCKED_REASON;
+        return;
+      }
       const push = await this.request<PushResponse>(`${endpoint}/v1/sync/push`, token, {
         method: "POST",
         headers: { "Content-Type": "application/json" },

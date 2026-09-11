@@ -964,7 +964,21 @@ export class SQLiteNoteStoreEngine implements NoteStore {
   }
 
   private applyRemoteDirect(change: PullChange): void {
-    if (this.pendingForEntityDirect(change.entityType, change.entityId).length > 0) {
+    const pending = this.pendingForEntityDirect(change.entityType, change.entityId);
+    // Pulls can contain our own acknowledged change while a newer local edit
+    // is already queued. It is historical at that point and must not become a
+    // conflict copy. Pending base revisions cover a row that has not yet been
+    // refreshed with its latest acknowledged revision.
+    const table = change.entityType === "page" ? "pages" : "notebooks";
+    const row = this.row(change.entityId, table);
+    const currentRevision = row ? Number(row.revision) : 0;
+    if (!Number.isInteger(currentRevision) || currentRevision < 0) throw new CorruptSnapshotError("Stored entity revision is invalid");
+    const acknowledgedRevision = Math.max(
+      currentRevision,
+      ...pending.map((operation) => operation.baseRevision),
+    );
+    if (change.revision <= acknowledgedRevision) return;
+    if (pending.length > 0) {
       this.insertConflictDirect(change.entityType, change.entityId, change.payload, "remote update while local edit is pending", change.sequence);
       return;
     }
@@ -995,6 +1009,10 @@ export class SQLiteNoteStoreEngine implements NoteStore {
   }
 
   private insertConflictDirect(entityType: SyncEntityType, entityID: string, payload: Record<string, unknown>, reason: string, sequence: number): void {
+    if (sequence > 0 && this.query<{ id: unknown }>(
+      "SELECT id FROM conflicts WHERE entity_type = ? AND entity_id = ? AND sequence = ? LIMIT 1",
+      [entityType, entityID, sequence],
+    ).length > 0) return;
     this.db.exec({ sql: "INSERT INTO conflicts(id, entity_type, entity_id, payload, created_at, reason, sequence) VALUES(?, ?, ?, ?, ?, ?, ?)", bind: [id(), entityType, entityID, JSON.stringify(payload), now(), reason, sequence] });
     // Keep the conflict recoverable through the normal notebook/page lists and
     // archive export. A newly recovered parent is also queued in this same

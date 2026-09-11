@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AuthResponse, PullChange, SyncOperation } from "../src/models";
+import { AuthResponse, PullChange, SyncOperation, toWirePayload } from "../src/models";
 import { NoteStore } from "../src/storage";
 import { SyncClient, selectPushBatch } from "../src/sync";
 
 const notebookID = "11111111-1111-4111-8111-111111111111";
+const pageID = "22222222-2222-4222-8222-222222222222";
+const strokeID = "77777777-7777-4777-8777-777777777777";
 const operationID = "33333333-3333-4333-8333-333333333333";
 const secondOperationID = "44444444-4444-4444-8444-444444444444";
 const session: AuthResponse = {
@@ -25,7 +27,40 @@ function operation(opId: string, entityId = notebookID): SyncOperation {
   };
 }
 
-function fakeStore(initial: SyncOperation[], initialCursor = 0): { store: NoteStore; cursor: () => number; sent: SyncOperation[]; pulled: PullChange[][]; events: string[] } {
+function inkOperation(opId: string, points: number): SyncOperation {
+  return {
+    ...operation(opId, pageID),
+    entityType: "page",
+    payload: {
+      id: pageID,
+      notebookId: notebookID,
+      title: "Ink",
+      text: "",
+      background: "blank",
+      width: 1024,
+      height: 1366,
+      strokes: [{
+        id: strokeID,
+        color: 0xff1b1b1f,
+        width: 2.5,
+        points: Array.from({ length: points }, (_, index) => ({
+          x: index % 1000,
+          y: Math.floor(index / 1000),
+          pressure: 0.5,
+          time: index,
+          tiltX: null,
+          tiltY: null,
+        })),
+      }],
+      formatVersion: 1,
+      revision: 0,
+      updatedAt: "2026-01-01T00:00:00Z",
+      deletedAt: null,
+    },
+  };
+}
+
+function fakeStore(initial: SyncOperation[], initialCursor = 0): { store: NoteStore; cursor: () => number; sent: SyncOperation[]; pulled: PullChange[][]; events: string[]; remaining: () => SyncOperation[] } {
   const outbox = new Map(initial.map((item) => [item.opId, structuredClone(item)]));
   let currentCursor = initialCursor;
   const sent: SyncOperation[] = [];
@@ -46,7 +81,7 @@ function fakeStore(initial: SyncOperation[], initialCursor = 0): { store: NoteSt
     setCursor: vi.fn(async (next: number) => { currentCursor = next; }),
     listConflicts: vi.fn(async () => []),
   } as unknown as NoteStore;
-  return { store, cursor: () => currentCursor, sent, pulled, events };
+  return { store, cursor: () => currentCursor, sent, pulled, events, remaining: () => [...outbox.values()] };
 }
 
 afterEach(() => {
@@ -189,6 +224,108 @@ describe("sync durability protocol", () => {
   it("sends at most one queued revision for an entity in a batch", () => {
     const selected = selectPushBatch([operation(operationID), operation(secondOperationID, notebookID)]);
     expect(selected.map((item) => item.opId)).toEqual([operationID]);
+  });
+
+  it("measures UTF-8 bytes instead of JavaScript string length", () => {
+    const unicode = operation(operationID);
+    const title = "é".repeat(1_000_000);
+    unicode.payload = { ...unicode.payload, title };
+
+    const payloadBytes = new TextEncoder().encode(JSON.stringify(unicode.payload)).byteLength;
+    expect(title.length).toBeLessThan(1_900_000);
+    expect(payloadBytes).toBeGreaterThan(1_900_000);
+    expect(selectPushBatch([unicode])).toEqual([unicode]);
+  });
+
+  it("round trips every ink point after the former payload ceiling", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const ink = inkOperation(operationID, 30_000);
+    const wirePayload = toWirePayload(ink);
+    expect(new TextEncoder().encode(JSON.stringify(wirePayload)).byteLength).toBeGreaterThan(1_900_000);
+    const fake = fakeStore([ink]);
+    let received: Record<string, unknown> | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("/push")) {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { operations?: Array<Record<string, unknown>> };
+        received = body.operations?.[0];
+        return new Response(JSON.stringify({ results: [{ opId: operationID, status: "acked", revision: 1, sequence: null, serverPayload: null, code: null }], cursor: 1 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ changes: [], nextCursor: 0, hasMore: false }), { status: 200 });
+    }));
+
+    const report = await new SyncClient().sync(fake.store, session);
+    const receivedPayload = received?.payload as { strokes?: Array<{ points?: unknown[] }> } | undefined;
+    expect(report).toEqual({ pushed: 1, pulled: 0, conflicts: 0 });
+    expect(received?.payload).toEqual(wirePayload);
+    expect(receivedPayload?.strokes?.[0]?.points).toHaveLength(30_000);
+  });
+
+  it("sends a large operation alone within the larger request bound", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const largeOperationID = "88888888-8888-4888-8888-888888888888";
+    const largeEntityID = "99999999-9999-4999-8999-999999999999";
+    const normalEntityID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const large = operation(largeOperationID, largeEntityID);
+    large.payload = { ...large.payload, title: "x".repeat(3_200_000) };
+    const normal = operation(secondOperationID, normalEntityID);
+    const fake = fakeStore([large, normal]);
+    const pushBatches: string[][] = [];
+    const pushBytes: number[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("/push")) {
+        const raw = String(init?.body ?? "{}");
+        const body = JSON.parse(raw) as { operations?: Array<{ opId: string }> };
+        const batch = body.operations ?? [];
+        pushBatches.push(batch.map((item) => item.opId));
+        pushBytes.push(new TextEncoder().encode(raw).byteLength);
+        return new Response(JSON.stringify({
+          results: batch.map((item, itemIndex) => ({ opId: item.opId, status: "acked", revision: 1, sequence: itemIndex + 1, serverPayload: null, code: null })),
+          cursor: batch.length,
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ changes: [], nextCursor: 0, hasMore: false }), { status: 200 });
+    }));
+
+    const report = await new SyncClient().sync(fake.store, session);
+    expect(pushBatches).toEqual([[largeOperationID], [secondOperationID]]);
+    expect(pushBytes[0]).toBeGreaterThan(3 * 1024 * 1024);
+    expect(pushBytes[0]).toBeLessThanOrEqual(34 * 1024 * 1024);
+    expect(pushBytes[1]).toBeLessThanOrEqual(3 * 1024 * 1024);
+    expect(report.pushed).toBe(2);
+  });
+
+  it("skips an oversized row while pushing independent work and pulling", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const oversizedOperationID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const oversizedEntityID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const independentEntityID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const oversized = operation(oversizedOperationID, oversizedEntityID);
+    oversized.payload = { ...oversized.payload, title: "x".repeat(32 * 1024 * 1024) };
+    const independent = operation(secondOperationID, independentEntityID);
+    const fake = fakeStore([oversized, independent]);
+    const pushed: string[] = [];
+    const change: PullChange = {
+      sequence: 1,
+      entityType: "notebook",
+      entityId: independentEntityID,
+      revision: 1,
+      action: "upsert",
+      payload: { ...independent.payload, revision: 1 },
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("/push")) {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { operations?: Array<{ opId: string }> };
+        pushed.push(...(body.operations ?? []).map((item) => item.opId));
+        return new Response(JSON.stringify({ results: (body.operations ?? []).map((item) => ({ opId: item.opId, status: "acked", revision: 1, sequence: null, serverPayload: null, code: null })), cursor: 1 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ changes: [change], nextCursor: 1, hasMore: false }), { status: 200 });
+    }));
+
+    const report = await new SyncClient().sync(fake.store, session);
+    expect(pushed).toEqual([secondOperationID]);
+    expect(fake.remaining().map((item) => item.opId)).toEqual([oversizedOperationID]);
+    expect(report.pulled).toBe(1);
+    expect(report.blockedReason).toContain("32 MiB");
   });
 
   it("does not upload a workspace selected for another account", async () => {

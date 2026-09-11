@@ -67,7 +67,10 @@ interface StoredDocument {
   entityType: EntityType;
   entityId: string;
   revision: number;
-  payload: string;
+  /** Hydrated JSON, or null until a chunked snapshot is needed. */
+  payload: string | null;
+  /** The exact value stored in documents.payload (inline JSON or marker). */
+  storedPayload: string;
   deleted: boolean;
   updatedAt: string;
 }
@@ -79,6 +82,7 @@ interface StoredOperation {
   revision: number | null;
   sequence: number | null;
   server_payload: string | null;
+  serverPayloadStorage: string | null;
   code: string | null;
 }
 
@@ -111,6 +115,7 @@ interface AckPlan {
   operation: Operation;
   requestHash: string;
   document: StoredDocument;
+  payloadChunks: PayloadChunks;
   action: SyncAction;
   result: PushResult;
 }
@@ -119,10 +124,26 @@ interface FinalPlan {
   kind: "final";
   operation: Operation;
   requestHash: string;
+  serverPayloadStorage: string | null;
   result: PushResult;
 }
 
 type WritePlan = AckPlan | FinalPlan;
+
+interface PayloadChunks {
+  storedPayload: string;
+  chunks: string[];
+}
+
+interface RawChange {
+  sequence: number;
+  entityType: EntityType;
+  entityId: string;
+  revision: number;
+  action: SyncAction;
+  storedPayload: string;
+  payloadBytes: number;
+}
 
 const PBKDF2_ITERATIONS = 600_000;
 const PBKDF2_BITS = 256;
@@ -130,18 +151,25 @@ const SALT_BYTES = 16;
 const SESSION_BYTES = 32;
 const SESSION_DAYS = 30;
 const MAX_AUTH_BODY = 64 * 1024;
-const MAX_SYNC_BODY = 4 * 1024 * 1024;
-// Free D1 allows 50 queries per invocation. Ten acknowledged operations use
-// 40 write statements; auth, preflight reads, receipt reload, and cursor read
-// keep the request at 45 queries, leaving a small margin.
+const MAX_SYNC_BODY = 36 * 1024 * 1024;
+// Free D1 allows 50 queries per invocation. Multi-operation pushes are capped
+// at 3 MiB and large single operations batch their chunk inserts by parameter
+// count so the write and hydration paths stay below that ceiling.
 const MAX_PUSH_OPERATIONS = 10;
-// D1's 2,000,000-byte row limit includes the other document columns. The
-// Worker keeps a margin below the Kotlin server's 2 MiB payload upper bound.
-const MAX_PAYLOAD_BYTES = 1_900_000;
+// D1's 2,000,000-byte row limit applies to each row. Large JSON snapshots are
+// kept in immutable UTF-8 chunks and the existing rows keep a small marker.
+const MAX_PAYLOAD_BYTES = 32 * 1024 * 1024;
+const INLINE_PAYLOAD_BYTES = 1_800_000;
+const PAYLOAD_CHUNK_BYTES = 900_000;
+const PAYLOAD_MARKER_PREFIX = "@payload:";
+const MAX_PULL_RESPONSE_BYTES = 4 * 1024 * 1024;
+const PULL_CHANGE_OVERHEAD_BYTES = 8 * 1024;
+const MAX_MULTI_OPERATION_BYTES = 3 * 1024 * 1024;
 const MAX_STROKES = 10_000;
 const MAX_POINTS = 200_000;
-const MAX_BATCH_STATEMENTS = 48;
+const MAX_BATCH_STATEMENTS = 45;
 const MAX_SQL_PARAMETERS = 100;
+const MAX_CHUNKS_PER_STATEMENT = Math.floor((MAX_SQL_PARAMETERS - 3) / 4);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DUMMY_SALT = new Uint8Array(SALT_BYTES);
 const textEncoder = new TextEncoder();
@@ -747,6 +775,105 @@ function canonicalPayload(value: NotebookPayload | PagePayload, action: SyncActi
   return { payload, deleted: action === "delete" || deletedAt !== null, updatedAt };
 }
 
+async function payloadChunks(payload: string): Promise<PayloadChunks> {
+  const bytes = textEncoder.encode(payload);
+  if (bytes.byteLength <= INLINE_PAYLOAD_BYTES) return { storedPayload: payload, chunks: [] };
+  const chunks = splitUtf8(bytes);
+  const payloadRef = await sha256Base64(payload);
+  return {
+    storedPayload: `${PAYLOAD_MARKER_PREFIX}${payloadRef}:${bytes.byteLength}:${chunks.length}`,
+    chunks,
+  };
+}
+
+function splitUtf8(bytes: Uint8Array): string[] {
+  const chunks: string[] = [];
+  for (let start = 0; start < bytes.byteLength;) {
+    let end = Math.min(bytes.byteLength, start + PAYLOAD_CHUNK_BYTES);
+    while (end < bytes.byteLength && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+    if (end <= start) throw new ApiFailure(500, "internal_error", "The server could not split a note payload");
+    chunks.push(new TextDecoder().decode(bytes.slice(start, end)));
+    start = end;
+  }
+  return chunks;
+}
+
+interface PayloadMarker {
+  ref: string;
+  bytes: number;
+  parts: number;
+}
+
+function parsePayloadMarker(value: string): PayloadMarker | null {
+  if (!value.startsWith(PAYLOAD_MARKER_PREFIX)) return null;
+  const match = /^@payload:([A-Za-z0-9_-]{43}):([1-9][0-9]*):([1-9][0-9]*)$/.exec(value);
+  if (!match) throw new ApiFailure(500, "internal_error", "The server could not complete the request");
+  const bytes = Number(match[2]);
+  const parts = Number(match[3]);
+  if (!Number.isSafeInteger(bytes) || bytes > MAX_PAYLOAD_BYTES || !Number.isSafeInteger(parts) || parts < 2 || parts > Math.ceil(MAX_PAYLOAD_BYTES / PAYLOAD_CHUNK_BYTES) + 1) {
+    throw new ApiFailure(500, "internal_error", "The server could not complete the request");
+  }
+  return { ref: match[1]!, bytes, parts };
+}
+
+async function hydratePayloads(db: D1Database, userId: string, storedPayloads: string[]): Promise<Map<string, string>> {
+  const markers = [...new Set(storedPayloads.filter((value) => parsePayloadMarker(value) !== null))].map((value) => parsePayloadMarker(value)!);
+  if (markers.length === 0) return new Map();
+  const chunksByRef = new Map<string, string[]>();
+  for (const marker of markers) chunksByRef.set(marker.ref, []);
+  const statements: D1PreparedStatement[] = [];
+  for (const group of chunks(markers, MAX_SQL_PARAMETERS - 1)) {
+    const placeholders = group.map(() => "?").join(",");
+    statements.push(db.prepare(
+      `SELECT payload_ref, chunk_index, payload FROM payload_chunks WHERE user_id = ? AND payload_ref IN (${placeholders}) ORDER BY payload_ref, chunk_index`,
+    ).bind(userId, ...group.map((marker) => marker.ref)));
+  }
+  const rows = await db.batch(statements);
+  for (const batch of rows) {
+    for (const row of rowsFrom(batch)) {
+      const typed = row as { payload_ref?: unknown; chunk_index?: unknown; payload?: unknown };
+      if (typeof typed.payload_ref !== "string" || typeof typed.payload !== "string") {
+        throw new ApiFailure(500, "internal_error", "The server could not complete the request");
+      }
+      const index = nullableInteger(typed.chunk_index);
+      const target = chunksByRef.get(typed.payload_ref);
+      if (index === null || !target || index !== target.length) {
+        throw new ApiFailure(500, "internal_error", "The server could not complete the request");
+      }
+      target.push(typed.payload);
+    }
+  }
+  const result = new Map<string, string>();
+  for (const marker of markers) {
+    const parts = chunksByRef.get(marker.ref)!;
+    if (parts.length !== marker.parts) throw new ApiFailure(500, "internal_error", "The server could not complete the request");
+    const payload = parts.join("");
+    if (textEncoder.encode(payload).byteLength !== marker.bytes) throw new ApiFailure(500, "internal_error", "The server could not complete the request");
+    result.set(`${PAYLOAD_MARKER_PREFIX}${marker.ref}:${marker.bytes}:${marker.parts}`, payload);
+  }
+  return result;
+}
+
+async function hydrateDocument(db: D1Database, userId: string, document: StoredDocument): Promise<string> {
+  if (document.payload !== null) return document.payload;
+  const marker = parsePayloadMarker(document.storedPayload);
+  let payload: string | undefined;
+  if (marker) {
+    payload = (await hydratePayloads(db, userId, [document.storedPayload])).get(document.storedPayload);
+  } else {
+    const row = await db.prepare("SELECT payload FROM documents WHERE user_id = ? AND entity_type = ? AND entity_id = ?")
+      .bind(userId, document.entityType, document.entityId)
+      .first<{ payload?: unknown }>();
+    if (typeof row?.payload === "string") {
+      payload = row.payload;
+      document.storedPayload = row.payload;
+    }
+  }
+  if (payload === undefined) throw new ApiFailure(500, "internal_error", "The server could not complete the request");
+  document.payload = payload;
+  return payload;
+}
+
 function operationWireJson(operation: Operation): string {
   return JSON.stringify({
     opId: operation.opId,
@@ -780,6 +907,8 @@ function storedResult(row: StoredOperation): PushResult {
     } catch {
       throw new ApiFailure(500, "internal_error", "The server could not complete the request");
     }
+  } else if (row.serverPayloadStorage !== null) {
+    throw new ApiFailure(500, "internal_error", "The server could not complete the request");
   }
   const status: PushStatus = row.status === "acked" ? "acked" : row.status === "conflict" ? "conflict" : "rejected";
   return toPushResult(row.opId, status, row.revision, row.sequence, serverPayload, row.code);
@@ -787,13 +916,20 @@ function storedResult(row: StoredOperation): PushResult {
 
 async function push(db: D1Database, userId: string, operations: Operation[]): Promise<{ results: PushResult[]; cursor: number }> {
   if (operations.length > MAX_PUSH_OPERATIONS) throw new ApiFailure(413, "too_many_operations", `At most ${MAX_PUSH_OPERATIONS} operations may be sent`);
-  const hashes = await Promise.all(operations.map((operation) => sha256Base64(operationWireJson(operation))));
+  const wireJson = operations.map(operationWireJson);
+  const aggregateBytes = textEncoder.encode(`{"operations":[${wireJson.join(",")}]}`).byteLength;
+  if (operations.length > 1 && aggregateBytes > MAX_MULTI_OPERATION_BYTES) {
+    throw new ApiFailure(413, "too_many_operations", "Large note changes must be sent one at a time");
+  }
+  const hashes = await Promise.all(wireJson.map((value) => sha256Base64(value)));
   const stored = await loadStoredOperations(db, userId, operations.map((operation) => operation.opId));
   const documents = await loadDocuments(db, userId, operations);
   const predicted = new Map<string, StoredDocument>(documents);
   const plannedByOperation = new Map<string, { requestHash: string; result: PushResult }>();
   const plans: WritePlan[] = [];
   const results: PushResult[] = [];
+  let conflictHydrationQueries = 0;
+  let storedHydrationQueries = 0;
 
   for (let index = 0; index < operations.length; index += 1) {
     const operation = operations[index]!;
@@ -815,6 +951,8 @@ async function push(db: D1Database, userId: string, operations: Operation[]): Pr
       continue;
     }
     if (existing && existing.status !== "processing") {
+      if (existing.serverPayloadStorage !== null && existing.server_payload === null) storedHydrationQueries += 1;
+      await hydrateStoredOperation(db, userId, existing);
       const result = storedResult(existing);
       plannedByOperation.set(operation.opId, { requestHash, result });
       results.push(result);
@@ -828,7 +966,7 @@ async function push(db: D1Database, userId: string, operations: Operation[]): Pr
       const failure = error instanceof ApiFailure ? error : new ApiFailure(400, "invalid_payload", "Note payload is invalid");
       const result = toPushResult(operation.opId, "rejected", null, null, null, failure.code);
       plannedByOperation.set(operation.opId, { requestHash, result });
-      plans.push({ kind: "final", operation, requestHash, result });
+      plans.push({ kind: "final", operation, requestHash, serverPayloadStorage: null, result });
       results.push(result);
       continue;
     }
@@ -836,36 +974,47 @@ async function push(db: D1Database, userId: string, operations: Operation[]): Pr
     const current = predicted.get(documentKey(operation.entityType, operation.entityId));
     const currentRevision = current?.revision ?? 0;
     if (operation.baseRevision !== currentRevision) {
+      if (current?.payload === null) conflictHydrationQueries += 1;
+      const currentPayload = current ? await hydrateDocument(db, userId, current) : null;
       const result = toPushResult(
         operation.opId,
         "conflict",
         currentRevision,
         null,
-        current ? parseStoredPayload(current.payload) : null,
+        currentPayload ? parseStoredPayload(currentPayload) : null,
         "revision_conflict",
       );
       plannedByOperation.set(operation.opId, { requestHash, result });
-      plans.push({ kind: "final", operation, requestHash, result });
+      plans.push({ kind: "final", operation, requestHash, serverPayloadStorage: current?.storedPayload ?? null, result });
       results.push(result);
       continue;
     }
 
     const canonical = canonicalPayload(validated.value, operation.action, currentRevision + 1);
+    const storedPayload = await payloadChunks(canonical.payload);
     const document: StoredDocument = {
       entityType: operation.entityType,
       entityId: operation.entityId,
       revision: currentRevision + 1,
       payload: canonical.payload,
+      storedPayload: storedPayload.storedPayload,
       deleted: canonical.deleted,
       updatedAt: canonical.updatedAt,
     };
     const result = toPushResult(operation.opId, "acked", document.revision, null, null, null);
     plannedByOperation.set(operation.opId, { requestHash, result });
-    plans.push({ kind: "ack", operation, requestHash, document, action: operation.action, result });
+    plans.push({ kind: "ack", operation, requestHash, document, payloadChunks: storedPayload, action: operation.action, result });
     predicted.set(documentKey(operation.entityType, operation.entityId), document);
     results.push(result);
   }
 
+  const operationWriteStatements = plans.reduce((total, plan) => total + (plan.kind === "ack"
+    ? Math.ceil(plan.payloadChunks.chunks.length / MAX_CHUNKS_PER_STATEMENT) + 4
+    : 1), 0);
+  const receiptHydrationQueries = plans.reduce((total, plan) => total + (plan.kind === "final" && plan.result.serverPayload !== null ? 1 : 0), 0);
+  if (operationWriteStatements + conflictHydrationQueries + storedHydrationQueries + receiptHydrationQueries > MAX_BATCH_STATEMENTS) {
+    throw new ApiFailure(413, "too_many_operations", "This push exceeds the server query budget");
+  }
   await persistPlans(db, userId, plans);
   if (plans.length > 0) {
     const receipts = await loadStoredOperations(db, userId, operations.map((operation) => operation.opId));
@@ -873,7 +1022,10 @@ async function push(db: D1Database, userId: string, operations: Operation[]): Pr
       const result = results[index]!;
       if (result.code === "idempotency_mismatch") continue;
       const receipt = receipts.get(result.opId);
-      if (receipt && receipt.request_hash === hashes[index]) results[index] = storedResult(receipt);
+      if (receipt && receipt.request_hash === hashes[index]) {
+        await hydrateStoredOperation(db, userId, receipt);
+        results[index] = storedResult(receipt);
+      }
     }
   }
   const cursor = await maxUserSequence(db, userId);
@@ -897,27 +1049,54 @@ async function loadStoredOperations(db: D1Database, userId: string, opIds: strin
   for (const chunk of chunks(unique, MAX_SQL_PARAMETERS - 1)) {
     const placeholders = chunk.map(() => "?").join(",");
     statements.push(db.prepare(
-      `SELECT op_id, request_hash, status, revision, sequence, server_payload, code FROM sync_operations WHERE user_id = ? AND op_id IN (${placeholders})`,
+      `SELECT op_id, request_hash, status, revision, sequence,
+         CASE WHEN server_payload IS NULL THEN NULL
+              WHEN substr(server_payload, 1, ${PAYLOAD_MARKER_PREFIX.length}) = '${PAYLOAD_MARKER_PREFIX}' THEN server_payload
+              ELSE '' END AS server_payload_storage,
+         server_payload IS NOT NULL AS has_server_payload, code
+       FROM sync_operations WHERE user_id = ? AND op_id IN (${placeholders})`,
     ).bind(userId, ...chunk));
   }
   const rows = await db.batch(statements);
   const result = new Map<string, StoredOperation>();
   for (const batch of rows) {
     for (const row of rowsFrom(batch)) {
-      const typed = row as { op_id?: unknown; request_hash?: unknown; status?: unknown; revision?: unknown; sequence?: unknown; server_payload?: unknown; code?: unknown };
+      const typed = row as { op_id?: unknown; request_hash?: unknown; status?: unknown; revision?: unknown; sequence?: unknown; server_payload_storage?: unknown; has_server_payload?: unknown; code?: unknown };
       if (typeof typed.op_id !== "string" || typeof typed.request_hash !== "string" || typeof typed.status !== "string") continue;
+      const hasServerPayload = Number(typed.has_server_payload) !== 0;
+      const serverPayloadStorage = hasServerPayload
+        ? typeof typed.server_payload_storage === "string" ? typed.server_payload_storage : null
+        : null;
       result.set(typed.op_id, {
         opId: typed.op_id,
         request_hash: typed.request_hash,
         status: typed.status,
         revision: nullableInteger(typed.revision),
         sequence: nullableInteger(typed.sequence),
-        server_payload: typed.server_payload === null || typed.server_payload === undefined ? null : String(typed.server_payload),
+        server_payload: null,
+        serverPayloadStorage,
         code: typed.code === null || typed.code === undefined ? null : String(typed.code),
       });
     }
   }
   return result;
+}
+
+async function hydrateStoredOperation(db: D1Database, userId: string, operation: StoredOperation): Promise<void> {
+  if (operation.serverPayloadStorage === null || operation.server_payload !== null) return;
+  const marker = parsePayloadMarker(operation.serverPayloadStorage);
+  if (marker) {
+    const hydrated = await hydratePayloads(db, userId, [operation.serverPayloadStorage]);
+    operation.server_payload = hydrated.get(operation.serverPayloadStorage) ?? null;
+    if (operation.server_payload === null) throw new ApiFailure(500, "internal_error", "The server could not complete the request");
+    return;
+  }
+  const row = await db.prepare("SELECT server_payload FROM sync_operations WHERE user_id = ? AND op_id = ?")
+    .bind(userId, operation.opId)
+    .first<{ server_payload?: unknown }>();
+  if (typeof row?.server_payload !== "string") throw new ApiFailure(500, "internal_error", "The server could not complete the request");
+  operation.serverPayloadStorage = row.server_payload;
+  operation.server_payload = row.server_payload;
 }
 
 async function loadDocuments(db: D1Database, userId: string, operations: Operation[]): Promise<Map<string, StoredDocument>> {
@@ -934,20 +1113,25 @@ async function loadDocuments(db: D1Database, userId: string, operations: Operati
   for (const chunk of chunks(unique, MAX_SQL_PARAMETERS - 1)) {
     const placeholders = chunk.map(() => "?").join(",");
     statements.push(db.prepare(
-      `SELECT entity_type, entity_id, revision, payload, deleted, updated_at FROM documents WHERE user_id = ? AND entity_id IN (${placeholders})`,
+      `SELECT entity_type, entity_id, revision,
+         CASE WHEN substr(payload, 1, ${PAYLOAD_MARKER_PREFIX.length}) = '${PAYLOAD_MARKER_PREFIX}' THEN payload ELSE '' END AS payload_storage,
+         deleted, updated_at
+       FROM documents WHERE user_id = ? AND entity_id IN (${placeholders})`,
     ).bind(userId, ...chunk));
   }
   const rows = await db.batch(statements);
   const result = new Map<string, StoredDocument>();
   for (const batch of rows) {
     for (const row of rowsFrom(batch)) {
-      const typed = row as { entity_type?: unknown; entity_id?: unknown; revision?: unknown; payload?: unknown; deleted?: unknown; updated_at?: unknown };
-      if ((typed.entity_type !== "notebook" && typed.entity_type !== "page") || typeof typed.entity_id !== "string" || typeof typed.payload !== "string") continue;
+      const typed = row as { entity_type?: unknown; entity_id?: unknown; revision?: unknown; payload_storage?: unknown; deleted?: unknown; updated_at?: unknown };
+      if ((typed.entity_type !== "notebook" && typed.entity_type !== "page") || typeof typed.entity_id !== "string" || typeof typed.payload_storage !== "string") continue;
+      if (typed.payload_storage) parsePayloadMarker(typed.payload_storage);
       const document: StoredDocument = {
         entityType: typed.entity_type,
         entityId: typed.entity_id,
         revision: nullableInteger(typed.revision) ?? 0,
-        payload: typed.payload,
+        payload: null,
+        storedPayload: typed.payload_storage,
         deleted: Number(typed.deleted) !== 0,
         updatedAt: String(typed.updated_at ?? ""),
       };
@@ -989,8 +1173,7 @@ async function persistPlans(db: D1Database, userId: string, plans: WritePlan[]):
 }
 
 function finalOperationStatement(db: D1Database, userId: string, plan: FinalPlan): D1PreparedStatement {
-  const { operation, requestHash, result } = plan;
-  const serverPayload = result.serverPayload === null ? null : JSON.stringify(result.serverPayload);
+  const { operation, requestHash, result, serverPayloadStorage } = plan;
   return db.prepare(
     `INSERT INTO sync_operations(user_id, op_id, request_hash, status, revision, sequence, server_payload, code)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -998,11 +1181,11 @@ function finalOperationStatement(db: D1Database, userId: string, plan: FinalPlan
        status = excluded.status, revision = excluded.revision, sequence = excluded.sequence,
        server_payload = excluded.server_payload, code = excluded.code
      WHERE sync_operations.request_hash = excluded.request_hash AND sync_operations.status = 'processing'`,
-  ).bind(userId, operation.opId, requestHash, result.status, result.revision, result.sequence, serverPayload, result.code);
+  ).bind(userId, operation.opId, requestHash, result.status, result.revision, result.sequence, serverPayloadStorage, result.code);
 }
 
 function ackStatements(db: D1Database, userId: string, plan: AckPlan): D1PreparedStatement[] {
-  const { operation, requestHash, document, action } = plan;
+  const { operation, requestHash, document, payloadChunks: stored, action } = plan;
   const parentGuard = operation.entityType === "page"
     ? `AND EXISTS (
          SELECT 1 FROM documents AS parent
@@ -1011,7 +1194,7 @@ function ackStatements(db: D1Database, userId: string, plan: AckPlan): D1Prepare
        )`
     : "";
   const parentValues = operation.entityType === "page"
-    ? [userId, (parseStoredPayload(document.payload).notebookId as string)]
+    ? [userId, (parseStoredPayload(document.payload ?? "").notebookId as string)]
     : [];
   const documentWrite = db.prepare(
     `INSERT INTO documents(user_id, entity_type, entity_id, revision, payload, deleted, updated_at)
@@ -1030,7 +1213,7 @@ function ackStatements(db: D1Database, userId: string, plan: AckPlan): D1Prepare
     operation.entityType,
     operation.entityId,
     document.revision,
-    document.payload,
+    document.storedPayload,
     document.deleted ? 1 : 0,
     document.updatedAt,
     userId,
@@ -1060,7 +1243,7 @@ function ackStatements(db: D1Database, userId: string, plan: AckPlan): D1Prepare
     operation.entityId,
     document.revision,
     action,
-    document.payload,
+    document.storedPayload,
     userId,
     operation.opId,
     requestHash,
@@ -1068,7 +1251,7 @@ function ackStatements(db: D1Database, userId: string, plan: AckPlan): D1Prepare
     operation.entityType,
     operation.entityId,
     document.revision,
-    document.payload,
+    document.storedPayload,
     userId,
     operation.entityType,
     operation.entityId,
@@ -1092,9 +1275,29 @@ function ackStatements(db: D1Database, userId: string, plan: AckPlan): D1Prepare
     operation.opId,
     requestHash,
   );
+  const marker = stored.chunks.length > 0 ? parsePayloadMarker(stored.storedPayload) : null;
+  if (stored.chunks.length > 0 && !marker) throw new ApiFailure(500, "internal_error", "The server could not store a note payload");
+  const chunkWrites = chunks(stored.chunks, MAX_CHUNKS_PER_STATEMENT).map((group, groupIndex) => {
+    const values = group.map(() => "(?, ?, ?, ?)").join(",");
+    const bindings: unknown[] = [];
+    for (let index = 0; index < group.length; index += 1) {
+      bindings.push(userId, marker!.ref, groupIndex * MAX_CHUNKS_PER_STATEMENT + index, group[index]!);
+    }
+    return db.prepare(
+      `WITH input(user_id, payload_ref, chunk_index, payload) AS (VALUES ${values})
+       INSERT OR IGNORE INTO payload_chunks(user_id, payload_ref, chunk_index, payload)
+       SELECT input.user_id, input.payload_ref, input.chunk_index, input.payload
+       FROM input
+       WHERE EXISTS (
+         SELECT 1 FROM sync_operations
+         WHERE user_id = ? AND op_id = ? AND request_hash = ? AND status = 'processing'
+       )`,
+    ).bind(...bindings, userId, operation.opId, requestHash);
+  });
   return [
     db.prepare("INSERT OR IGNORE INTO sync_operations(user_id, op_id, request_hash, status) VALUES (?, ?, ?, 'processing')")
       .bind(userId, operation.opId, requestHash),
+    ...chunkWrites,
     documentWrite,
     changeInsert,
     finalUpdate,
@@ -1112,32 +1315,81 @@ async function pull(db: D1Database, userId: string, cursor: number, limit: numbe
   const results = await db.batch([
     db.prepare("SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM changes WHERE user_id = ?").bind(userId),
     db.prepare(
-      "SELECT sequence, entity_type, entity_id, revision, action, payload FROM changes WHERE user_id = ? AND sequence > ? ORDER BY sequence LIMIT ?",
+      `SELECT sequence, entity_type, entity_id, revision, action,
+         CASE WHEN substr(payload, 1, ${PAYLOAD_MARKER_PREFIX.length}) = '${PAYLOAD_MARKER_PREFIX}' THEN payload ELSE '' END AS payload_marker,
+         length(CAST(payload AS BLOB)) AS payload_bytes
+       FROM changes WHERE user_id = ? AND sequence > ? ORDER BY sequence LIMIT ?`,
     ).bind(userId, cursor, limit + 1),
   ]);
   const maxSequence = nullableInteger((rowsFrom(results[0] ?? {}).at(0) as { max_sequence?: unknown } | undefined)?.max_sequence) ?? 0;
   if (cursor > maxSequence) throw new ApiFailure(409, "cursor_expired", "A full sync is required");
-  const rawChanges = rowsFrom(results[1] ?? {});
-  const hasMore = rawChanges.length > limit;
-  const changes = rawChanges.slice(0, limit).map((raw) => {
-    const row = raw as { sequence?: unknown; entity_type?: unknown; entity_id?: unknown; revision?: unknown; action?: unknown; payload?: unknown };
+  const rawChanges: RawChange[] = rowsFrom(results[1] ?? {}).map((raw) => {
+    const row = raw as { sequence?: unknown; entity_type?: unknown; entity_id?: unknown; revision?: unknown; action?: unknown; payload_marker?: unknown; payload_bytes?: unknown };
     if ((row.entity_type !== "notebook" && row.entity_type !== "page") || (row.action !== "upsert" && row.action !== "delete") ||
-        typeof row.entity_id !== "string" || typeof row.payload !== "string") {
+        typeof row.entity_id !== "string" || typeof row.payload_marker !== "string") {
       throw new ApiFailure(500, "internal_error", "The server could not complete the request");
     }
     const sequence = nullableInteger(row.sequence);
     const revision = nullableInteger(row.revision);
-    if (sequence === null || revision === null) throw new ApiFailure(500, "internal_error", "The server could not complete the request");
+    const payloadBytes = nullableInteger(row.payload_bytes);
+    if (sequence === null || revision === null || payloadBytes === null || payloadBytes < 1) throw new ApiFailure(500, "internal_error", "The server could not complete the request");
     const entityType: EntityType = row.entity_type;
     const action: SyncAction = row.action;
+    if (row.payload_marker) parsePayloadMarker(row.payload_marker);
     return {
       sequence,
       entityType,
       entityId: row.entity_id,
       revision,
       action,
-      payload: parseStoredPayload(row.payload),
+      storedPayload: row.payload_marker,
+      payloadBytes,
     };
   });
+  const candidates = rawChanges.slice(0, limit);
+  const selected: RawChange[] = [];
+  let estimatedBytes = 0;
+  for (const change of candidates) {
+    const marker = parsePayloadMarker(change.storedPayload);
+    const payloadBytes = marker?.bytes ?? change.payloadBytes;
+    const changeBytes = payloadBytes + PULL_CHANGE_OVERHEAD_BYTES;
+    if (selected.length > 0 && estimatedBytes + changeBytes > MAX_PULL_RESPONSE_BYTES) break;
+    selected.push(change);
+    estimatedBytes += changeBytes;
+  }
+  const inline = selected.filter((change) => !parsePayloadMarker(change.storedPayload));
+  if (inline.length > 0) {
+    const inlineStatements = chunks(inline, MAX_SQL_PARAMETERS - 1).map((group) => {
+      const placeholders = group.map(() => "?").join(",");
+      return db.prepare(
+        `SELECT sequence, payload FROM changes WHERE user_id = ? AND sequence IN (${placeholders})`,
+      ).bind(userId, ...group.map((change) => change.sequence));
+    });
+    const inlineRows = await db.batch(inlineStatements);
+    const payloadBySequence = new Map<number, string>();
+    for (const batch of inlineRows) {
+      for (const row of rowsFrom(batch)) {
+        const typed = row as { sequence?: unknown; payload?: unknown };
+        const sequence = nullableInteger(typed.sequence);
+        if (sequence === null || typeof typed.payload !== "string") throw new ApiFailure(500, "internal_error", "The server could not complete the request");
+        payloadBySequence.set(sequence, typed.payload);
+      }
+    }
+    for (const change of inline) {
+      const payload = payloadBySequence.get(change.sequence);
+      if (payload === undefined) throw new ApiFailure(500, "internal_error", "The server could not complete the request");
+      change.storedPayload = payload;
+    }
+  }
+  const hydrated = await hydratePayloads(db, userId, selected.map((change) => change.storedPayload));
+  const changes = selected.map((change) => ({
+    sequence: change.sequence,
+    entityType: change.entityType,
+    entityId: change.entityId,
+    revision: change.revision,
+    action: change.action,
+    payload: parseStoredPayload(hydrated.get(change.storedPayload) ?? change.storedPayload),
+  }));
+  const hasMore = rawChanges.length > selected.length;
   return { changes, nextCursor: changes.at(-1)?.sequence ?? cursor, hasMore };
 }
