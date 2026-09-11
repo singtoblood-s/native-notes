@@ -83,6 +83,7 @@ function toWireOperation(operation: SyncOperation): Record<string, unknown> {
 
 export class SyncClient {
   private active: Promise<SyncReport> | null = null;
+  private readonly partialPulls = new WeakMap<NoteStore, { accountKey: string; count: number }>();
 
   async sync(store: NoteStore, session: AuthResponse | null): Promise<SyncReport> {
     if (this.active) return this.active;
@@ -109,9 +110,15 @@ export class SyncClient {
     const releaseLease = store.acquireSyncLease?.();
     try {
       const report: SyncReport = { pushed: 0, pulled: 0, conflicts: 0 };
-      await this.pushAll(store, endpoint, session.sessionToken, report);
-      await this.pullAll(store, endpoint, session.sessionToken, report);
-      report.conflicts = Math.max(report.conflicts, (await store.listConflicts()).length);
+      try {
+        await this.pushAll(store, endpoint, session.sessionToken, report);
+        await this.pullAll(store, endpoint, session.sessionToken, report);
+        report.conflicts = Math.max(report.conflicts, (await store.listConflicts()).length);
+      } catch (error) {
+        this.rememberPartialPull(store, expectedAccountKey, report.pulled);
+        throw error;
+      }
+      report.pulled += this.consumePartialPull(store, expectedAccountKey);
       return report;
     } finally {
       releaseLease?.();
@@ -205,6 +212,20 @@ export class SyncClient {
       if (!checked.hasMore) return;
     }
     throw new Error("Sync returned too many pages; try again later.");
+  }
+
+  private rememberPartialPull(store: NoteStore, accountKey: string, count: number): void {
+    if (count === 0) return;
+    const previous = this.partialPulls.get(store);
+    const previousCount = previous?.accountKey === accountKey ? previous.count : 0;
+    this.partialPulls.set(store, { accountKey, count: previousCount + count });
+  }
+
+  private consumePartialPull(store: NoteStore, accountKey: string): number {
+    const partial = this.partialPulls.get(store);
+    if (!partial || partial.accountKey !== accountKey) return 0;
+    this.partialPulls.delete(store);
+    return partial.count;
   }
 
   private async request<T>(input: RequestInfo | URL, token: string, init: RequestInit): Promise<T> {

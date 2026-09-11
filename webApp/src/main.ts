@@ -223,6 +223,8 @@ class NotePadApp {
     onClick("rename-notebook", () => this.openNotebookRename());
     onClick("rename-page", () => { void this.openTextDrawer(true); });
     onClick("sync-button", () => this.sync());
+    onClick("library-sync-button", () => this.sync());
+    onClick("settings-sync-button", () => this.sync());
     onClick("undo-button", () => { this.canvas?.undo(); this.updateToolbar(); });
     onClick("redo-button", () => { this.canvas?.redo(); this.updateToolbar(); });
     onClick("fit-button", () => this.canvas?.fitToViewport());
@@ -953,13 +955,39 @@ class NotePadApp {
   }
 
   private setState(state: SyncState): void {
-    if (!document.getElementById("sync-button")) return;
     const offlineAccountLabel = "Sign in required";
     const label = state.kind === "error" ? state.message : state.kind === "conflict" ? `${state.count} conflict${state.count === 1 ? "" : "s"}` : state.kind === "needs-login" ? offlineAccountLabel : state.kind === "offline" ? "Saved locally" : state.kind === "saving" ? "Saving…" : state.kind === "syncing" ? "Syncing…" : state.kind === "saved" ? "Saved locally" : "Ready";
-    byId("sync-label").textContent = label;
-    byId("sync-button").classList.toggle("is-busy", state.kind === "saving" || state.kind === "syncing");
-    byId("sync-button").setAttribute("aria-label", label);
-    byId("sync-icon").textContent = state.kind === "error" ? "!" : state.kind === "conflict" ? "!" : state.kind === "syncing" ? "↻" : state.kind === "needs-login" ? "·" : "✓";
+    const icon = state.kind === "error" ? "!" : state.kind === "conflict" ? "!" : state.kind === "syncing" ? "↻" : state.kind === "needs-login" ? "·" : "✓";
+    for (const button of document.querySelectorAll<HTMLButtonElement>("[data-sync-button]")) {
+      button.classList.toggle("is-busy", state.kind === "saving" || state.kind === "syncing");
+      button.setAttribute("aria-label", label);
+      button.dataset.state = state.kind;
+      button.querySelector<HTMLElement>("[data-sync-icon]")?.replaceChildren(icon);
+      button.querySelector<HTMLElement>("[data-sync-label]")?.replaceChildren(label);
+    }
+    const settingsLabel = document.getElementById("settings-sync-label");
+    if (settingsLabel) {
+      settingsLabel.replaceChildren(label);
+      settingsLabel.title = label;
+    }
+    const retry = document.getElementById("settings-sync-button") as HTMLButtonElement | null;
+    if (retry) {
+      retry.disabled = state.kind === "syncing";
+      retry.setAttribute("aria-label", `Sync now · ${label}`);
+    }
+  }
+
+  private setSyncLabels(label: string): void {
+    for (const button of document.querySelectorAll<HTMLButtonElement>("[data-sync-button]")) {
+      button.setAttribute("aria-label", label);
+      button.querySelector<HTMLElement>("[data-sync-label]")?.replaceChildren(label);
+    }
+    const settingsLabel = document.getElementById("settings-sync-label");
+    if (settingsLabel) {
+      settingsLabel.replaceChildren(label);
+      settingsLabel.title = label;
+    }
+    document.getElementById("settings-sync-button")?.setAttribute("aria-label", `Sync now · ${label}`);
   }
 
   private pauseCoordinatorForStoreSwitch(): void {
@@ -999,8 +1027,7 @@ class NotePadApp {
       this.setState(this.auth.session ? { kind: "saved" } : { kind: "needs-login" });
       if (!this.auth.session) return;
       const label = status.pending > 0 ? `Saved locally · ${status.pending} queued` : "Saved locally · sync queued";
-      byId("sync-label").textContent = label;
-      byId("sync-button").setAttribute("aria-label", label);
+      this.setSyncLabels(label);
       return;
     }
     if (status.conflicts > 0) {
@@ -1009,11 +1036,15 @@ class NotePadApp {
     }
     if (!this.saveTimer && !this.saveInFlight && this.unsavedPageID === null) {
       this.setState(this.auth.session ? { kind: "saved" } : { kind: "needs-login" });
+      if (this.pendingRemoteRefresh) {
+        const label = status.pending > 0 ? `Refreshing notes · ${status.pending} queued` : "Refreshing notes…";
+        this.setSyncLabels(label);
+        return;
+      }
       if (this.auth.session && status.lastSuccessAt && status.pending === 0) {
         const time = new Date(status.lastSuccessAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
         const label = `Synced · ${time}`;
-        byId("sync-label").textContent = label;
-        byId("sync-button").setAttribute("aria-label", label);
+        this.setSyncLabels(label);
       }
     }
   }
@@ -1347,7 +1378,7 @@ function shellMarkup(auth: AuthSession): string {
       <div class="sidebar-bottom"><button class="utility-row" id="trash-toggle" aria-pressed="false"><span>♢</span><span id="trash-label">Trash</span></button><button class="utility-row" id="settings-button"><span>⌘</span> Settings</button></div>
     </aside>
     <main class="library" id="library" aria-label="Notebook library">
-      <header class="library-header"><a class="library-brand" href="${BASE}">NotePad</a><div><button id="library-trash" class="library-icon" aria-label="Open trash">♢</button><button id="library-settings" class="library-icon" aria-label="Library settings">⚙</button><button id="library-account" class="library-icon" aria-label="Library account">○</button></div></header>
+      <header class="library-header"><a class="library-brand" href="${BASE}">NotePad</a><div><button class="sync-status" id="library-sync-button" data-sync-button aria-label="Sign in required"><span id="library-sync-icon" data-sync-icon>·</span><span id="library-sync-label" data-sync-label>Sign in required</span></button><button id="library-trash" class="library-icon" aria-label="Open trash">♢</button><button id="library-settings" class="library-icon" aria-label="Library settings">⚙</button><button id="library-account" class="library-icon" aria-label="Library account">○</button></div></header>
       <section class="library-body"><div class="library-heading"><div><h1 id="library-title" tabindex="-1">Documents</h1><span id="library-count">0 notebooks</span></div><button class="library-new" id="library-new">＋ New…</button></div>
         <div class="library-controls"><label class="library-search"><span aria-hidden="true">⌕</span><input type="search" id="library-search" aria-label="Search library" placeholder="Search notebooks and typed notes" /></label><label class="library-sort">Sort by <select id="library-sort" aria-label="Sort notebooks"><option value="modified">Last edited</option><option value="name">Name</option></select></label><button class="library-icon" id="library-layout" aria-label="List view" aria-pressed="false">☷</button></div>
         <div class="library-books" id="library-books"></div><p class="library-empty" id="library-empty" role="status" hidden></p>
@@ -1355,7 +1386,7 @@ function shellMarkup(auth: AuthSession): string {
       <nav class="library-tabs" aria-label="Library sections"><button id="library-documents" aria-current="page"><span aria-hidden="true">▱</span>Documents</button><button id="library-tab-search" aria-current="false"><span aria-hidden="true">⌕</span>Search</button><button id="library-favorites" aria-current="false"><span aria-hidden="true">☆</span>Favorites</button></nav>
     </main>
     <main class="workspace" id="editor-workspace" hidden>
-      <header class="topbar"><div class="topbar-leading"><button class="back-library" id="back-library" aria-label="Back to Documents">‹ <span>Documents</span></button><button class="drawer-trigger" id="mobile-menu" aria-controls="sidebar" aria-expanded="false"><span class="drawer-trigger-icon">☰</span><span>Pages</span></button><div class="crumbs"><span class="eyebrow">NOTEBOOK</span><button class="notebook-title-button" id="rename-notebook" aria-label="Rename notebook"><strong id="notebook-name">My notebook</strong><span aria-hidden="true">✎</span></button></div></div><div class="top-actions"><button class="text-toggle" id="text-toggle" aria-label="Text and page details" aria-controls="inspector" aria-expanded="false"><span aria-hidden="true">T</span><span>Text</span></button><button class="sync-status" id="sync-button" aria-label="Sign in required"><span id="sync-icon">·</span><span id="sync-label">Sign in required</span></button><button class="avatar-button" id="auth-button" aria-label="Account">○</button></div></header>
+      <header class="topbar"><div class="topbar-leading"><button class="back-library" id="back-library" aria-label="Back to Documents">‹ <span>Documents</span></button><button class="drawer-trigger" id="mobile-menu" aria-controls="sidebar" aria-expanded="false"><span class="drawer-trigger-icon">☰</span><span>Pages</span></button><div class="crumbs"><span class="eyebrow">NOTEBOOK</span><button class="notebook-title-button" id="rename-notebook" aria-label="Rename notebook"><strong id="notebook-name">My notebook</strong><span aria-hidden="true">✎</span></button></div></div><div class="top-actions"><button class="text-toggle" id="text-toggle" aria-label="Text and page details" aria-controls="inspector" aria-expanded="false"><span aria-hidden="true">T</span><span>Text</span></button><button class="sync-status" id="sync-button" data-sync-button aria-label="Sign in required"><span id="sync-icon" data-sync-icon>·</span><span id="sync-label" data-sync-label>Sign in required</span></button><button class="avatar-button" id="auth-button" aria-label="Account">○</button></div></header>
       <section class="editor-layout">
         <div class="editor-stage" id="editor-content">
       <div class="editor-toolbar" role="toolbar" aria-label="Writing tools">
@@ -1398,7 +1429,7 @@ function authMarkup(): string {
 
 function dialogMarkup(auth: AuthSession): string {
   return `${authMarkup()}
-  <dialog class="dialog" id="settings-dialog"><form class="dialog-form" id="settings-form"><div class="dialog-head"><div><span class="eyebrow">SETTINGS</span><h2>Keep your paper close</h2></div><button type="button" class="icon-button" id="cancel-settings" aria-label="Close">×</button></div><label>Sync server URL<input id="endpoint-input" type="url" inputmode="url" placeholder="https://notes.example.com" /></label><p class="form-hint">Use the same HTTPS server on every device. Changing servers requires signing in again.</p><p class="form-message offline-cache-status" id="offline-cache-status" role="status">Preparing offline cache…</p><div class="settings-actions"><button class="outline-button" type="button" id="browse-import">Import backup</button><button class="outline-button" type="button" id="settings-export">Export backup</button><button class="outline-button" type="button" id="settings-share">Share backup</button></div><input id="import-input" type="file" accept="application/json,.json,.notepad" hidden /><p class="form-message" id="settings-message"></p>${thisAccountMarkup(auth)}<button class="primary-button" type="submit">Save settings</button></form></dialog>
+  <dialog class="dialog" id="settings-dialog"><form class="dialog-form" id="settings-form"><div class="dialog-head"><div><span class="eyebrow">SETTINGS</span><h2>Keep your paper close</h2></div><button type="button" class="icon-button" id="cancel-settings" aria-label="Close">×</button></div><label>Sync server URL<input id="endpoint-input" type="url" inputmode="url" placeholder="https://notes.example.com" /></label><p class="form-hint">Use the same HTTPS server on every device. Changing servers requires signing in again.</p><div class="account-line"><span>Sync</span><strong id="settings-sync-label" aria-live="polite" title="Sign in required">Sign in required</strong><button class="outline-button compact" type="button" id="settings-sync-button">Sync now</button></div><p class="form-message offline-cache-status" id="offline-cache-status" role="status">Preparing offline cache…</p><div class="settings-actions"><button class="outline-button" type="button" id="browse-import">Import backup</button><button class="outline-button" type="button" id="settings-export">Export backup</button><button class="outline-button" type="button" id="settings-share">Share backup</button></div><input id="import-input" type="file" accept="application/json,.json,.notepad" hidden /><p class="form-message" id="settings-message"></p>${thisAccountMarkup(auth)}<button class="primary-button" type="submit">Save settings</button></form></dialog>
   <dialog class="dialog" id="notebook-dialog"><form class="dialog-form" id="notebook-form"><div class="dialog-head"><div><span class="eyebrow">NOTEBOOK</span><h2>Rename notebook</h2></div><button type="button" class="icon-button" id="cancel-notebook" aria-label="Close">×</button></div><label>Name<input id="notebook-title" type="text" maxlength="500" autocomplete="off" required /></label><div id="new-notebook-options" hidden><label>Paper<select id="new-paper"><option value="blank">Blank</option><option value="ruled" selected>Ruled lines</option><option value="grid">Grid</option></select></label><div class="paper-choices" role="group" aria-label="Paper preview"><button type="button" class="paper-sample paper-blank" data-paper="blank" aria-pressed="false">Blank</button><button type="button" class="paper-sample paper-ruled" data-paper="ruled" aria-pressed="true">Ruled</button><button type="button" class="paper-sample paper-grid" data-paper="grid" aria-pressed="false">Grid</button></div></div><p class="form-error" id="notebook-error" role="alert"></p><button class="primary-button" type="submit">Save name</button></form></dialog>
 `;
 }

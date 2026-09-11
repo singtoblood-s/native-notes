@@ -198,7 +198,10 @@ export class SyncCoordinator {
       this.publishIfCurrent(generation, { state: "idle", error: null });
       return;
     }
-    if (!(await this.refreshPending(store, generation))) return;
+    if (!(await this.refreshPending(store, generation))) {
+      this.scheduleRetry(generation);
+      return;
+    }
     if (!this.started || generation !== this.generation) return;
     if (!this.isOnline()) {
       this.publishIfCurrent(generation, { state: "offline", error: null });
@@ -236,7 +239,10 @@ export class SyncCoordinator {
       const report = await this.client.sync(store, session);
       if (!this.isRunCurrent(generation, store, session)) return;
       if (this.generation === generation) await this.onAfterSync?.({ store, session, reason, report });
-      if (!(await this.refreshPending(store, generation, report.conflicts))) return;
+      if (!(await this.refreshPending(store, generation, report.conflicts))) {
+        this.scheduleRetry(generation);
+        return;
+      }
       this.retryCount = 0;
       this.publishIfCurrent(generation, { state: "idle", lastSuccessAt: now(), error: null });
       // Keep a local-write/auth request that arrived while the network was in
@@ -248,12 +254,15 @@ export class SyncCoordinator {
       const status = error instanceof SyncHttpError && error.status === 401 ? "needs-login" : this.isOnline() ? "error" : "offline";
       const message = status === "offline" || status === "needs-login" ? null : safeError(error);
       this.publishIfCurrent(generation, { state: status, error: message });
-      if (status === "error" && this.started && this.generation === generation && !this.requested) {
-        const delay = Math.min(MAX_BACKOFF_MS, INITIAL_BACKOFF_MS * 2 ** Math.min(this.retryCount, 8));
-        this.retryCount += 1;
-        this.schedule(delay, "retry");
-      }
+      if (status === "error") this.scheduleRetry(generation);
     }
+  }
+
+  private scheduleRetry(generation: number): void {
+    if (!this.started || this.generation !== generation || this.requested) return;
+    const delay = Math.min(MAX_BACKOFF_MS, INITIAL_BACKOFF_MS * 2 ** Math.min(this.retryCount, 8));
+    this.retryCount += 1;
+    this.schedule(delay, "retry");
   }
 
   private async refreshPending(store: NoteStore, generation: number, conflictCount?: number): Promise<boolean> {
