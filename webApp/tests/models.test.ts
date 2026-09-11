@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { LEGACY_API_URL } from "../src/auth";
 import { accountNamespace } from "../src/storage";
 import { clonePage, createPage, createNotebook, isUUID, requireUUID } from "../src/models";
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe("local identity and canonical models", () => {
   it("keeps endpoint and account namespaces distinct", async () => {
@@ -10,6 +15,15 @@ describe("local identity and canonical models", () => {
     expect(first).not.toBe(second);
     expect(first).not.toBe(otherAccount);
     expect(first).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("reuses the legacy SQLite namespace for a migrated account key", async () => {
+    vi.stubEnv("VITE_API_URL", "https://d1.example.test");
+    vi.stubEnv("VITE_LEGACY_API_URL", LEGACY_API_URL);
+    const userID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const legacy = await accountNamespace(`${LEGACY_API_URL}:${userID}`);
+    const canonical = await accountNamespace(`https://d1.example.test:${userID}`);
+    expect(canonical).toBe(legacy);
   });
 
   it("accepts only UUID entity identifiers", () => {

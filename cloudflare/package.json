@@ -1,0 +1,22 @@
+{
+  "name": "native-notes-api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.4.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.0.0",
+    "@cloudflare/workers-types": "^5.20260911.1",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.131.0"
+  }
+}

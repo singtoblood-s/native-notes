@@ -1,5 +1,5 @@
 import "./styles.css";
-import { AuthClient, AuthSession, getEndpoint, setEndpoint } from "./auth";
+import { AuthClient, AuthSession, getEndpoint, setEndpoint, workspaceAccountKey } from "./auth";
 import { PaperCanvas, CanvasTool } from "./canvas";
 import {
   AuthResponse,
@@ -331,7 +331,7 @@ class NotePadApp {
       return;
     }
     target.innerHTML = `<div class="workspace-recovery"><span class="recovery-label">Saved local workspaces</span><p>Export an older account before changing servers or signing in elsewhere. These copies never upload automatically.</p>${workspaces.map((workspace) => {
-      const key = `${workspace.endpoint}:${workspace.userID}`;
+      const key = workspaceAccountKey(workspace.endpoint, workspace.userID);
       const active = key === this.store.accountKey;
       return `<div class="recovery-row"><span><strong>${escapeHTML(workspace.identifier)}</strong><small>${escapeHTML(workspace.endpoint)}${active ? " · current" : ""}</small></span><button type="button" class="outline-button compact" data-export-workspace="${escapeAttr(workspace.userID)}" data-workspace-endpoint="${escapeAttr(workspace.endpoint)}">Export</button></div>`;
     }).join("")}</div>`;
@@ -347,7 +347,7 @@ class NotePadApp {
       byId("settings-message").textContent = "That saved workspace is no longer available.";
       return;
     }
-    const accountKey = `${identity.endpoint}:${identity.userID}`;
+    const accountKey = workspaceAccountKey(identity.endpoint, identity.userID);
     let workspaceStore: NoteStore | null = null;
     try {
       workspaceStore = accountKey === this.store.accountKey ? this.store : await SQLiteNoteStore.open(accountKey);

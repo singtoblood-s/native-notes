@@ -76,6 +76,7 @@ describe("sync durability protocol", () => {
     const report = await new SyncClient().sync(fake.store, session);
     expect(report).toEqual({ pushed: 1, pulled: 1, conflicts: 0 });
     expect(requests[1]).toContain("cursor=0");
+    expect(requests[1]).toContain("limit=100");
     expect(fake.cursor()).toBe(7);
     expect(fake.store.applyRemoteBatch).toHaveBeenCalledWith([change], 7);
   });
@@ -144,5 +145,32 @@ describe("sync durability protocol", () => {
     await new SyncClient().sync(fake.store, session);
     expect(fake.store.setCursor).toHaveBeenCalledWith(0);
     expect(fake.cursor()).toBe(0);
+  });
+
+  it("drains more than ten queued operations in separate push batches", async () => {
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const operations = Array.from({ length: 11 }, (_, index) => {
+      const suffix = String(index + 10).padStart(12, "0");
+      return operation(`00000000-0000-4000-8000-${suffix}`, `10000000-0000-4000-8000-${suffix}`);
+    });
+    const fake = fakeStore(operations);
+    const pushSizes: number[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("/push")) {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { operations?: Array<{ opId: string }> };
+        const batch = body.operations ?? [];
+        pushSizes.push(batch.length);
+        return new Response(JSON.stringify({
+          results: batch.map((item, itemIndex) => ({ opId: item.opId, status: "acked", revision: 1, sequence: itemIndex + 1, serverPayload: null, code: null })),
+          cursor: batch.length,
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ changes: [], nextCursor: 0, hasMore: false }), { status: 200 });
+    }));
+
+    const report = await new SyncClient().sync(fake.store, session);
+    expect(pushSizes).toEqual([10, 1]);
+    expect(fake.sent).toHaveLength(11);
+    expect(report.pushed).toBe(11);
   });
 });

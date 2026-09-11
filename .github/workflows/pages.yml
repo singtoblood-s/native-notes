@@ -36,6 +36,7 @@ jobs:
         env:
           VITE_BASE: /native-notes/
           VITE_API_URL: ${{ vars.VITE_API_URL }}
+          VITE_LEGACY_API_URL: ${{ vars.VITE_LEGACY_API_URL }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: webApp/dist

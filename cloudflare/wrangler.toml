@@ -1,0 +1,21 @@
+name = "native-notes-api"
+main = "src/index.ts"
+compatibility_date = "2026-09-11"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ALLOWED_ORIGINS = "https://singtoblood-s.github.io,http://localhost:4173,http://localhost:4174"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "native-notes"
+database_id = "2f83358e-6bfd-4fe4-ad2b-688bd4eb577c"
+migrations_dir = "migrations"
+
+[[durable_objects.bindings]]
+name = "API"
+class_name = "ApiDurableObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ApiDurableObject"]

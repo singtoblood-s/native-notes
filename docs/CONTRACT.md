@@ -97,6 +97,18 @@ new server account automatically. The old browser database and outbox remain
 available through the saved workspace list for an explicit export/recovery
 action.
 
+For the one-way Ktor-to-Cloudflare D1 cutover, a Pages build may opt in with
+`VITE_LEGACY_API_URL` set to the exact old public endpoint and a valid HTTPS
+`VITE_API_URL`. The browser then canonicalizes persisted endpoint and account
+identity keys to the new endpoint, invalidates old endpoint-bound sessions so
+the user must sign in again, and reuses the old local SQLite/IndexedDB
+namespace for the same user ID. This preserves local UUIDs, revisions, the
+pending outbox, and the pull cursor while the migrated server preserves UUIDs,
+revisions, and change sequences. Without that exact build flag, or for any
+other custom endpoint, namespaces remain separate; guest workspaces and
+explicit recovery exports never upload automatically or cross account
+boundaries.
+
 When a conflict copy refers to a notebook that is missing or tombstoned in the
 local workspace, the client creates a new recovery notebook and queues its
 upsert before showing the recovered page. The recovered page remains local
@@ -202,9 +214,12 @@ and `opId`. They do not retry 400/401/403/409 without handling the code.
 
 Login is local identifier/password with PBKDF2-HMAC-SHA256 on the server; it
 does not require Google provisioning. Transport must be TLS in deployment.
-Push accepts at most 100 operations, 4 MiB per HTTP request, and 2 MiB per
-operation payload. The PWA keeps its request batches below 3 MiB to leave room
-for JSON framing and proxies.
+The legacy Ktor server accepts at most 100 operations per push. The deployed
+Cloudflare D1 worker accepts at most 10 operations per push; the PWA drains a
+larger outbox through multiple requests. Both servers accept 4 MiB per HTTP
+request. The worker and PWA keep each operation payload below 1.9 MiB for its
+D1 row ceiling, and the PWA keeps each request below 3 MiB to leave room for
+JSON framing and proxies.
 The server can read note payloads; end-to-end encryption is a later contract.
 Sync is snapshot plus revision CAS, with conflict copies; there is no realtime
 collaboration or CRDT. Attachments and PDF backgrounds are outside v1.
