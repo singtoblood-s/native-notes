@@ -25,6 +25,160 @@ function openEngine() {
   return { engine: engine as SQLiteNoteStoreEngine, db };
 }
 
+it("duplicates a whole notebook atomically, preserving page order and giving content fresh IDs", async () => {
+  const { engine, db } = openEngine();
+  const book = createNotebook("ก".repeat(500));
+  const page = createPage(book.id, "Page 10");
+  page.text = "Keep every character";
+  page.strokes = [{ id: crypto.randomUUID(), color: 0xff000000, width: 2, points: [{ x: 1, y: 2, pressure: .5, time: 0, tiltX: null, tiltY: null }] }];
+  await engine.importDocument(book, [page, createPage(book.id, "Page 2")]);
+  const copy = await engine.duplicateNotebook(book.id);
+  expect(copy.title).toHaveLength(500);
+  expect(copy.title.endsWith(" (copy)")).toBe(true);
+  const copies = await engine.listPages(copy.id);
+  expect(copies.map(p => p.title)).toEqual(["Page 10", "Page 2"]);
+  expect(copies[0]!.text).toBe(page.text);
+  expect(copies[0]!.strokes[0]!.id).not.toBe(page.strokes[0]!.id);
+  expect(copies[0]!.strokes[0]!.points).toEqual(page.strokes[0]!.points);
+  const before = await engine.exportArchive();
+  const queued = await engine.pendingOperations();
+  db.exec("CREATE TRIGGER fail_copy BEFORE INSERT ON pages WHEN json_extract(NEW.json, '$.order') = 1 BEGIN SELECT RAISE(ABORT, 'Disk full'); END");
+  await expect(engine.duplicateNotebook(book.id)).rejects.toThrow("Disk full");
+  expect((await engine.exportArchive()).notebooks).toEqual(before.notebooks);
+  expect((await engine.exportArchive()).pages).toEqual(before.pages);
+  expect(await engine.pendingOperations()).toEqual(queued);
+});
+
+it("creates a notebook and first page together or leaves neither after failure", async () => {
+  const { engine, db } = openEngine();
+  const book = createNotebook("No partial notebook");
+  db.exec("CREATE TRIGGER fail_page BEFORE INSERT ON pages BEGIN SELECT RAISE(ABORT, 'Disk full'); END");
+  await expect(engine.importDocument(book, [createPage(book.id)])).rejects.toThrow("Disk full");
+  expect(await engine.listNotebooks()).toEqual([]);
+  expect(await engine.pendingOperations()).toEqual([]);
+});
+
+it("reorders legacy pages and moves an unsent page after its new parent's creation in the outbox", async () => {
+  const { engine, db } = openEngine();
+  const book = createNotebook("Source");
+  await engine.saveNotebook(book);
+  const first = createPage(book.id, "Page 2"), last = createPage(book.id, "Page 10");
+  await engine.savePage(first); await engine.savePage(last);
+  db.exec("UPDATE pages SET json = json_remove(json, '$.order')");
+  await engine.movePage(last.id, book.id, 0);
+  expect((await engine.listPages(book.id)).map(page => [page.id, page.order])).toEqual([[last.id, 0], [first.id, 1]]);
+  const destination = createNotebook("Destination"); await engine.saveNotebook(destination);
+  const stale = (await engine.getPage(first.id))!;
+  await engine.movePage(first.id, destination.id, 0);
+  expect((await engine.listPages(book.id)).map(page => page.id)).toEqual([last.id]);
+  expect(await engine.getPage(first.id)).toMatchObject({ notebookId: destination.id, order: 0 });
+  const operations = await engine.pendingOperations();
+  expect(operations.findIndex(op => op.entityId === destination.id)).toBeLessThan(operations.findIndex(op => op.entityId === first.id));
+  await expect(engine.savePage({ ...stale, text: "A stale editor must not undo the move" })).rejects.toThrow("moved");
+  const remote = openEngine().engine;
+  await remote.applyRemoteBatch(operations.map((op, index) => ({ sequence: index + 1, entityType: op.entityType, entityId: op.entityId, action: op.action, revision: 1, payload: { ...op.payload, revision: 1 } })), operations.length);
+  expect(await remote.getPage(first.id)).toMatchObject({ notebookId: destination.id, order: 0 });
+});
+
+it("preserves immutable sending operations while moving, and rolls back every reordered page on failure", async () => {
+  const { engine, db } = openEngine();
+  const book = createNotebook("Source"), destination = createNotebook("Destination");
+  await engine.saveNotebook(book);
+  const first = createPage(book.id), second = createPage(book.id);
+  await engine.savePage(first); await engine.savePage(second);
+  const operation = (await engine.pendingOperations()).find(op => op.entityId === first.id)!;
+  await engine.markOperationSending(operation.opId);
+  const immutable = await engine.getOperation(operation.opId);
+  await engine.saveNotebook(destination);
+  await engine.movePage(first.id, destination.id, 0);
+  expect(await engine.getOperation(operation.opId)).toEqual(immutable);
+  expect((await engine.pendingOperations()).at(-1)!.payload.notebookId).toBe(destination.id);
+  await engine.movePage(first.id, book.id, 0);
+  const before = await engine.listPages(book.id), queued = await engine.pendingOperations();
+  db.exec(`CREATE TRIGGER fail_reorder BEFORE INSERT ON pages WHEN NEW.id = '${first.id}' BEGIN SELECT RAISE(ABORT, 'Disk full'); END`);
+  await expect(engine.movePage(second.id, book.id, 0)).rejects.toThrow("Disk full");
+  expect(await engine.listPages(book.id)).toEqual(before);
+  expect(await engine.pendingOperations()).toEqual(queued);
+});
+
+it.each([-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, 2])("rejects invalid move position %s without changes", async position => {
+  const { engine } = openEngine();
+  const book = createNotebook("Position"); await engine.saveNotebook(book);
+  const page = createPage(book.id); await engine.savePage(page);
+  const queued = await engine.pendingOperations();
+  await expect(engine.movePage(page.id, book.id, position)).rejects.toThrow();
+  expect(await engine.pendingOperations()).toEqual(queued);
+});
+
+it("requires restoration of the parent notebook, and keeps deleted/recovery pages out of move targets", async () => {
+  const { engine } = openEngine();
+  const book = createNotebook("Trash"), destination = createNotebook("Destination");
+  await engine.saveNotebook(book); await engine.saveNotebook(destination);
+  const page = createPage(book.id); await engine.savePage(page);
+  await engine.deletePage(page.id); await engine.archiveNotebook(book.id);
+  const queued = await engine.pendingOperations();
+  expect(await engine.restorePage(page.id)).toMatchObject({ status: "failed", message: "Restore the notebook first." });
+  await expect(engine.movePage(page.id, destination.id, 0)).rejects.toThrow("Restore");
+  await expect(engine.duplicateNotebook(book.id)).rejects.toThrow("trash");
+  expect(await engine.pendingOperations()).toEqual(queued);
+  await engine.restoreNotebook(book.id); await engine.restorePage(page.id);
+  await engine.archiveNotebook(destination.id);
+  await expect(engine.movePage(page.id, destination.id, 0)).rejects.toThrow("destination");
+});
+
+it("rejects unrepresentable order growth and can recover by reordering", async () => {
+  const { engine } = openEngine();
+  const book = createNotebook("Full order"); await engine.saveNotebook(book);
+  const page = { ...createPage(book.id), order: Number.MAX_SAFE_INTEGER, formatVersion: 2 };
+  await engine.savePage(page);
+  await expect(engine.savePage(createPage(book.id))).rejects.toThrow("Page order is full");
+  await engine.movePage(page.id, book.id, 0);
+  await engine.savePage(createPage(book.id));
+  expect((await engine.listPages(book.id)).map(page => page.order)).toEqual([0, 1]);
+});
+
+it("appends imported pages using the current order when the prepared order became stale", async () => {
+  const { engine } = openEngine();
+  const book = createNotebook("Concurrent import"); await engine.saveNotebook(book);
+  await engine.savePage({ ...createPage(book.id, "Existing"), order: 10, formatVersion: 2 });
+  await engine.importDocument(book, [{ ...createPage(book.id, "Imported"), order: 0, formatVersion: 2 }]);
+  expect((await engine.listPages(book.id)).map(page => [page.title, page.order])).toEqual([["Existing", 10], ["Imported", 11]]);
+});
+
+it("keeps saved versions linked after archive import and includes them in single-notebook backups", async () => {
+  const { engine } = openEngine();
+  const book = createNotebook("History"), other = createNotebook("Other");
+  await engine.saveNotebook(book); await engine.saveNotebook(other);
+  const page = createPage(book.id); await engine.savePage(page);
+  const op = (await engine.pendingOperations()).find(op => op.entityId === page.id)!;
+  await engine.createConflictCopyFromOperation(op);
+  const restored = openEngine().engine;
+  await restored.importArchive(await engine.exportArchive());
+  const importedBook = (await restored.listNotebooks()).find(item => item.title === "History")!;
+  const backup = await restored.exportArchive(importedBook.id);
+  expect(backup.notebooks).toHaveLength(1);
+  expect(backup.pages).toHaveLength(1);
+  expect(backup.versions).toHaveLength(1);
+  expect(backup.versions![0]!.entityId).toBe(backup.pages[0]!.id);
+  expect(backup.versions![0]!.payload.notebookId).toBe(importedBook.id);
+  const destination = (await restored.listNotebooks()).find(item => item.title === "Other")!;
+  await restored.movePage(backup.pages[0]!.id, destination.id, 0);
+  expect((await restored.exportArchive(destination.id)).versions).toHaveLength(1);
+});
+
+it("preserves valid small page, image and stroke dimensions through backup round trips", async () => {
+  const { engine } = openEngine();
+  const book = createNotebook("Small format");
+  const page = { ...createPage(book.id), width: 100, height: 200, formatVersion: 2 };
+  page.images = [{ id: crypto.randomUUID(), src: "data:image/png;base64,AAAA", x: 0, y: 0, width: .25, height: .5 }];
+  page.strokes = [{ id: crypto.randomUUID(), color: 0xff000000, width: .1, points: [{ x: 0, y: 0, pressure: .5, time: 0, tiltX: null, tiltY: null }] }];
+  await engine.importDocument(book, [page]);
+  const restored = openEngine().engine;
+  await restored.importArchive(await engine.exportArchive());
+  const result = (await restored.exportArchive()).pages[0]!;
+  expect([result.width, result.height, result.images![0]!.width, result.images![0]!.height, result.strokes[0]!.width]).toEqual([100, 200, .25, .5, .1]);
+});
+
 it("preserves parent/child and delete/restore ordering when the device clock moves backward", async () => {
   vi.useFakeTimers();
   const { engine } = openEngine();

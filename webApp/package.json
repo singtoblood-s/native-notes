@@ -9,6 +9,7 @@
     "pretest:browser": "node scripts/prepare-pdf.mjs",
     "test:browser": "node scripts/editor-smoke.mjs",
     "test:ipad": "node scripts/ipad-images.mjs",
+    "test:features": "node scripts/feature-audit.mjs",
     "dev": "vite",
     "build": "tsc --noEmit && vite build && node scripts/generate-sw.mjs",
     "preview": "vite preview",

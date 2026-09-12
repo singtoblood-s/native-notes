@@ -124,6 +124,7 @@ export function offsetAtAnchor(world: CanvasPoint, scale: number, anchor: Canvas
 export interface CanvasCallbacks {
   onChange: (strokes: InkStroke[]) => void;
   onZoom: (scale: number) => void;
+  onLimit?: (message: string) => void;
 }
 
 const previewStates = new WeakMap<HTMLCanvasElement, PreviewState>();
@@ -176,6 +177,8 @@ export class PaperCanvas {
   private height = 1366;
   private tool: CanvasTool = { kind: "pen", color: 0xff252429, width: 2.5 };
   private active: ActiveStroke | null = null;
+  private activePointBudget = 0;
+  private limitReported = false;
   private eraserBefore: InkStroke[] | null = null;
   private eraserPointerID: number | null = null;
   private renderedPointCount = 0;
@@ -604,6 +607,14 @@ export class PaperCanvas {
       this.eraserBefore = cloneStrokes(this.strokes);
       this.eraserPointerID = event.pointerId;
       this.eraseAt(this.pagePoint(event));
+      return;
+    }
+    this.activePointBudget = 200_000 - historyPointCount(this.strokes);
+    this.limitReported = false;
+    if (this.strokes.length >= 10_000 || this.activePointBudget <= 0) {
+      this.callbacks.onLimit?.("This page reached its ink limit. Add a new page or erase some ink to continue.");
+      this.penPointers.delete(event.pointerId);
+      try { this.canvas.releasePointerCapture(event.pointerId); } catch { /* Capture may already be gone. */ }
       return;
     }
     const timestamp = finite(event.timeStamp) ? event.timeStamp : performance.now();
@@ -1041,6 +1052,11 @@ export class PaperCanvas {
     if (events.length === 0) return;
     const rect = this.canvas.getBoundingClientRect();
     for (const sample of events) {
+      if (this.active.stroke.points.length >= this.activePointBudget && !(this.tool.kind === "line" && this.activePointBudget >= 2)) {
+        if (!this.limitReported) this.callbacks.onLimit?.("This page reached its ink limit. The sampled ink was kept; continue on a new page.");
+        this.limitReported = true;
+        break;
+      }
       const position = this.pagePoint(sample, rect);
       const timestamp = finite(sample.timeStamp) ? sample.timeStamp : performance.now();
       const pressure = finite(sample.pressure) && sample.pressure > 0 ? clamp(sample.pressure, 0, 1) : 0.5;
@@ -1053,8 +1069,8 @@ export class PaperCanvas {
         pressure: this.tool.kind === "pen" && this.tool.pressureSensitive !== false ? roundTo(pressure, 3) : 1,
         // Coalesced samples and pointerup can arrive with older timestamps.
         time: Math.max(previous?.time ?? 0, Math.round(timestamp - this.active.startedAt)),
-        tiltX: finite(sample.tiltX) ? roundTo(sample.tiltX, 1) : null,
-        tiltY: finite(sample.tiltY) ? roundTo(sample.tiltY, 1) : null,
+        tiltX: finite(sample.tiltX) ? clamp(roundTo(sample.tiltX, 1), -90, 90) : null,
+        tiltY: finite(sample.tiltY) ? clamp(roundTo(sample.tiltY, 1), -90, 90) : null,
       };
       // A tap commonly arrives as a down and an up with an empty coalesced
       // array. Keep its single canonical point instead of duplicating it.

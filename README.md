@@ -114,6 +114,10 @@ Pages hosting. Personal notes and credentials do not belong in this repo.
 
 ## Verification
 
+ดู [ผลตรวจฟีเจอร์สองรอบและ edge cases วันที่ 12 กันยายน 2026](docs/FEATURE_AUDIT_2026-09-12.md)
+เพิ่ม Move / reorder page, กระโดดไปเลขหน้า, ผลค้นหาเปิดตรงหน้า, Restore as copy,
+backup เฉพาะสมุด, ส่งออกข้อความเต็ม และจำมุมมองคลัง พร้อม regression tests สำหรับความทนทานของข้อมูล
+
 GitHub Actions records build/test outcomes. The task's final delivery report
 states which checks actually passed and which require the user's hardware.
 An emulator or automated browser test cannot certify S Pen/Apple Pencil

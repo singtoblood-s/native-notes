@@ -18,6 +18,8 @@ import {
   SyncOperation,
   createPage,
   createNotebook,
+  copyTitle,
+  clonePage,
   id,
   isUUID,
   now,
@@ -86,6 +88,8 @@ export interface NoteStore {
   getPage(id: string): Promise<NotePage | null>;
   savePage(page: NotePage, queue?: boolean): Promise<SaveResult>;
   importDocument(notebook: Notebook, pages: NotePage[]): Promise<void>;
+  duplicateNotebook(notebookID: string): Promise<Notebook>;
+  movePage(pageID: string, notebookID: string, position: number): Promise<void>;
   deletePage(id: string): Promise<SaveResult>;
   restorePage(id: string): Promise<SaveResult>;
   archiveNotebook(id: string): Promise<SaveResult>;
@@ -105,7 +109,7 @@ export interface NoteStore {
   archiveEmptyConflictNotebooks?(): Promise<number>;
   listConflicts(): Promise<ConflictCopy[]>;
   deleteConflict(conflictID: string): Promise<void>;
-  exportArchive(): Promise<Archive>;
+  exportArchive(notebookID?: string): Promise<Archive>;
   importArchive(archive: Archive): Promise<{ notebooks: number; pages: number }>;
   ensureStarterData(): Promise<{ notebook: Notebook; page: NotePage }>;
   /** Keep the database open while a network sync is applying its ACKs. */
@@ -143,7 +147,7 @@ function optionalString(value: unknown, label: string): string | null {
 }
 
 function nonNegativeInteger(value: unknown, label: string): number {
-  if (!Number.isInteger(value) || (value as number) < 0) throw new Error(`${label} is invalid`);
+  if (!Number.isSafeInteger(value) || (value as number) < 0) throw new Error(`${label} is invalid`);
   return value as number;
 }
 
@@ -610,7 +614,9 @@ export class SQLiteNoteStoreEngine implements NoteStore {
         // The normal row decoder reports corrupt snapshots when the row is read.
       }
     }
-    return Math.max(count, maximum + 1);
+    const next = Math.max(count, maximum + 1);
+    if (!Number.isSafeInteger(next)) throw new Error("Page order is full. Reorder the pages before adding another page.");
+    return next;
   }
 
   private notebookFromRow(row: Record<string, unknown> | null | undefined): Notebook | null {
@@ -641,7 +647,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
   }
 
   /** Coalesce unchanged pending state; preserve ordered state transitions. */
-  private queueOperation(operation: Omit<SyncOperation, "opId" | "createdAt" | "state">): string {
+  private queueOperation(operation: Omit<SyncOperation, "opId" | "createdAt" | "state">, append = false): string {
     // Use the newest row. Coalescing the oldest create row after a pending
     // delete would erase the parent-before-children ordering needed by the
     // server. Sending rows are immutable and therefore always force a new
@@ -654,8 +660,12 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       [operation.entityType, operation.entityId],
     )[0];
     if (latest && latest.state === "pending" && latest.action === operation.action && typeof latest.op_id === "string") {
-      this.db.exec({ sql: "UPDATE outbox SET payload = ? WHERE op_id = ? AND state = 'pending'", bind: [JSON.stringify(operation.payload), latest.op_id] });
-      return latest.op_id;
+      if (!append) {
+        this.db.exec({ sql: "UPDATE outbox SET payload = ? WHERE op_id = ? AND state = 'pending'", bind: [JSON.stringify(operation.payload), latest.op_id] });
+        return latest.op_id;
+      }
+      // A moved page must follow the destination notebook's queued creation.
+      this.db.exec({ sql: "DELETE FROM outbox WHERE op_id = ? AND state = 'pending'", bind: [latest.op_id] });
     }
     const opId = id();
     this.db.exec({
@@ -666,14 +676,15 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     return opId;
   }
 
-  private savePageRow(page: NotePage, queue: boolean): SaveResult {
+  private savePageRow(page: NotePage, queue: boolean, changeOrder = false): SaveResult {
     const normalized = validatePageSnapshot(page, page.id, undefined, true, "local");
     const existing = this.pageFromRow(this.row(normalized.id, "pages"));
+    if (existing && existing.notebookId !== normalized.notebookId && !changeOrder) throw new Error("This page moved to another notebook. Reopen it before editing.");
     // Local edits do not mint server revisions. Keep the last acknowledged one.
     const baseRevision = existing?.revision ?? normalized.revision;
     // New local pages append after existing pages. Existing/remote order is
     // preserved, including legacy rows that have no order field yet.
-    const pageOrder = existing ? existing.order : normalized.order ?? this.nextPageOrderDirect(normalized.notebookId);
+    const pageOrder = existing && !changeOrder ? existing.order : normalized.order ?? this.nextPageOrderDirect(normalized.notebookId);
     const saved: NotePage = {
       ...normalized,
       order: pageOrder,
@@ -701,7 +712,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       baseRevision,
       action: saved.deletedAt === null ? "upsert" : "delete",
       payload: saved.deletedAt === null ? toWirePage(saved) as unknown as Record<string, unknown> : { ...toWirePage(saved), deletedAt: saved.deletedAt },
-    });
+    }, Boolean(existing && existing.notebookId !== saved.notebookId));
     return { status: "saved", operationId: operationID, revision: saved.revision };
   }
 
@@ -758,8 +769,10 @@ export class SQLiteNoteStoreEngine implements NoteStore {
         const result = this.saveNotebookRow(book, true);
         if (result.status === "failed") throw new Error(result.message ?? "Could not save imported notebook.");
       }
-      for (const page of checked) {
-        const result = this.savePageRow(page, true);
+      const firstOrder = existing ? this.nextPageOrderDirect(book.id) : null;
+      for (const [index, page] of checked.entries()) {
+        const imported = firstOrder === null ? page : { ...page, order: firstOrder + index, formatVersion: PAGE_METADATA_FORMAT_VERSION };
+        const result = this.savePageRow(imported, true);
         if (result.status === "failed") throw new Error(result.message ?? "Could not save imported pages.");
       }
     });
@@ -785,9 +798,56 @@ export class SQLiteNoteStoreEngine implements NoteStore {
   }
 
   async restorePage(entityID: string): Promise<SaveResult> {
-    const page = await this.getPage(entityID);
-    if (!page) return { status: "failed", message: "Page not found" };
-    return this.savePage({ ...page, deletedAt: null });
+    return this.transaction(() => {
+      const page = this.pageFromRow(this.row(entityID, "pages"));
+      if (!page) return { status: "failed", message: "Page not found" };
+      const parent = this.notebookFromRow(this.row(page.notebookId, "notebooks"));
+      if (!parent || parent.deletedAt) return { status: "failed", message: "Restore the notebook first." };
+      return this.savePageRow({ ...page, deletedAt: null }, true);
+    });
+  }
+
+  async duplicateNotebook(notebookID: string): Promise<Notebook> {
+    return this.transaction(() => {
+      const source = this.notebookFromRow(this.row(requireUUID(notebookID, "Notebook ID"), "notebooks"));
+      if (!source || source.deletedAt) throw new Error("This notebook is unavailable or in the trash.");
+      const pages = this.query("SELECT json FROM pages WHERE notebook_id = ? AND deleted_at IS NULL", [source.id])
+        .map(row => this.pageFromRow(row)!).filter(page => !page.conflictOf).sort(comparePageOrder);
+      const copy = createNotebook(copyTitle(source.title));
+      this.saveNotebookRow(copy, true);
+      pages.forEach((sourcePage, order) => {
+        const page = clonePage(sourcePage);
+        this.savePageRow({ ...page, id: id(), notebookId: copy.id, revision: 0, order,
+          formatVersion: PAGE_METADATA_FORMAT_VERSION, conflictOf: undefined,
+          strokes: page.strokes.map(stroke => ({ ...stroke, id: id() })),
+          images: page.images?.map(image => ({ ...image, id: id() })),
+        }, true);
+      });
+      return copy;
+    });
+  }
+
+  /** Position is zero-based amongst active, non-recovery destination pages. */
+  async movePage(pageID: string, notebookID: string, position: number): Promise<void> {
+    pageID = requireUUID(pageID, "Page ID");
+    notebookID = requireUUID(notebookID, "Notebook ID");
+    if (!Number.isSafeInteger(position) || position < 0) throw new Error("Invalid page position.");
+    await this.transaction(() => {
+      const page = this.pageFromRow(this.row(pageID, "pages"));
+      const destination = this.notebookFromRow(this.row(notebookID, "notebooks"));
+      const source = page && this.notebookFromRow(this.row(page.notebookId, "notebooks"));
+      if (!page || page.deletedAt || page.conflictOf || !source || source.deletedAt) throw new Error("Restore the page and notebook before moving it.");
+      if (!destination || destination.deletedAt) throw new Error("The destination notebook is unavailable or in the trash.");
+      const pages = this.query("SELECT json FROM pages WHERE notebook_id = ? AND deleted_at IS NULL", [notebookID])
+        .map(row => this.pageFromRow(row)!).filter(item => item.id !== pageID && !item.conflictOf).sort(comparePageOrder);
+      if (position > pages.length) throw new Error("The page list changed. Choose its position again.");
+      pages.splice(position, 0, { ...page, notebookId: notebookID });
+      pages.forEach((item, order) => {
+        if (item.order !== order || (item.id === pageID && page.notebookId !== notebookID)) {
+          this.savePageRow({ ...item, order, formatVersion: PAGE_METADATA_FORMAT_VERSION }, true, true);
+        }
+      });
+    });
   }
 
   async archiveNotebook(entityID: string): Promise<SaveResult> {
@@ -949,10 +1009,13 @@ export class SQLiteNoteStoreEngine implements NoteStore {
 
   async deleteConflict(conflictID: string): Promise<void> { await this.transaction(() => this.db.exec({ sql: "DELETE FROM conflicts WHERE id = ?", bind: [conflictID] })); }
 
-  async exportArchive(): Promise<Archive> {
-    const notebooks = await this.listNotebooks(true);
+  async exportArchive(notebookID?: string): Promise<Archive> {
+    const notebooks = notebookID ? [(await this.getNotebook(requireUUID(notebookID, "Notebook ID")))].filter((book): book is Notebook => book !== null) : await this.listNotebooks(true);
+    if (notebookID && !notebooks.length) throw new Error("Notebook not found.");
     const pages = (await Promise.all(notebooks.map((notebook) => this.listPages(notebook.id, true)))).flat();
-    return { version: 1, exportedAt: now(), account: this.accountKey, notebooks, pages, versions: await this.listConflicts() };
+    const pageIDs = new Set(pages.map(page => page.id));
+    const versions = (await this.listConflicts()).filter(version => !notebookID || version.entityId === notebooks[0]!.id || pageIDs.has(version.entityId) || version.payload.notebookId === notebooks[0]!.id);
+    return { version: 1, exportedAt: now(), account: this.accountKey, notebooks, pages, versions };
   }
 
   async importArchive(archive: Archive): Promise<{ notebooks: number; pages: number }> {
@@ -1014,9 +1077,10 @@ export class SQLiteNoteStoreEngine implements NoteStore {
         remappedNotebookIDs.set(notebook.id, newID);
         return { ...notebook, id: newID, revision: 0, deletedAt: null, updatedAt: now() };
       });
+      const remappedPageIDs = new Map(pages.map(page => [page.id, freshID()]));
       const inputPages = pages.map((page) => ({
         ...page,
-        id: freshID(),
+        id: remappedPageIDs.get(page.id)!,
         notebookId: remappedNotebookIDs.get(page.notebookId)!,
         revision: 0,
         deletedAt: null,
@@ -1025,7 +1089,12 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       }));
       inputNotebooks.forEach((notebook) => this.saveNotebookRow(notebook, true));
       inputPages.forEach((page) => this.savePageRow(page, true));
-      checkedVersions.forEach(version => this.insertConflictDirect(version.entityType as SyncEntityType, version.entityId, version.payload as unknown as Record<string, unknown>, "Imported saved version", 0));
+      checkedVersions.forEach(version => {
+        const entityId = (version.entityType === "page" ? remappedPageIDs : remappedNotebookIDs).get(version.entityId) ?? version.entityId;
+        const payload = { ...version.payload, id: entityId } as unknown as Record<string, unknown>;
+        if (typeof payload.notebookId === "string") payload.notebookId = remappedNotebookIDs.get(payload.notebookId) ?? payload.notebookId;
+        this.insertConflictDirect(version.entityType as SyncEntityType, entityId, payload, "Imported saved version", 0);
+      });
       return { notebooks: inputNotebooks.length, pages: inputPages.length };
     });
   }
@@ -1304,9 +1373,11 @@ export class SQLiteNoteStore implements NoteStore {
   archiveEmptyConflictNotebooks(): Promise<number> { return this.rpc("archiveEmptyConflictNotebooks"); }
   listConflicts(): Promise<ConflictCopy[]> { return this.rpc("listConflicts"); }
   deleteConflict(conflictID: string): Promise<void> { return this.rpc("deleteConflict", [conflictID]); }
-  exportArchive(): Promise<Archive> { return this.rpc("exportArchive"); }
+  exportArchive(notebookID?: string): Promise<Archive> { return this.rpc("exportArchive", [notebookID]); }
   importArchive(archive: Archive): Promise<{ notebooks: number; pages: number }> { return this.rpc("importArchive", [archive]); }
   importDocument(notebook: Notebook, pages: NotePage[]): Promise<void> { return this.rpc("importDocument", [notebook, pages]); }
+  duplicateNotebook(notebookID: string): Promise<Notebook> { return this.rpc("duplicateNotebook", [notebookID]); }
+  movePage(pageID: string, notebookID: string, position: number): Promise<void> { return this.rpc("movePage", [pageID, notebookID, position]); }
   ensureStarterData(): Promise<{ notebook: Notebook; page: NotePage }> { return this.rpc("ensureStarterData"); }
 
   acquireSyncLease(): () => void {

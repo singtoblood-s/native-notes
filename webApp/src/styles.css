@@ -851,6 +851,11 @@ input, textarea, select { accent-color: var(--accent); }
   overflow-wrap: anywhere;
 }
 
+#organize-dialog select { width: 100%; min-height: 44px; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--paper); color: var(--ink); font: inherit; }
+#library-page-results { padding-bottom: 24px; }
+#library-page-results h2 { font-size: 18px; }
+#library-page-results .page-row { min-height: 56px; border-bottom: 1px solid var(--line); color: var(--ink); }
+
 /* Avoid focus zoom for small form fields on touch devices. */
 @media (any-pointer: coarse) {
   input, textarea, select { font-size: max(16px, 1em) !important; }

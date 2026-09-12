@@ -146,6 +146,8 @@ export const PAGE_METADATA_FORMAT_VERSION = 2;
 export const DEFAULT_PAGE_WIDTH = 1024;
 export const DEFAULT_PAGE_HEIGHT = 1366;
 export const MAX_PAGE_IMAGES = 100;
+export const MAX_TITLE_LENGTH = 500;
+export const MAX_PAGE_TEXT_LENGTH = 1_000_000;
 export const MAX_PAGE_IMAGE_BYTES = 2 * 1024 * 1024;
 export const MAX_PAGE_IMAGE_BYTES_TOTAL = 10 * 1024 * 1024;
 export const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -179,6 +181,15 @@ export function id(): string {
 
 export function now(): string {
   return new Date().toISOString();
+}
+
+/** Reserve space for the suffix without splitting a Unicode surrogate pair. */
+export function copyTitle(title: string): string {
+  return `${title.slice(0, MAX_TITLE_LENGTH - 7).replace(/[\uD800-\uDBFF]$/, "")} (copy)`;
+}
+
+export function searchText(value: string): string {
+  return value.normalize("NFC").toLocaleLowerCase().replace(/\s+/g, " ").trim();
 }
 
 export function createNotebook(title = "My notebook"): Notebook {
@@ -221,8 +232,8 @@ export function sanitizePageImage(input: Partial<PageImage>): PageImage {
     src: typeof input.src === "string" ? input.src : "",
     x: Number.isFinite(input.x) ? input.x ?? 0 : 0,
     y: Number.isFinite(input.y) ? input.y ?? 0 : 0,
-    width: Number.isFinite(input.width) ? Math.max(1, input.width ?? 1) : 1,
-    height: Number.isFinite(input.height) ? Math.max(1, input.height ?? 1) : 1,
+    width: Number.isFinite(input.width) && (input.width ?? 0) > 0 ? input.width! : 1,
+    height: Number.isFinite(input.height) && (input.height ?? 0) > 0 ? input.height! : 1,
   };
 }
 
@@ -244,7 +255,7 @@ export function sanitizeStroke(stroke: Partial<InkStroke>): InkStroke {
   return {
     id: typeof stroke.id === "string" && stroke.id ? stroke.id.toLowerCase() : id(),
     color,
-    width: Number.isFinite(stroke.width) ? Math.max(0.5, stroke.width ?? 2.5) : 2.5,
+    width: Number.isFinite(stroke.width) ? Math.max(0.1, stroke.width ?? 2.5) : 2.5,
     points: Array.isArray(stroke.points) ? stroke.points.map((point) => sanitizePoint(point)) : [],
   };
 }
@@ -256,8 +267,8 @@ export function sanitizePage(input: Partial<NotePage>): NotePage {
     title: typeof input.title === "string" ? input.title : "Untitled page",
     text: typeof input.text === "string" ? input.text : "",
     background: input.background === "ruled" || input.background === "grid" ? input.background : "blank",
-    width: Number.isFinite(input.width) ? Math.max(320, input.width ?? DEFAULT_PAGE_WIDTH) : DEFAULT_PAGE_WIDTH,
-    height: Number.isFinite(input.height) ? Math.max(320, input.height ?? DEFAULT_PAGE_HEIGHT) : DEFAULT_PAGE_HEIGHT,
+    width: Number.isFinite(input.width) ? Math.max(1, input.width ?? DEFAULT_PAGE_WIDTH) : DEFAULT_PAGE_WIDTH,
+    height: Number.isFinite(input.height) ? Math.max(1, input.height ?? DEFAULT_PAGE_HEIGHT) : DEFAULT_PAGE_HEIGHT,
     strokes: Array.isArray(input.strokes) ? input.strokes.map((stroke) => sanitizeStroke(stroke)) : [],
     images: Array.isArray(input.images) ? input.images.map((image) => sanitizePageImage(image)) : undefined,
     order: Number.isSafeInteger(input.order) && (input.order ?? 0) >= 0 ? input.order : undefined,

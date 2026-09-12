@@ -51,6 +51,28 @@ beforeEach(() => {
 afterEach(() => { document.body.innerHTML = ""; vi.unstubAllGlobals(); });
 
 describe("PaperCanvas pointer contract", () => {
+  it("keeps a page at the point limit saveable and allows erasing to resume writing", () => {
+    const { canvas, changes, canvasController } = setup();
+    const points = Array.from({ length: 199_999 }, (_, time) => ({ x: 5, y: 5, pressure: .5, time, tiltX: null, tiltY: null }));
+    canvasController.setStrokes([{ id: "existing", color: 0xff000000, width: 2, points }], true);
+    canvas.dispatchEvent(pointer("pointerdown", { clientX: 50, clientY: 50 }));
+    canvas.dispatchEvent(pointer("pointermove", { clientX: 60, clientY: 60 }));
+    canvas.dispatchEvent(pointer("pointerup", { clientX: 70, clientY: 70 }));
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(changes.mock.calls[0]![0].reduce((count: number, stroke: { points: unknown[] }) => count + stroke.points.length, 0)).toBe(200_000);
+    canvas.dispatchEvent(pointer("pointerdown", { clientX: 80, clientY: 80 }));
+    canvas.dispatchEvent(pointer("pointerup", { clientX: 80, clientY: 80 }));
+    expect(changes).toHaveBeenCalledTimes(1);
+    canvasController.setTool({ kind: "eraser", width: 20 });
+    canvas.dispatchEvent(pointer("pointerdown", { clientX: 2.5, clientY: 2.5 }));
+    canvas.dispatchEvent(pointer("pointerup", { clientX: 2.5, clientY: 2.5 }));
+    expect(changes).toHaveBeenCalledTimes(2);
+    canvasController.setTool({ kind: "pen", width: 2, color: 0xff000000 });
+    canvas.dispatchEvent(pointer("pointerdown", { clientX: 80, clientY: 80, tiltX: 120, tiltY: -120 }));
+    canvas.dispatchEvent(pointer("pointerup", { clientX: 80, clientY: 80, tiltX: 120, tiltY: -120 }));
+    expect(changes.mock.calls.at(-1)![0].at(-1).points[0]).toMatchObject({ tiltX: 90, tiltY: -90 });
+    canvasController.destroy();
+  });
   it("bounds raster memory for large imported PDF page dimensions", () => {
     const { canvasController, canvas } = setup();
     canvasController.setPage("poster", 10_000, 10_000, "blank", []);

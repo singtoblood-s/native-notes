@@ -1,10 +1,21 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LEGACY_API_URL } from "../src/auth";
 import { accountNamespace } from "../src/storage";
-import { clonePage, createPage, createNotebook, isUUID, pageImageDataBytes, requireUUID, toWirePage } from "../src/models";
+import { clonePage, createPage, createNotebook, isUUID, pageImageDataBytes, requireUUID, toWirePage, copyTitle, searchText } from "../src/models";
 
 afterEach(() => {
   vi.unstubAllEnvs();
+});
+
+it.each(["ก".repeat(500), "a".repeat(492) + "😀" + "b".repeat(6), "Title"])("keeps duplicate names valid: %s", title => {
+  expect(copyTitle(title).length).toBeLessThanOrEqual(500);
+  expect(copyTitle(title).endsWith(" (copy)")).toBe(true);
+  expect(copyTitle(title)).not.toMatch(/[\uD800-\uDBFF] \(copy\)$/);
+});
+
+it("finds canonically equivalent Unicode and text split across lines", () => {
+  expect(searchText("Cafe\u0301\n  THAI")).toBe(searchText("Café thai"));
+  expect(searchText("  โน้ต\nภาษาไทย  ")).toBe("โน้ต ภาษาไทย");
 });
 
 describe("local identity and canonical models", () => {

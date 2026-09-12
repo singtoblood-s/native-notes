@@ -20,6 +20,18 @@ beforeEach(() => {
 });
 afterEach(() => { vi.restoreAllMocks(); });
 
+it("does not silently discard additional pages during PNG export", async () => {
+  await expect(exportPages([createPage(notebookID), createPage(notebookID)], "png", vi.fn(), new AbortController().signal)).rejects.toThrow("one page");
+});
+
+it("honors cancellation while the PNG renderer is loading", async () => {
+  const controller = new AbortController();
+  const canvas = document.createElement("canvas");
+  mocks.renderExport.mockImplementationOnce(async () => { controller.abort(); return canvas; });
+  await expect(exportPages([createPage(notebookID)], "png", vi.fn(), controller.signal)).rejects.toMatchObject({ name: "AbortError" });
+  expect(canvas.width).toBe(1);
+});
+
 it("imports every PDF page with schema version, original physical dimensions and stable append order", async () => {
   const destroy = vi.fn();
   const cleanup = vi.fn();

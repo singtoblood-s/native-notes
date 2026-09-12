@@ -21,7 +21,7 @@ interface WorkerScope {
 const scope = globalThis as unknown as WorkerScope;
 const allowedMethods = new Set([
   "listNotebooks", "getNotebook", "saveNotebook", "listPages", "getPage", "savePage", "importDocument",
-  "deletePage", "restorePage", "archiveNotebook", "restoreNotebook",
+  "deletePage", "restorePage", "archiveNotebook", "restoreNotebook", "duplicateNotebook", "movePage",
   "createConflictCopyFromOperation", "pendingOperations", "getOperation", "markOperationSending",
   "markOperationPending", "markOperationAcked", "applyRemote", "applyRemoteBatch", "applyServerSnapshot",
   "archiveEmptyConflictNotebooks", "getCursor", "setCursor", "resetCursor", "listConflicts", "deleteConflict", "exportArchive", "importArchive", "ensureStarterData",

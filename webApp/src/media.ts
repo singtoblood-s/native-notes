@@ -161,9 +161,15 @@ export async function importMediaPages(files: File[], notebookID: string, firstO
 export async function exportPages(pages: NotePage[], format: "pdf" | "png", progress: MediaProgress, signal: AbortSignal): Promise<Blob> {
   if (!pages.length) throw new Error("There are no pages to export.");
   if (format === "png") {
+    if (pages.length !== 1) throw new Error("PNG export supports one page. Use PDF for multiple pages.");
     signal.throwIfAborted();
     const canvas = await renderPageExport(pages[0]!);
-    try { return await canvasBlob(canvas); } finally { canvas.width = canvas.height = 1; }
+    try {
+      signal.throwIfAborted();
+      const blob = await canvasBlob(canvas);
+      signal.throwIfAborted();
+      return blob;
+    } finally { canvas.width = canvas.height = 1; }
   }
   const { PDFDocument } = await import("pdf-lib");
   const pdf = await PDFDocument.create();
@@ -179,5 +185,7 @@ export async function exportPages(pages: NotePage[], format: "pdf" | "png", prog
     await new Promise(resolve => setTimeout(resolve, 0));
   }
   signal.throwIfAborted();
-  return new Blob([new Uint8Array(await pdf.save())], { type: "application/pdf" });
+  const bytes = new Uint8Array(await pdf.save());
+  signal.throwIfAborted();
+  return new Blob([bytes], { type: "application/pdf" });
 }

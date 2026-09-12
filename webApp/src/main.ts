@@ -16,6 +16,7 @@ import {
   id,
   isUUID,
   now,
+  copyTitle, searchText, MAX_PAGE_TEXT_LENGTH,
 } from "./models";
 import { Archive, NoteStore, SQLiteNoteStore } from "./storage";
 import { SyncCoordinator, SyncCoordinatorStatus, SyncCompleteContext } from "./coordinator";
@@ -25,7 +26,7 @@ import { removeGuestData } from "./remove-guest-data";
 import { FloatingTools } from "./floating-tools";
 
 const BASE = import.meta.env.BASE_URL;
-const APP_BUILD = "2026.09.11.3";
+const APP_BUILD = "2026.09.12.1";
 type OfflineCacheStatus = "preparing" | "ready" | "error" | "unsupported" | "development";
 interface SavedSelection { notebookID?: string; pageID?: string; }
 
@@ -115,6 +116,9 @@ class NotePadApp {
   private remoteRefreshTimer: number | null = null;
   private navigationGeneration = 0;
   private explicitPageNavigation = false;
+  private organizingPageID: string | null = null;
+  private archiveBusy = false;
+  private duplicateBusy = false;
   private readonly handlePageHide = (): void => { void this.flushPendingSave(); };
 
   constructor(root: HTMLElement) {
@@ -122,6 +126,10 @@ class NotePadApp {
     lockBrowserZoom();
     document.addEventListener("keydown", (event) => { if (!this.loginRequired) this.handleShortcut(event); });
     window.addEventListener("pagehide", this.handlePageHide, { capture: true });
+    document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") void this.flushPendingSave(); });
+    window.addEventListener("beforeunload", event => {
+      if (this.unsavedPageID || this.saveInFlight) { event.preventDefault(); event.returnValue = ""; }
+    });
     window.setInterval(() => {
       if (document.getElementById("auth-dialog") && !this.loginRequired && !this.auth.session) this.requireLogin();
     }, 1_000);
@@ -214,12 +222,14 @@ class NotePadApp {
     const canvas = byId<HTMLCanvasElement>("ink-canvas");
     this.canvas = new PaperCanvas(canvas, byId("paper"), byId("paper-viewport"), {
       onChange: (strokes) => this.handleCanvasChange(strokes),
+      onLimit: message => this.toast(message),
       onZoom: (scale) => {
         byId("zoom-label").textContent = `${Math.round(scale * 100)}%`;
         this.updateFlowScale(scale);
       },
     });
     this.bindEvents();
+    this.restoreLibraryPreferences();
     this.restoreToolSettings();
     this.selectTool(this.selectedTool);
     byId<HTMLInputElement>("endpoint-input").value = getEndpoint();
@@ -295,12 +305,13 @@ class NotePadApp {
       byId<HTMLInputElement>("import-input").click();
     });
     byId("library-search").addEventListener("input", () => this.renderLibrary());
-    byId("library-sort").addEventListener("change", () => this.renderLibrary());
+    byId("library-sort").addEventListener("change", () => { this.saveLibraryPreferences(); this.renderLibrary(); });
     byId("library-layout").addEventListener("click", () => {
       const button = byId("library-layout");
       const list = button.getAttribute("aria-pressed") !== "true";
       button.setAttribute("aria-pressed", String(list));
       byId("library-books").classList.toggle("is-list", list);
+      this.saveLibraryPreferences();
     });
     for (const name of ["documents", "favorites", "search"] as const) onClick(name === "search" ? "library-tab-search" : `library-${name}`, () => {
       this.libraryTab = name;
@@ -379,6 +390,24 @@ class NotePadApp {
     onClick("hand-tool", () => this.selectTool("hand"));
     onClick("previous-page", () => { void this.turnPage(-1); });
     onClick("next-page", () => { void this.turnPage(1); });
+    onClick("page-position", () => {
+      const pages = this.editorPages();
+      if (!pages.length) return;
+      const input = byId<HTMLInputElement>("jump-page-number");
+      input.max = String(pages.length);
+      input.value = String(Math.max(0, pages.findIndex(page => page.id === this.currentPage?.id)) + 1);
+      this.openDialog("jump-dialog");
+      input.focus(); input.select();
+    });
+    onClick("close-jump", () => this.closeDialog("jump-dialog"));
+    byId("jump-form").addEventListener("submit", event => {
+      event.preventDefault();
+      const index = Number(byId<HTMLInputElement>("jump-page-number").value) - 1;
+      const page = Number.isSafeInteger(index) ? this.editorPages()[index] : undefined;
+      if (!page) return;
+      this.closeDialog("jump-dialog");
+      void this.selectPage(page.id);
+    });
     onClick("add-page", () => { void this.createNewPage(); });
     onClick("duplicate-page", () => { void this.createNewPage(true); });
     onClick("fit-whole-page", () => this.canvas?.fitToPage());
@@ -415,6 +444,9 @@ class NotePadApp {
     onClick("settings-export", () => this.exportArchive());
     onClick("saved-versions", () => { void this.openSavedVersions(); });
     onClick("close-versions", () => this.closeDialog("versions-dialog"));
+    onClick("close-organize", () => this.closeDialog("organize-dialog"));
+    byId("organize-notebook").addEventListener("change", () => this.renderPagePositions());
+    byId("organize-form").addEventListener("submit", event => { event.preventDefault(); void this.submitPageOrganization(); });
     onClick("settings-share", () => this.shareArchive());
     onClick("reload-app", () => { void this.reloadApp(); });
     byId<HTMLInputElement>("import-input").addEventListener("change", (event) => this.importArchive(event));
@@ -429,7 +461,7 @@ class NotePadApp {
     document.addEventListener("pointercancel", this.handleFlowPointerUp, { passive: false, signal });
     byId("paper-scroll").addEventListener("scroll", () => this.scheduleFlowActivation(), { passive: true });
     byId<HTMLInputElement>("search-input").addEventListener("input", (event) => {
-      this.search = (event.target as HTMLInputElement).value.trim().toLocaleLowerCase();
+      this.search = searchText((event.target as HTMLInputElement).value);
       this.renderLists();
     });
     byId<HTMLInputElement>("page-title").addEventListener("input", (event) => {
@@ -644,6 +676,9 @@ class NotePadApp {
     if (action === "export-media") { this.openDialog("export-dialog"); return; }
     if (!entityID) return;
     switch (action) {
+      case "organize-page": await this.openPageOrganization(entityID); break;
+      case "export-notebook-backup": await this.exportArchive(entityID); break;
+      case "export-text": await this.exportPageText(entityID); break;
       case "rename-notebook":
         await this.selectNotebookForAction(entityID);
         this.openNotebookRename();
@@ -689,19 +724,32 @@ class NotePadApp {
       const versions = await store.listConflicts();
       if (store !== this.store || !this.auth.session) return;
       byId("versions-list").innerHTML = versions.length ? [...versions].reverse().map(version => `<div class="recovery-row"><span><strong>${escapeHTML(String(version.payload.title || "Untitled"))}</strong><small>${escapeHTML(version.entityType)} · ${escapeHTML(new Date(version.createdAt).toLocaleString())}</small></span><button type="button" class="outline-button compact" data-export-version="${escapeAttr(version.id)}">Export</button></div>`).join("") : "<p>No saved versions yet.</p>";
+      byId("versions-list").querySelectorAll<HTMLElement>("[data-export-version]").forEach(button => {
+        button.insertAdjacentHTML("afterend", `<button type="button" class="outline-button compact" data-restore-version="${escapeAttr(button.dataset.exportVersion!)}">Restore as copy</button>`);
+      });
       byId("versions-list").onclick = async event => {
-        const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-export-version]");
-        const version = versions.find(item => item.id === button?.dataset.exportVersion);
-        if (!version || store !== this.store || !this.auth.session) return;
+        const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-export-version], [data-restore-version]");
+        const version = versions.find(item => item.id === (button?.dataset.exportVersion ?? button?.dataset.restoreVersion));
+        if (!button || button.disabled || !version || store !== this.store || !this.auth.session || this.archiveBusy) return;
+        button.disabled = true;
+        this.archiveBusy = true;
         try {
+          if (!(await this.flushPendingSave()) || store !== this.store || this.loginRequired) return;
           const notebook = version.entityType === "notebook" ? version.payload as unknown as Notebook
             : await store.getNotebook(String(version.payload.notebookId)) ?? { ...createNotebook("Restored notes"), id: String(version.payload.notebookId) };
           const archive: Archive = { version: 1, exportedAt: now(), account: store.accountKey,
             notebooks: [{ ...notebook, title: notebook.title.replace(/(?: · conflict)+$/, "") || "Restored notebook", deletedAt: null }],
             pages: version.entityType === "page" ? [{ ...version.payload as unknown as NotePage, deletedAt: null, conflictOf: undefined }] : [] };
           if (store !== this.store || !this.auth.session) return;
-          download(new Blob([JSON.stringify(archive)], { type: "application/json" }), `saved-version-${version.id}.notepad.json`);
-        } catch (error) { byId("versions-message").textContent = error instanceof Error ? error.message : "Could not export this version."; }
+          if (button.dataset.restoreVersion) {
+            const result = await store.importArchive(archive);
+            if (store !== this.store || this.loginRequired) return;
+            this.coordinator.notifyLocalWrite();
+            await this.reload();
+            byId("versions-message").textContent = `Restored ${result.pages} page(s) in a new notebook. Open Documents to find it. The original version is kept.`;
+          } else download(new Blob([JSON.stringify(archive)], { type: "application/json" }), `saved-version-${version.id}.notepad.json`);
+        } catch (error) { if (store === this.store && !this.loginRequired) byId("versions-message").textContent = error instanceof Error ? error.message : "Could not read this version."; }
+        finally { button.disabled = false; this.archiveBusy = false; }
       };
       byId("versions-message").textContent = "";
       this.openDialog("versions-dialog");
@@ -834,9 +882,84 @@ class NotePadApp {
     } catch { return []; }
   }
 
+  private async openPageOrganization(pageID: string): Promise<void> {
+    const store = this.store;
+    if (!(await this.flushPendingSave()) || store !== this.store || this.loginRequired) return;
+    const page = this.allPages.find(item => item.id === pageID);
+    if (!page || page.deletedAt || page.conflictOf || this.showTrash) return;
+    this.organizingPageID = pageID;
+    byId<HTMLSelectElement>("organize-notebook").innerHTML = this.notebooks.filter(book => !book.deletedAt)
+      .map(book => `<option value="${book.id}">${escapeHTML(book.title)}</option>`).join("");
+    byId<HTMLSelectElement>("organize-notebook").value = page.notebookId;
+    this.renderPagePositions();
+    byId("organize-message").textContent = "";
+    this.openDialog("organize-dialog");
+  }
+
+  private renderPagePositions(): void {
+    const notebookID = byId<HTMLSelectElement>("organize-notebook").value;
+    const pages = this.allPages.filter(page => page.notebookId === notebookID && !page.deletedAt && !page.conflictOf);
+    const currentIndex = pages.findIndex(page => page.id === this.organizingPageID);
+    const others = pages.filter(page => page.id !== this.organizingPageID);
+    byId<HTMLSelectElement>("organize-position").innerHTML = others.map((page, index) => `<option value="${index}">${index + 1} · Before ${escapeHTML(page.title || "Untitled page")}</option>`).join("") + `<option value="${others.length}">${others.length + 1} · At the end</option>`;
+    byId<HTMLSelectElement>("organize-position").value = String(currentIndex < 0 ? others.length : currentIndex);
+  }
+
+  private async submitPageOrganization(): Promise<void> {
+    const button = byId<HTMLButtonElement>("organize-submit");
+    if (button.disabled || !this.organizingPageID || this.loginRequired) return;
+    const store = this.store;
+    const pageID = this.organizingPageID;
+    const notebookID = byId<HTMLSelectElement>("organize-notebook").value;
+    const position = Number(byId<HTMLSelectElement>("organize-position").value);
+    button.disabled = true;
+    try {
+      if (!(await this.flushPendingSave()) || store !== this.store || this.loginRequired) return;
+      await store.movePage(pageID, notebookID, position);
+      if (store !== this.store || this.loginRequired) return;
+      this.coordinator.notifyLocalWrite();
+      const notebook = await store.getNotebook(notebookID);
+      if (store !== this.store || this.loginRequired) return;
+      this.currentNotebook = notebook;
+      this.view = "editor";
+      this.closeDialog("organize-dialog");
+      await this.reload(pageID);
+    } catch (error) {
+      if (store === this.store && !this.loginRequired) byId("organize-message").textContent = error instanceof Error ? error.message : "Could not move the page.";
+    } finally { button.disabled = false; }
+  }
+
+  private async exportPageText(pageID: string): Promise<void> {
+    const store = this.store;
+    try {
+      if (!(await this.flushPendingSave()) || store !== this.store || this.loginRequired) return;
+      const page = await store.getPage(pageID);
+      if (!page || store !== this.store || this.loginRequired) return;
+      download(new Blob([page.text], { type: "text/plain;charset=utf-8" }), `page-${page.id}.txt`);
+    } catch (error) { this.setState({ kind: "error", message: error instanceof Error ? error.message : "Could not export text." }); }
+  }
+
+  private restoreLibraryPreferences(): void {
+    try {
+      const value = JSON.parse(localStorage.getItem(`notepad.library:${this.accountKey()}`) ?? "null");
+      byId<HTMLSelectElement>("library-sort").value = value?.sort === "name" ? "name" : "modified";
+      // Preserve the existing default option if its value differs.
+      if (!byId<HTMLSelectElement>("library-sort").value) byId<HTMLSelectElement>("library-sort").selectedIndex = 0;
+      byId("library-layout").setAttribute("aria-pressed", String(value?.list === true));
+      byId("library-books").classList.toggle("is-list", value?.list === true);
+    } catch { /* Optional device preferences must never block notes. */ }
+  }
+
+  private saveLibraryPreferences(): void {
+    try { localStorage.setItem(`notepad.library:${this.accountKey()}`, JSON.stringify({
+      sort: byId<HTMLSelectElement>("library-sort").value,
+      list: byId("library-layout").getAttribute("aria-pressed") === "true",
+    })); } catch { /* Notes remain durable when preference storage is full. */ }
+  }
+
   private renderLibrary(): void {
     if (this.view !== "library") return;
-    const query = byId<HTMLInputElement>("library-search").value.trim().toLocaleLowerCase();
+    const query = searchText(byId<HTMLInputElement>("library-search").value);
     const favorites = this.favoriteIDs();
     const all = this.notebooks.filter((book) => !book.deletedAt);
     const pagesByNotebook = new Map<string, NotePage[]>();
@@ -855,7 +978,7 @@ class NotePadApp {
     }
     const modified = (book: Notebook): string => modifiedByNotebook.get(book.id) ?? book.updatedAt;
     const books = all.filter((book) => (this.libraryTab !== "favorites" || favorites.includes(book.id)) &&
-      (!query || book.title.toLocaleLowerCase().includes(query) || pagesForBook(book).some((page) => `${page.title} ${page.text}`.toLocaleLowerCase().includes(query))));
+      (!query || searchText(book.title).includes(query) || pagesForBook(book).some((page) => searchText(`${page.title} ${page.text}`).includes(query))));
     const sort = byId<HTMLSelectElement>("library-sort").value;
     books.sort((a, b) => sort === "name" ? a.title.localeCompare(b.title) : modified(b).localeCompare(modified(a)) || a.title.localeCompare(b.title));
     byId("library-title").textContent = ({ documents: "Documents", favorites: "Favorites", search: "Search" })[this.libraryTab];
@@ -870,6 +993,16 @@ class NotePadApp {
       const date = new Date(modified(book));
       return `<article class="library-book"><button class="book-open" data-open-book="${book.id}" aria-label="Open notebook ${escapeAttr(book.title)}"><span class="book-cover cover-${shade}"><span class="cover-label"><small>NOTEBOOK</small><strong>${escapeHTML(book.title)}</strong><span>NotePad</span></span></span><span class="book-caption"><strong>${escapeHTML(book.title)}</strong><small>${pages.length} page${pages.length === 1 ? "" : "s"} · ${Number.isFinite(date.getTime()) ? escapeHTML(date.toLocaleDateString(undefined, { month: "short", day: "numeric" })) : ""}</small></span></button><div class="book-actions"><button class="book-star" data-favorite="${book.id}" aria-label="Favorite ${escapeAttr(book.title)}" aria-pressed="${starred}">${starred ? "★" : "☆"}</button><button class="book-menu-button" data-menu-button aria-haspopup="menu" aria-label="More actions for ${escapeAttr(book.title)}" title="Notebook actions">⋯</button></div><div class="quick-menu book-quick-menu" role="menu" hidden><button data-action="rename-notebook" data-entity="${escapeAttr(book.id)}">Rename</button><button data-action="duplicate-notebook" data-entity="${escapeAttr(book.id)}">Duplicate</button><button data-action="trash-notebook" data-entity="${escapeAttr(book.id)}">Move to trash</button></div></article>`;
     }).join("");
+    let matches = byId("library-books").parentElement!.querySelector<HTMLElement>("#library-page-results");
+    if (!matches) {
+      matches = document.createElement("div");
+      matches.id = "library-page-results";
+      byId("library-books").after(matches);
+    }
+    const matchingPages = query ? books.flatMap(book => pagesForBook(book).filter(page => searchText(`${page.title} ${page.text}`).includes(query))) : [];
+    matches.hidden = matchingPages.length === 0;
+    matches.innerHTML = matchingPages.length ? `<h2>Matching pages (${matchingPages.length})</h2>${matchingPages.slice(0, 200).map(page => `<button class="page-row" data-search-page="${page.id}"><span class="page-copy"><strong>${escapeHTML(page.title || "Untitled page")}</strong><small>${pageNotebookLabel(page, this.notebooks)} · ${escapeHTML(preview(page.text))}</small></span></button>`).join("")}${matchingPages.length > 200 ? "<p>Showing the first 200 pages. Refine your search for more precise results.</p>" : ""}` : "";
+    matches.querySelectorAll<HTMLButtonElement>("[data-search-page]").forEach(button => button.addEventListener("click", () => { void this.selectPage(button.dataset.searchPage!); }));
     byId("library-books").querySelectorAll<HTMLButtonElement>("[data-open-book]").forEach((button) => button.addEventListener("click", () => { void this.selectNotebook(button.dataset.openBook!); }));
     byId("library-books").querySelectorAll<HTMLButtonElement>("[data-favorite]").forEach((button) => button.addEventListener("click", () => {
       const id = button.dataset.favorite!;
@@ -890,7 +1023,7 @@ class NotePadApp {
     this.renderLibrary();
     const notebookList = byId("notebook-list");
     const notebooks = this.notebooks.filter((notebook) => this.showTrash || !notebook.deletedAt || (this.showRecovery && notebook.id === this.currentNotebook?.id))
-      .filter((notebook) => !this.search || notebook.title.toLocaleLowerCase().includes(this.search));
+      .filter((notebook) => !this.search || searchText(notebook.title).includes(this.search));
     notebookList.innerHTML = notebooks.length ? notebooks.map((notebook) => {
       const deleted = Boolean(notebook.deletedAt);
       return `<div class="nav-row-wrap"><button class="nav-row ${notebook.id === this.currentNotebook?.id ? "selected" : ""}" data-notebook="${escapeAttr(notebook.id)}" aria-current="${notebook.id === this.currentNotebook?.id ? "page" : "false"}">
@@ -909,15 +1042,18 @@ class NotePadApp {
     const pageList = byId("page-list");
     const sourcePages = this.showTrash || this.showRecovery || this.search ? this.allPages : this.pages;
     const pages = sourcePages.filter((page) => this.isPageVisible(page))
-      .filter((page) => !this.search || `${page.title} ${page.text}`.toLocaleLowerCase().includes(this.search));
-    pageList.innerHTML = pages.length ? pages.map((page) => {
+      .filter((page) => !this.search || searchText(`${page.title} ${page.text}`).includes(this.search));
+    pageList.innerHTML = pages.length ? pages.map((page, index) => {
       const deleted = this.isPageInTrash(page);
       return `<div class="nav-row-wrap"><button class="page-row ${page.id === this.currentPage?.id ? "selected" : ""}" data-page="${escapeAttr(page.id)}" aria-current="${page.id === this.currentPage?.id ? "page" : "false"}">
-        <span class="page-index">${pages.indexOf(page) + 1}</span><span class="page-copy"><strong>${escapeHTML(page.title || "Untitled page")}</strong><small>${pageNotebookLabel(page, this.notebooks)}${page.text.trim() ? ` · ${escapeHTML(preview(page.text))}` : ` · ${page.strokes.length} strokes`}</small></span>
+        <span class="page-index">${index + 1}</span><span class="page-copy"><strong>${escapeHTML(page.title || "Untitled page")}</strong><small>${pageNotebookLabel(page, this.notebooks)}${page.text.trim() ? ` · ${escapeHTML(preview(page.text))}` : ` · ${page.strokes.length} strokes`}</small></span>
       </button><button class="nav-menu-button" data-menu-button aria-label="More actions for ${escapeAttr(page.title || "Untitled page")}">⋯</button><div class="quick-menu" hidden>
         ${deleted ? `<button data-action="restore-page" data-entity="${escapeAttr(page.id)}">Restore page</button>` : `<button data-action="rename-page" data-entity="${escapeAttr(page.id)}">Rename</button><button data-action="duplicate-page" data-entity="${escapeAttr(page.id)}">Duplicate</button><button data-action="trash-page" data-entity="${escapeAttr(page.id)}">Move to trash</button>`}
       </div></div>`;
-    }).join("") : `<p class="empty-copy">${this.showTrash ? "No deleted pages." : this.showRecovery ? "No recovered copies yet." : "No pages yet."}</p>`;
+    }).join("") : `<p class="empty-copy">${this.search ? "No matching pages. Try a page title or typed text." : this.showTrash ? "No deleted pages." : this.showRecovery ? "No recovered copies yet." : "No pages yet."}</p>`;
+    pageList.querySelectorAll<HTMLElement>("[data-action='duplicate-page']").forEach(button => {
+      if (!this.showRecovery) button.insertAdjacentHTML("afterend", `<button data-action="organize-page" data-entity="${button.dataset.entity}">Move / reorder page</button>`);
+    });
     pageList.querySelectorAll<HTMLButtonElement>("[data-page]:not([data-action])").forEach((button) => button.addEventListener("click", () => void this.selectPage(button.dataset.page!)));
     pageList.querySelectorAll<HTMLButtonElement>("[data-menu-button]").forEach((button) => button.addEventListener("click", (event) => {
       event.stopPropagation();
@@ -956,6 +1092,7 @@ class NotePadApp {
   private isPageVisible(page: NotePage, notebooks = this.notebooks): boolean {
     if (this.showTrash) return this.isPageInTrash(page, notebooks);
     if (page.deletedAt) return false;
+    if (notebooks.find(notebook => notebook.id === page.notebookId)?.deletedAt) return false;
     return this.showRecovery ? this.isRecoveryPage(page, notebooks) : !page.conflictOf;
   }
 
@@ -989,7 +1126,7 @@ class NotePadApp {
     } else if (this.currentNotebook) {
       notebookMenu.innerHTML = `<button data-action="rename-notebook" data-entity="${escapeAttr(this.currentNotebook.id)}">Rename notebook</button><button data-action="duplicate-notebook" data-entity="${escapeAttr(this.currentNotebook.id)}">Duplicate notebook</button><button data-action="trash-notebook" data-entity="${escapeAttr(this.currentNotebook.id)}">Move notebook to trash</button>`;
     }
-    if (this.currentNotebook && !this.showTrash) notebookMenu.insertAdjacentHTML("beforeend", '<button data-action="import-media">Import picture / PDF</button><button data-action="export-media">Export PDF / picture</button>');
+    if (this.currentNotebook && !this.showTrash) notebookMenu.insertAdjacentHTML("beforeend", `<button data-action="import-media">Import picture / PDF</button><button data-action="export-media">Export PDF / picture</button><button data-action="export-notebook-backup" data-entity="${this.currentNotebook.id}">Export this notebook backup</button>`);
     byId<HTMLButtonElement>("notebook-menu").disabled = !this.currentNotebook;
     const pageMenu = byId<HTMLElement>("page-menu-popup");
     if (page) {
@@ -998,6 +1135,8 @@ class NotePadApp {
         : `<button data-action="rename-page" data-entity="${escapeAttr(page.id)}">Rename page</button><button data-action="duplicate-page" data-entity="${escapeAttr(page.id)}">Duplicate page</button><button data-action="trash-page" data-entity="${escapeAttr(page.id)}">Move page to trash</button>`;
     } else pageMenu.replaceChildren();
     if (page && !this.showTrash) pageMenu.insertAdjacentHTML("beforeend", '<button data-action="export-media">Export PDF / picture</button>');
+    if (page) pageMenu.insertAdjacentHTML("beforeend", `<button data-action="export-text" data-entity="${page.id}">Export full typed text (.txt)</button>`);
+    if (page && !this.showTrash && !this.showRecovery) pageMenu.insertAdjacentHTML("beforeend", `<button data-action="organize-page" data-entity="${page.id}">Move / reorder page</button>`);
     byId<HTMLButtonElement>("page-menu").disabled = !page;
     byId<HTMLButtonElement>("rename-notebook").disabled = !this.currentNotebook || this.showTrash;
     const notebookAction = byId<HTMLButtonElement>("archive-notebook");
@@ -1638,7 +1777,7 @@ class NotePadApp {
   private pasteText(text: string): void {
     if (!text || !this.canInsertImage() || !this.currentPage) return;
     const next = [this.currentPage.text, text].filter(Boolean).join("\n");
-    if (next.length > 1_000_000) { this.setState({ kind: "error", message: "This text is too long to paste." }); return; }
+    if (next.length > MAX_PAGE_TEXT_LENGTH) { this.setState({ kind: "error", message: "This text is too long to paste." }); return; }
     this.currentPage.text = next;
     byId<HTMLTextAreaElement>("page-text").value = next;
     this.canvas?.setText?.(next);
@@ -1935,24 +2074,13 @@ class NotePadApp {
     if (!title || this.showTrash || this.showRecovery) return;
     const notebook = createNotebook(title);
     try {
-      const result = await this.store.saveNotebook(notebook);
-      if (result.status === "failed") {
-        byId("notebook-error").textContent = result.message ?? "Could not save notebook";
-        this.setState({ kind: "error", message: result.message ?? "Could not save notebook" });
-        return;
-      }
-      this.coordinator.notifyLocalWrite();
       const page = createPage(notebook.id, "First page");
       page.background = byId<HTMLSelectElement>("new-paper").value as PageBackground;
-      const pageResult = await this.store.savePage(page);
-      if (pageResult.status === "failed") {
-        byId("notebook-error").textContent = pageResult.message ?? "Notebook saved, but its first page could not be saved.";
-        this.setState({ kind: "error", message: pageResult.message ?? "Notebook saved, but its first page could not be saved." });
-        await this.reload();
-        return;
-      }
+      const store = this.store;
+      await store.importDocument(notebook, [page]);
+      if (store !== this.store || this.loginRequired) return;
       this.coordinator.notifyLocalWrite();
-      this.currentNotebook = { ...notebook, revision: result.revision ?? notebook.revision };
+      this.currentNotebook = notebook;
       this.view = "editor";
       await this.reload(page.id);
       this.closeDialog("notebook-dialog");
@@ -1972,7 +2100,7 @@ class NotePadApp {
       if (navigation !== this.navigationGeneration) return;
       if (!this.currentNotebook || this.showTrash || this.showRecovery) return;
       const source = this.currentPage;
-      const page = createPage(this.currentNotebook.id, duplicate && source ? `${source.title} (copy)` : `Page ${this.pages.length + 1}`);
+      const page = createPage(this.currentNotebook.id, duplicate && source ? copyTitle(source.title) : `Page ${this.pages.length + 1}`);
       if (source) {
         page.background = source.background;
         page.width = source.width;
@@ -2160,7 +2288,7 @@ class NotePadApp {
     if (!(await this.flushPendingSave())) return;
     const source = this.allPages.find((page) => page.id === pageID) ?? await this.store.getPage(pageID);
     if (!source || source.deletedAt || this.showTrash || this.showRecovery) return;
-    const copy = createPage(source.notebookId, `${source.title || "Untitled page"} (copy)`);
+    const copy = createPage(source.notebookId, copyTitle(source.title || "Untitled page"));
     copy.background = source.background;
     copy.width = source.width;
     copy.height = source.height;
@@ -2183,36 +2311,22 @@ class NotePadApp {
   }
 
   private async duplicateNotebook(notebookID: string): Promise<void> {
-    if (!(await this.flushPendingSave())) return;
-    if (this.showTrash || this.showRecovery) return;
-    const source = this.notebooks.find((notebook) => notebook.id === notebookID) ?? await this.store.getNotebook(notebookID);
-    if (!source || source.deletedAt) return;
-    const copy = createNotebook(`${source.title || "Untitled notebook"} (copy)`);
+    if (this.duplicateBusy || this.showTrash || this.showRecovery) return;
+    this.duplicateBusy = true;
+    const store = this.store;
     try {
-      const notebookResult = await this.store.saveNotebook(copy);
-      if (notebookResult.status === "failed") throw new Error(notebookResult.message ?? "Could not duplicate notebook");
+      if (!(await this.flushPendingSave()) || store !== this.store || this.loginRequired) return;
+      const copy = await store.duplicateNotebook(notebookID);
+      if (store !== this.store || this.loginRequired) return;
       this.coordinator.notifyLocalWrite();
-      const pages = await this.store.listPages(source.id);
-      let firstPageID: string | undefined;
-      for (const sourcePage of pages) {
-        const page = createPage(copy.id, sourcePage.title);
-        page.background = sourcePage.background;
-        page.width = sourcePage.width;
-        page.height = sourcePage.height;
-        page.text = sourcePage.text;
-        page.strokes = clonePage(sourcePage).strokes;
-        setPageImages(page, cloneImages(getPageImages(sourcePage), true));
-        const pageResult = await this.store.savePage(page);
-        if (pageResult.status === "failed") throw new Error(pageResult.message ?? "Could not duplicate notebook page");
-        this.coordinator.notifyLocalWrite();
-        firstPageID ??= page.id;
-      }
+      this.currentNotebook = copy;
+      this.currentPage = null;
       this.view = "editor";
-      await this.reload(firstPageID);
+      await this.reload();
       await this.closeDrawers();
     } catch (error) {
-      this.setState({ kind: "error", message: error instanceof Error ? error.message : "Could not duplicate notebook" });
-    }
+      if (store === this.store && !this.loginRequired) this.setState({ kind: "error", message: error instanceof Error ? error.message : "Could not duplicate notebook" });
+    } finally { this.duplicateBusy = false; }
   }
 
   private async setNotebookDeleted(notebookID: string, restore: boolean): Promise<void> {
@@ -2499,45 +2613,59 @@ class NotePadApp {
     this.setState(this.auth.session ? { kind: "saved" } : { kind: "needs-login" });
   }
 
-  private async exportArchive(): Promise<void> {
-    if (!(await this.flushPendingSave())) return;
-    const archive = await this.store.exportArchive();
-    download(new Blob([JSON.stringify(archive, null, 2)], { type: "application/json" }), `notepad-${dateStamp()}.notepad.json`);
+  private async exportArchive(notebookID?: string): Promise<void> {
+    const store = this.store;
+    try {
+      if (!(await this.flushPendingSave()) || store !== this.store || this.loginRequired) return;
+      const archive = await store.exportArchive(notebookID);
+      if (store !== this.store || this.loginRequired || !this.auth.session) return;
+      download(new Blob([JSON.stringify(archive)], { type: "application/json" }), `notepad-${notebookID ? `${notebookID}-` : ""}${dateStamp()}.notepad.json`);
+    } catch (error) { this.setState({ kind: "error", message: error instanceof Error ? error.message : "Could not export the backup." }); }
   }
 
   private async shareArchive(): Promise<void> {
-    if (!(await this.flushPendingSave())) return;
-    const archive = await this.store.exportArchive();
-    const blob = new Blob([JSON.stringify(archive, null, 2)], { type: "application/json" });
-    const file = new File([blob], `notepad-${dateStamp()}.notepad.json`, { type: blob.type });
-    if (navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }))) {
-      try { await navigator.share({ title: "NotePad archive", files: [file] }); return; } catch { /* user cancelled: keep the download fallback */ }
-    }
-    download(blob, file.name);
+    const store = this.store;
+    try {
+      if (!(await this.flushPendingSave()) || store !== this.store || this.loginRequired) return;
+      const archive = await store.exportArchive();
+      if (store !== this.store || this.loginRequired || !this.auth.session) return;
+      const blob = new Blob([JSON.stringify(archive)], { type: "application/json" });
+      const file = new File([blob], `notepad-${dateStamp()}.notepad.json`, { type: blob.type });
+      if (navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }))) {
+        try { await navigator.share({ title: "NotePad archive", files: [file] }); return; }
+        catch (error) { if (error instanceof Error && error.name === "AbortError") return; }
+      }
+      if (store === this.store && !this.loginRequired) download(blob, file.name);
+    } catch (error) { this.setState({ kind: "error", message: error instanceof Error ? error.message : "Could not share the backup." }); }
   }
 
   private async importArchive(event: Event): Promise<void> {
-    if (!(await this.flushPendingSave())) return;
     const input = event.target as HTMLInputElement;
     const file = input.files?.[0];
     input.value = "";
-    if (!file) return;
+    if (!file || this.archiveBusy || this.loginRequired) return;
     if (file.size > 50 * 1024 * 1024) {
       byId("settings-message").textContent = "That backup is larger than 50 MB. Export smaller notebooks or use the server sync.";
       return;
     }
+    const store = this.store;
+    this.archiveBusy = true;
     try {
+      if (!(await this.flushPendingSave()) || store !== this.store || this.loginRequired) return;
       const archive = JSON.parse(await file.text()) as Archive;
-      const result = await this.store.importArchive(archive);
+      if (store !== this.store || this.loginRequired || !this.auth.session) return;
+      const result = await store.importArchive(archive);
+      if (store !== this.store || this.loginRequired) return;
       this.coordinator.notifyLocalWrite();
       await this.reload();
       byId("settings-message").textContent = `Imported ${result.pages} pages in ${result.notebooks} notebooks.`;
     } catch (error) {
-      byId("settings-message").textContent = error instanceof Error ? error.message : "Could not import this archive.";
-    }
+      if (store === this.store && !this.loginRequired) byId("settings-message").textContent = error instanceof Error ? error.message : "Could not import this archive.";
+    } finally { this.archiveBusy = false; }
   }
 
   private handleShortcut(event: KeyboardEvent): void {
+    if (event.isComposing || event.keyCode === 229) return;
     const target = event.target instanceof HTMLElement ? event.target : null;
     if (target?.closest("input, textarea, select, [contenteditable='true']")) return;
     if (document.querySelector("dialog[open]") || this.canvas?.isInputActive) return;
@@ -2698,13 +2826,13 @@ function shellMarkup(auth: AuthSession): string {
           <label class="width-control"><span id="width-value">3px</span><input id="width-range" type="range" min="1" max="12" step="0.5" value="3" aria-label="Stroke width" /></label>
         </div>
       </div>
-           <div class="page-bar"><div class="page-heading"><button class="page-title-button" id="rename-page" aria-label="Rename page"><span class="page-title-kicker">PAGE</span><strong id="page-title-label">First page</strong><span aria-hidden="true">✎</span><span class="recovery-badge" id="recovery-page-badge" hidden>Recovered copy</span></button><button class="menu-trigger page-menu-trigger" id="page-menu" data-menu-button aria-label="Page actions">⋯</button><div class="quick-menu top-quick-menu" id="page-menu-popup" hidden><button data-action="rename-page" data-page="">Rename page</button><button data-action="duplicate-page" data-page="">Duplicate page</button><button data-action="trash-page" data-page="">Move page to trash</button></div></div><div class="page-navigation"><label class="view-mode-select"><span>View</span><select id="page-view-mode" aria-label="Page view mode"><option value="continuous">Continuous</option><option value="horizontal">Book scroll</option><option value="paged">Page turn</option></select></label><button class="quiet-button" id="previous-page" aria-label="Previous page">‹</button><span id="page-position" aria-live="polite">1 / 1</span><button class="quiet-button" id="next-page" aria-label="Next page">›</button><button class="quiet-button add-page" id="add-page" aria-label="Add page" title="Add page with the same paper">＋</button></div></div>
+           <div class="page-bar"><div class="page-heading"><button class="page-title-button" id="rename-page" aria-label="Rename page"><span class="page-title-kicker">PAGE</span><strong id="page-title-label">First page</strong><span aria-hidden="true">✎</span><span class="recovery-badge" id="recovery-page-badge" hidden>Recovered copy</span></button><button class="menu-trigger page-menu-trigger" id="page-menu" data-menu-button aria-label="Page actions">⋯</button><div class="quick-menu top-quick-menu" id="page-menu-popup" hidden><button data-action="rename-page" data-page="">Rename page</button><button data-action="duplicate-page" data-page="">Duplicate page</button><button data-action="trash-page" data-page="">Move page to trash</button></div></div><div class="page-navigation"><label class="view-mode-select"><span>View</span><select id="page-view-mode" aria-label="Page view mode"><option value="continuous">Continuous</option><option value="horizontal">Book scroll</option><option value="paged">Page turn</option></select></label><button class="quiet-button" id="previous-page" aria-label="Previous page">‹</button><button class="quiet-button" id="page-position" aria-live="polite" aria-label="Go to page">1 / 1</button><button class="quiet-button" id="next-page" aria-label="Next page">›</button><button class="quiet-button add-page" id="add-page" aria-label="Add page" title="Add page with the same paper">＋</button></div></div>
           <div class="paper-scroll" id="paper-scroll"><div class="page-flow" id="page-flow"><article class="flow-page active" id="active-page-slot" data-flow-page=""><div class="paper-viewport" id="paper-viewport"><div class="paper" id="paper"><canvas id="ink-canvas" aria-label="Note page drawing surface"></canvas><div class="paper-image-layer" id="paper-image-layer" aria-label="Page images"></div></div></div></article></div></div>
           <div class="print-note" aria-hidden="true"><h1 id="print-title"></h1><p id="print-text"></p></div>
            <div class="stage-foot" title="Two fingers to move or zoom · Hand tool for one-finger pan"><span id="tool-name" aria-live="polite">Pen</span><small class="gesture-hint">2 fingers: move / zoom · Hand: 1-finger pan</small><div class="view-controls"><button class="quiet-button" id="zoom-out" aria-label="Zoom out">−</button><span class="zoom-label" id="zoom-label">100%</span><button class="quiet-button" id="zoom-in" aria-label="Zoom in">＋</button><button class="quiet-button" id="fit-button" aria-label="Fit page width">Fit width</button><button class="quiet-button" id="fit-whole-page" aria-label="Fit whole page">Full page</button></div><span id="page-revision">revision 0</span></div>
         </div>
          <div class="empty-editor hidden" id="editor-empty"><div class="empty-orbit">✦</div><h1 id="editor-empty-title">Choose a page</h1><p id="editor-empty-copy">Your paper is waiting in the left rail.</p></div>
-      <aside class="inspector" id="inspector" aria-label="Text and page details" aria-hidden="true"><div class="inspector-head"><div><span class="eyebrow">TEXT & DETAILS</span><strong class="inspector-title">Page tools</strong></div><button class="icon-button" id="close-inspector" aria-label="Close text panel">×</button></div><label class="title-field"><span>Page title</span><input id="page-title" type="text" placeholder="Untitled page" /></label><label class="text-field"><span>Typed note</span><textarea id="page-text" rows="8" placeholder="Type in Thai or English…" dir="auto"></textarea></label><label class="select-field"><span>Paper</span><select id="background-select"><option value="blank">Blank</option><option value="ruled">Ruled lines</option><option value="grid">Grid</option></select></label><section class="image-tools" aria-label="Page images"><div class="image-tools-head"><strong>Images</strong><span><button class="outline-button compact" id="insert-image" type="button">Insert image</button><button class="outline-button compact" id="paste-image" type="button">Paste</button></span></div><input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden /><p class="image-empty" id="image-empty">Paste an image or choose a file.</p><div id="image-list"></div><div class="image-controls" id="image-controls" hidden><span id="selected-image-label">Selected image</span><button class="outline-button" id="copy-image" type="button">Copy image</button><label>Width <input id="image-width" type="range" min="48" max="960" step="1" value="320" /></label><div class="image-nudge"><button class="outline-button compact" id="image-left" type="button" aria-label="Move image left">←</button><button class="outline-button compact" id="image-right" type="button" aria-label="Move image right">→</button><button class="outline-button compact" id="image-up" type="button" aria-label="Move image up">↑</button><button class="outline-button compact" id="image-down" type="button" aria-label="Move image down">↓</button><button class="outline-button compact danger-button" id="remove-image" type="button">Remove</button></div></div></section><div class="inspector-actions"><button class="outline-button" id="duplicate-page">Duplicate page</button><button class="outline-button" id="delete-page">Move page to trash</button><button class="outline-button" id="keep-page" hidden>Keep as normal page</button><button class="outline-button" id="archive-notebook" title="Archive or restore notebook" aria-label="Archive or restore notebook">Archive notebook</button><button class="outline-button" id="print-button">Export PDF / picture</button><button class="outline-button" id="share-button">Share archive</button><button class="outline-button" id="export-button">Export backup</button></div><p class="inspector-note">Changes save locally after each edit. Sync uses the configured server only when you sign in.</p></aside>
+      <aside class="inspector" id="inspector" aria-label="Text and page details" aria-hidden="true"><div class="inspector-head"><div><span class="eyebrow">TEXT & DETAILS</span><strong class="inspector-title">Page tools</strong></div><button class="icon-button" id="close-inspector" aria-label="Close text panel">×</button></div><label class="title-field"><span>Page title</span><input id="page-title" maxlength="500" type="text" placeholder="Untitled page" /></label><label class="text-field"><span>Typed note</span><textarea id="page-text" maxlength="1000000" rows="8" placeholder="Type in Thai or English…" dir="auto"></textarea></label><label class="select-field"><span>Paper</span><select id="background-select"><option value="blank">Blank</option><option value="ruled">Ruled lines</option><option value="grid">Grid</option></select></label><section class="image-tools" aria-label="Page images"><div class="image-tools-head"><strong>Images</strong><span><button class="outline-button compact" id="insert-image" type="button">Insert image</button><button class="outline-button compact" id="paste-image" type="button">Paste</button></span></div><input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden /><p class="image-empty" id="image-empty">Paste an image or choose a file.</p><div id="image-list"></div><div class="image-controls" id="image-controls" hidden><span id="selected-image-label">Selected image</span><button class="outline-button" id="copy-image" type="button">Copy image</button><label>Width <input id="image-width" type="range" min="48" max="960" step="1" value="320" /></label><div class="image-nudge"><button class="outline-button compact" id="image-left" type="button" aria-label="Move image left">←</button><button class="outline-button compact" id="image-right" type="button" aria-label="Move image right">→</button><button class="outline-button compact" id="image-up" type="button" aria-label="Move image up">↑</button><button class="outline-button compact" id="image-down" type="button" aria-label="Move image down">↓</button><button class="outline-button compact danger-button" id="remove-image" type="button">Remove</button></div></div></section><div class="inspector-actions"><button class="outline-button" id="duplicate-page">Duplicate page</button><button class="outline-button" id="delete-page">Move page to trash</button><button class="outline-button" id="keep-page" hidden>Keep as normal page</button><button class="outline-button" id="archive-notebook" title="Archive or restore notebook" aria-label="Archive or restore notebook">Archive notebook</button><button class="outline-button" id="print-button">Export PDF / picture</button><button class="outline-button" id="share-button">Share archive</button><button class="outline-button" id="export-button">Export backup</button></div><p class="inspector-note">Changes save locally after each edit. Sync uses the configured server only when you sign in.</p></aside>
       </section>
     </main>
     <p id="editor-toast" role="status" hidden></p>
@@ -2723,7 +2851,9 @@ function authMarkup(): string {
 
 function dialogMarkup(auth: AuthSession): string {
   return `${authMarkup()}
-  <dialog class="dialog" id="versions-dialog"><div class="dialog-form"><div class="dialog-head"><h2>Saved versions</h2><button type="button" class="icon-button" id="close-versions" aria-label="Close saved versions">×</button></div><p>Sync resolves simultaneous edits without creating extra notebooks. Earlier versions stay on this device. Export a version and use Import backup to restore it.</p><div id="versions-list"></div><p id="versions-message" role="status"></p></div></dialog>
+  <dialog class="dialog" id="jump-dialog" aria-labelledby="jump-title"><form class="dialog-form" id="jump-form"><div class="dialog-head"><h2 id="jump-title">Go to page</h2><button type="button" class="icon-button" id="close-jump" aria-label="Close">×</button></div><label>Page number<input type="number" min="1" step="1" required id="jump-page-number" /></label><button type="submit" class="primary-button">Go</button></form></dialog>
+  <dialog class="dialog" id="organize-dialog" aria-labelledby="organize-title"><form class="dialog-form" id="organize-form"><div class="dialog-head"><h2 id="organize-title">Move / reorder page</h2><button type="button" class="icon-button" id="close-organize" aria-label="Close">×</button></div><label>Notebook<select id="organize-notebook"></select></label><label>Position<select id="organize-position"></select></label><p class="form-hint">Move this page within its notebook or to another notebook. Ink, images and text stay together.</p><p id="organize-message" role="alert"></p><button type="submit" class="primary-button" id="organize-submit">Move page</button></form></dialog>
+  <dialog class="dialog" id="versions-dialog"><div class="dialog-form"><div class="dialog-head"><h2>Saved versions</h2><button type="button" class="icon-button" id="close-versions" aria-label="Close saved versions">×</button></div><p>Sync resolves simultaneous edits without creating extra notebooks. Earlier versions stay on this device. Restore as copy creates a new notebook without replacing current notes. Notebook versions contain notebook details only; page versions include ink, images and text.</p><div id="versions-list"></div><p id="versions-message" role="status"></p></div></dialog>
   <dialog class="dialog" id="settings-dialog"><form class="dialog-form" id="settings-form"><div class="dialog-head"><div><span class="eyebrow">SETTINGS</span><h2>Sync & backup</h2></div><button type="button" class="icon-button" id="cancel-settings" aria-label="Close">×</button></div><label>Sync server URL<input id="endpoint-input" type="url" inputmode="url" placeholder="https://notes.example.com" /></label><p class="form-hint">Use the same HTTPS server on every device. Changing servers requires signing in again.</p><div class="account-line"><span>Sync</span><strong id="settings-sync-label" aria-live="polite" title="Sign in required">Sign in required</strong><button class="outline-button compact" type="button" id="settings-sync-button">Sync now</button></div><p class="form-message offline-cache-status" id="offline-cache-status" role="status">Preparing offline cache…</p><div class="settings-actions"><button class="outline-button" type="button" id="browse-import">Import backup</button><button class="outline-button" type="button" id="settings-export">Export backup</button><button class="outline-button" type="button" id="settings-share">Share backup</button><button class="outline-button" type="button" id="saved-versions">Saved versions</button></div><input id="import-input" type="file" accept="application/json,.json,.notepad" hidden /><p class="form-message" id="settings-message"></p>${thisAccountMarkup(auth)}<div class="app-build"><span>Web app build ${APP_BUILD}</span><button class="outline-button compact" type="button" id="reload-app">Reload app</button></div><button class="primary-button" type="submit">Save settings</button></form></dialog>
   <dialog class="dialog" id="notebook-dialog"><form class="dialog-form" id="notebook-form"><div class="dialog-head"><div><span class="eyebrow">NOTEBOOK</span><h2>Rename notebook</h2></div><button type="button" class="icon-button" id="cancel-notebook" aria-label="Close">×</button></div><label>Name<input id="notebook-title" type="text" maxlength="500" autocomplete="off" required /></label><div id="new-notebook-options" hidden><label>Paper<select id="new-paper"><option value="blank">Blank</option><option value="ruled" selected>Ruled lines</option><option value="grid">Grid</option></select></label><div class="paper-choices" role="group" aria-label="Paper preview"><button type="button" class="paper-sample paper-blank" data-paper="blank" aria-pressed="false">Blank</button><button type="button" class="paper-sample paper-ruled" data-paper="ruled" aria-pressed="true">Ruled</button><button type="button" class="paper-sample paper-grid" data-paper="grid" aria-pressed="false">Grid</button></div></div><p class="form-error" id="notebook-error" role="alert"></p><button class="primary-button" type="submit">Save name</button></form></dialog>
 `;

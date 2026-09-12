@@ -17,6 +17,11 @@ vi.mock("../src/storage", () => ({ SQLiteNoteStore: { open: async () => ({
     else data.notebooks[index] = structuredClone(notebook);
     return { status: "saved", revision: 1 };
   },
+  importDocument: async (notebook: Notebook, pages: NotePage[]) => {
+    if (data.failSave) throw new Error("Disk full");
+    data.notebooks.push(structuredClone(notebook));
+    data.pages.push(...structuredClone(pages));
+  },
   archiveNotebook: async (id: string) => {
     const index = data.notebooks.findIndex((item) => item.id === id);
     if (index < 0) return { status: "failed", message: "Notebook not found" };
