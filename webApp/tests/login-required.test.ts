@@ -7,7 +7,7 @@ vi.mock("../src/coordinator", () => ({ SyncCoordinator: class {
 } }));
 vi.mock("../src/storage", () => ({ SQLiteNoteStore: { open: async (accountKey: string) => {
   state.opened(accountKey);
-  return { accountKey, listNotebooks: async () => [], listPages: async () => [], close: vi.fn() };
+  return { accountKey, listNotebooks: async () => [], listPageSummaries: async () => [], listPages: async () => [], close: vi.fn() };
 } } }));
 vi.mock("../src/canvas", () => ({ PaperCanvas: class { setTool() {} destroy() {} } }));
 

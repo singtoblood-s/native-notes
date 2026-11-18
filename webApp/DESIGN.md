@@ -1,22 +1,14 @@
 # NotePad web direction
 
-Visual thesis: a precise, quiet notebook studio with porcelain surfaces,
-graphite typography and one blue action color; physical book covers and the
-writing paper provide the visual anchors.
+NotePad uses warm white surfaces, graphite text and a dark green accent for
+primary actions and selected tools. The paper and the user's notes provide the
+visual focus.
 
-Content plan: a persistent library rail on desktop and bottom navigation on
-mobile frame a searchable, generously spaced bookshelf. A clear title, count
-and New document action orient each library view. Empty states explain the
-next step. The paper workspace fills the viewport for handwriting first.
-Notebook navigation and the text/details controls stay available as focused
-drawers, while the top bar keeps notebook and page rename actions visible.
-Backup/sync controls remain in Settings so recovery stays easy to find without
-turning the writing surface into a dashboard.
+The library opens to a compact list with page counts and edit dates. The
+layout toggle offers a grid. Navigation sits in a narrow rail on desktop and
+at the bottom on phones. The editor keeps the writing surface between compact
+tool and page controls. Pages and typed notes open in drawers. Settings groups
+writing preferences, sync and backups.
 
-Interaction thesis: covers lift gently on hover, tool selection has a clear
-blue surface, and dialogs/drawers enter with short, restrained transitions.
-Every important control has a touch-sized target; the
-Notebooks button opens a searchable global rail, Text opens a keyboard-safe
-details drawer, and the paper never gives its height to a permanent inspector.
-Tool/status changes use restrained color and motion so the surface feels
-responsive while a reduced-motion preference stays calm.
+Rows and tool selections change color in place. Drawers slide in and dialogs
+appear with short transitions that respect the reduced-motion setting.

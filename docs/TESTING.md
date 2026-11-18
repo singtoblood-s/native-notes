@@ -25,12 +25,13 @@ The script loads Playwright from `PLAYWRIGHT_MODULE` when set. Set
 bundled Playwright revision; `SMOKE_WIDTH` and `SMOKE_HEIGHT` override the
 viewport. The default artifacts directory is `webApp/test-results`.
 
-1. Create an account using Account. Use the same account on both devices.
+1. Use Create account on the sign-in screen. Sign in with that account on the second device.
 2. Write on device A and wait for the sync status to confirm a successful
    server exchange. Device B pulls when brought to the foreground and checks
    periodically while visible. The status button can request an immediate sync.
 3. Edit the same page offline on both devices, then sync each. Check that
-   both versions remain recoverable as conflict copies.
+   both devices show the first synced edit. On the device with the alternate
+   edit, open Settings → Saved versions and restore it as a copy.
 4. Export a backup before clearing browser data or changing servers. Keep
    separate test accounts when checking account isolation.
 
@@ -75,6 +76,34 @@ the editor and API, but they do not replace physical Apple Pencil/S Pen
 testing. Accounts have no email recovery in v1, and note contents are not
 end-to-end encrypted. Use non-sensitive sample notes while evaluating a
 configured test service.
+
+## NotePad review on 19 November 2026
+
+The sync benchmark used headless Chromium, SQLite WASM and IndexedDB on
+Windows. The local test database held 40 pages and occupied 17.29 MiB.
+
+| Seven syncs with no changed records | Before | After |
+| --- | ---: | ---: |
+| Median time per sync | 212.1 ms | 1.7 ms |
+| Full database writes | 14 | 0 |
+| Total snapshot data written | 242.05 MiB | 0 MiB |
+
+All five saves with changed content still wrote a snapshot. A separate check
+forced an IndexedDB write to fail with later work queued. Reopening recovered
+the previous text and sync cursor. Both new values survived reopening after a retry.
+
+In a 1024 × 900 Chromium viewport at device pixel ratio 1, the 95th percentile
+frame interval while drawing four strokes was 16.7 ms in a four-page notebook
+and 16.8 ms in a 16-page notebook containing 96,000 ink points. Both notebooks
+retained all four new strokes after reopening. Physical stylus latency remains
+untested.
+
+From `webApp`, run `npm test` for the automated regressions and
+`node scripts/ui-smoke.mjs` for the six screen widths from 320 to 1440 px.
+The UI checks cover creating a first notebook, navigating empty favorites,
+clearing a search, keyboard focus on entering the editor and visible sync
+errors. Chromium and WebKit also passed the local account, two-client sync,
+conflict recovery, offline reload and media workflows.
 
 ## Media and page-navigation regression (2026-09-11)
 

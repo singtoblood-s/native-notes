@@ -57,7 +57,7 @@ async function loadGeneratedServiceWorker() {
   const cache = {
     added: [] as string[],
     async addAll(resources: string[]) { this.added = [...resources]; },
-    async put() { /* runtime caching is outside this contract test */ },
+    async put(_request: TestRequest, _response: Response) {},
   };
   const caches = {
     async open() { return cache; },
@@ -72,12 +72,34 @@ async function loadGeneratedServiceWorker() {
     addEventListener(type: string, listener: (event: any) => void) { handlers.set(type, listener); },
     skipWaiting() { /* no-op */ },
   };
-  const context = { self, caches, URL, Response: TestResponse, console, fetch: async () => { throw new Error("offline"); } };
+  const context = { self, caches, URL, Response: TestResponse, console, fetch: async (): Promise<Response> => { throw new Error("offline"); } };
   vm.runInNewContext(source, context);
   return { handlers, cache, caches, context };
 }
 
 describe("generated service worker contract", () => {
+  it.each(["navigate", "cors"] as const)("keeps an independent offline copy of a %s response", async mode => {
+    const { handlers, caches, cache, context } = await loadGeneratedServiceWorker();
+    context.fetch = async () => new Response("online content");
+    let openCache!: () => void;
+    const delayed = new Promise<void>(resolve => { openCache = resolve; });
+    caches.open = async () => { await delayed; return cache; };
+    let cachedContent: string | undefined;
+    cache.put = async (_request, copy) => { cachedContent = await copy.text(); };
+    let served!: Promise<Response>;
+    let written: Promise<void> | undefined;
+    handlers.get("fetch")!({
+      request: new TestRequest("https://notes.example.test/native-notes/resource", mode),
+      respondWith(response: Promise<Response>) { served = response; },
+      waitUntil(write: Promise<void>) { written = write; },
+    });
+    expect(await (await served).text()).toBe("online content");
+    openCache();
+    expect(written).toBeDefined();
+    await written;
+    expect(cachedContent).toBe("online content");
+  });
+
   it("serves a precached module offline despite differing Origin request headers", async () => {
     const loaded = await loadGeneratedServiceWorker();
     const module = new TestResponse("export default true;");

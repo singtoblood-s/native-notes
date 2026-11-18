@@ -57,6 +57,12 @@ export interface NotePage {
   conflictOf?: string;
 }
 
+export type PageSummary = Omit<NotePage, "strokes" | "images"> & { strokeCount: number };
+
+export function summarizePage({ strokes, images: _images, ...page }: NotePage): PageSummary {
+  return { ...page, strokeCount: strokes.length };
+}
+
 export type SyncEntityType = "notebook" | "page";
 export type SyncAction = "upsert" | "delete";
 

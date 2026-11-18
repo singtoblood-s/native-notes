@@ -20,7 +20,7 @@ interface WorkerScope {
 
 const scope = globalThis as unknown as WorkerScope;
 const allowedMethods = new Set([
-  "listNotebooks", "getNotebook", "saveNotebook", "listPages", "getPage", "savePage", "importDocument",
+  "listNotebooks", "getNotebook", "saveNotebook", "listPages", "listPageSummaries", "getPage", "savePage", "importDocument",
   "deletePage", "restorePage", "archiveNotebook", "restoreNotebook", "duplicateNotebook", "movePage",
   "createConflictCopyFromOperation", "pendingOperations", "getOperation", "markOperationSending",
   "markOperationPending", "markOperationAcked", "applyRemote", "applyRemoteBatch", "applyServerSnapshot",

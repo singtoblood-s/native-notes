@@ -355,7 +355,7 @@ try {
   await page.setViewportSize({ width: 768, height: 1024 });
   await page.locator("#notebook-menu").click();
   const menu = page.locator("#notebook-menu-popup");
-  assert.equal(await menu.locator("button").first().evaluate(element => getComputedStyle(element).color), "rgb(37, 36, 41)");
+  assert(await menu.locator("button").first().evaluate(element => getComputedStyle(element).color === getComputedStyle(document.body).color), "Menu text uses the foreground color on the light menu surface");
   await page.screenshot({ path: `${output}/tablet-menu.png` });
   await page.keyboard.press("Escape");
   await checkDocumentZoom("continuous");

@@ -195,14 +195,12 @@ export class AuthClient {
   async remember(session: AuthResponse, endpoint: string): Promise<AuthResponse | null> {
     const currentExpiry = Date.parse(session.expiresAt);
     if (currentExpiry - Date.now() > REMEMBERED_SESSION_REFRESH_WINDOW_MS || endpoint !== getEndpoint()) return null;
-    const response = await fetchWithTimeout(`${endpoint}/v1/auth/remember`, {
+    const payload = await requestWithTimeout(`${endpoint}/v1/auth/remember`, {
       method: "POST",
       headers: { Authorization: `Bearer ${session.sessionToken}` },
-    });
+    }, async response => response.ok ? parseJSON(response) : null);
     // Older self-hosted servers can still sync with their original token.
-    if (!response.ok) return null;
-    const payload = await parseJSON(response);
-    if (typeof payload.expiresAt !== "string" || !(Date.parse(payload.expiresAt) > currentExpiry)) return null;
+    if (typeof payload?.expiresAt !== "string" || !(Date.parse(payload.expiresAt) > currentExpiry)) return null;
     return { ...session, expiresAt: payload.expiresAt };
   }
 
@@ -219,13 +217,12 @@ export class AuthClient {
   private async request(path: string, body: Record<string, string>): Promise<AuthResponse> {
     const endpoint = getEndpoint();
     if (!endpoint) throw new Error("Add your HTTPS server URL in Settings before signing in.");
-    const response = await fetchWithTimeout(`${endpoint}${path}`, {
+    const { ok, payload } = await requestWithTimeout(`${endpoint}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    });
-    const payload = await parseJSON(response);
-    if (!response.ok) throw new Error(readError(payload, "Sign-in failed."));
+    }, async response => ({ ok: response.ok, payload: await parseJSON(response) }));
+    if (!ok) throw new Error(readError(payload, "Sign-in failed."));
     const rawUser = payload.user;
     if (!payload || typeof payload.sessionToken !== "string" || !rawUser || typeof rawUser !== "object" || typeof (rawUser as { id?: unknown }).id !== "string" || typeof (rawUser as { identifier?: unknown }).identifier !== "string" || typeof payload.expiresAt !== "string" || isExpired(payload.expiresAt)) {
       throw new Error("The server returned an invalid login response.");
@@ -239,7 +236,7 @@ export async function fetchWithTimeout(input: RequestInfo | URL, init: RequestIn
 }
 
 /** Keep the deadline active while consuming the body, not only until headers arrive. */
-export async function requestWithTimeout<T>(input: RequestInfo | URL, init: RequestInit, consume: (response: Response) => Promise<T>, timeoutMs: number): Promise<T> {
+export async function requestWithTimeout<T>(input: RequestInfo | URL, init: RequestInit, consume: (response: Response) => Promise<T>, timeoutMs = 15000): Promise<T> {
   const controller = new AbortController();
   const suspend = (): void => controller.abort();
   document.addEventListener("freeze", suspend);
@@ -247,7 +244,9 @@ export async function requestWithTimeout<T>(input: RequestInfo | URL, init: Requ
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(input, { ...init, signal: controller.signal });
-    return await consume(response);
+    const result = await consume(response);
+    if (controller.signal.aborted) throw controller.signal.reason;
+    return result;
   } catch (error) {
     if (controller.signal.aborted) throw new Error("The request timed out. Your notes are still safe offline.");
     if (error instanceof TypeError) throw new Error("Network unavailable. Your notes are still safe offline.");

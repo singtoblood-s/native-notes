@@ -91,11 +91,12 @@ try {
   await page.locator("#cancel-settings").click();
   assert.equal(await page.locator("[data-open-book]").count(), 4);
   await page.locator("#library-sort").selectOption("name");
+  assert.equal(await page.locator("#library-layout").getAttribute("aria-pressed"), "true");
   await page.locator("#library-layout").click();
   await page.reload();
   await page.locator("[data-open-book]").first().waitFor();
   assert.equal(await page.locator("#library-sort").inputValue(), "name");
-  assert.equal(await page.locator("#library-layout").getAttribute("aria-pressed"), "true");
+  assert.equal(await page.locator("#library-layout").getAttribute("aria-pressed"), "false");
   await page.setViewportSize({ width: 390, height: 844 });
   await page.locator("#library-tab-search").click();
   await page.locator("#library-search").fill("Preserved history");

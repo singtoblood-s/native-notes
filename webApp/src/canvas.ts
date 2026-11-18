@@ -134,8 +134,20 @@ export interface CanvasCallbacks {
 
 const previewStates = new WeakMap<HTMLCanvasElement, PreviewState>();
 
+interface PaperTextLayout {
+  text: string;
+  width: number;
+  height: number;
+  fontMetrics: string;
+  lines: string[];
+}
+
+// One layout per raster. Photo decode and erasing repaint unchanged text.
+const paperTextLayouts = new WeakMap<HTMLCanvasElement, PaperTextLayout>();
+
 export function clearPagePreview(canvas: HTMLCanvasElement): void {
   previewStates.delete(canvas);
+  paperTextLayouts.delete(canvas);
   canvas.width = canvas.height = 1;
   delete canvas.dataset.version;
 }
@@ -1300,25 +1312,45 @@ export function renderPaperBackground(context: CanvasRenderingContext2D, width: 
 }
 
 export function drawPageText(context: CanvasRenderingContext2D, text: string, width: number, height: number): void {
-  if (!text) return;
+  const canvas = context.canvas;
+  if (!text) {
+    paperTextLayouts.delete(canvas);
+    return;
+  }
   context.save();
   context.fillStyle = "#252429";
   context.font = "24px system-ui, sans-serif";
   context.textBaseline = "top";
+  const fontMetrics = [context.font, context.direction, context.fontKerning, context.fontStretch,
+    context.fontVariantCaps, context.letterSpacing, context.wordSpacing, context.textRendering].join("|");
+  let layout = paperTextLayouts.get(canvas);
+  if (!layout || layout.text !== text || layout.width !== width || layout.height !== height || layout.fontMetrics !== fontMetrics) {
+    layout = { text, width, height, fontMetrics, lines: wrapPageText(context, text, width, height) };
+    paperTextLayouts.set(canvas, layout);
+  }
+  layout.lines.forEach((line, index) => context.fillText(line, 32, 32 + index * 34));
+  context.restore();
+}
+
+function wrapPageText(context: CanvasRenderingContext2D, text: string, width: number, height: number): string[] {
+  const lines: string[] = [];
   let y = 32;
   for (const paragraph of text.split("\n")) {
     let line = "";
     for (const char of paragraph) {
       if (line && context.measureText(line + char).width > width - 64) {
-        context.fillText(line, 32, y); y += 34; line = "";
+        lines.push(line);
+        y += 34;
+        line = "";
         if (y > height - 32) break;
       }
       line += char;
     }
     if (y > height - 32) break;
-    context.fillText(line, 32, y); y += 34;
+    lines.push(line);
+    y += 34;
   }
-  context.restore();
+  return lines;
 }
 
 /** Await every image for deterministic exports, using the same layer order as the editor. */

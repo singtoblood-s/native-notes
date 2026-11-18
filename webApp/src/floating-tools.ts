@@ -21,7 +21,10 @@ export class FloatingTools {
 
   constructor(signal: AbortSignal, private readonly closeMenus: () => void, private readonly canToggle: () => boolean) {
     this.workspace = document.getElementById("editor-workspace")!;
-    this.workspace.querySelector(".top-actions")!.insertAdjacentHTML("afterbegin", '<button id="float-tools" class="outline-button" title="Hide bars in a draggable circle" aria-label="Collapse bars into floating tools">◉ <span>Focus</span></button>');
+    this.workspace.querySelector(".top-actions")!.insertAdjacentHTML("afterbegin", `
+      <button id="float-tools" class="outline-button" title="Focus mode" aria-label="Collapse bars into floating tools">
+        <svg viewBox="0 0 24 26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5H4v5m11-5h5v5m-16 6v5h5m11-5v5h-5"/></svg><span>Focus</span>
+      </button>`);
     this.toggle = document.getElementById("float-tools") as HTMLButtonElement;
     this.workspace.insertAdjacentHTML("beforeend", `
       <button id="floating-tools-button" class="floating-tools-button" hidden aria-controls="floating-tools-panel" aria-expanded="false" aria-describedby="floating-tools-help"><span class="floating-tool-icon" aria-hidden="true"></span><span class="floating-tool-status" aria-hidden="true"></span></button>

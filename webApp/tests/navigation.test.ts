@@ -1,5 +1,5 @@
 import { expect, it, vi } from "vitest";
-import { createNotebook, createPage, type NotePage, type Notebook } from "../src/models";
+import { createNotebook, createPage, summarizePage, type NotePage, type Notebook } from "../src/models";
 
 const state = vi.hoisted(() => ({
   notebooks: [] as Notebook[],
@@ -19,6 +19,7 @@ vi.mock("../src/storage", () => ({ SQLiteNoteStore: { open: async () => ({
   accountKey: "https://sync.example.test:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   listNotebooks: async () => structuredClone(state.notebooks),
   listPages: async (notebookID: string) => structuredClone(state.pages.filter((page) => page.notebookId === notebookID)),
+  listPageSummaries: async () => state.pages.map(summarizePage),
   getNotebook: async (notebookID: string) => structuredClone(state.notebooks.find((notebook) => notebook.id === notebookID) ?? null),
   getPage: (pageID: string) => state.getPage(pageID),
   savePage: (page: NotePage) => state.savePage(page),
@@ -70,7 +71,9 @@ it("keeps the newest page selection and coalesces rapid back taps into one durab
   try {
     await import("../src/main");
     await vi.waitFor(() => expect(document.querySelector("[data-open-book]")).not.toBeNull());
+    expect(state.getPage).not.toHaveBeenCalled();
     document.querySelector<HTMLButtonElement>("[data-open-book]")!.click();
+    await vi.waitFor(() => expect(document.getElementById("editor-workspace")!.hidden).toBe(false));
     await vi.waitFor(() => expect(document.getElementById("page-title-label")?.textContent).toBe("First page"));
 
     const reads = new Map<string, ReturnType<typeof deferred<NotePage | null>>>();

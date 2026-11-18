@@ -2,8 +2,8 @@ import { createPage, id, MAX_PAGE_IMAGE_BYTES, type NotePage } from "./models";
 import { renderPageExport } from "./canvas";
 
 export const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
-const MAX_IMAGE_FILE_BYTES = 50 * 1024 * 1024;
-const MAX_PDF_FILE_BYTES = 250 * 1024 * 1024;
+export const MEDIA_IMPORT_LIMITS = { imageMiB: 50, pdfMiB: 250, preparedMiB: 38, pages: 100 } as const;
+const MIB = 1024 * 1024;
 const IMPORT_IMAGE_BUDGET = 36 * 1024 * 1024;
 export type MediaProgress = (message: string) => void;
 
@@ -57,7 +57,7 @@ export async function encodePageImage(canvas: HTMLCanvasElement, maxBytes = 512 
 
 export async function imageCanvas(file: File): Promise<HTMLCanvasElement> {
   if (!IMAGE_TYPES.has(mediaType(file))) throw new Error("Use PNG, JPEG, WebP or GIF images.");
-  if (file.size > MAX_IMAGE_FILE_BYTES) throw new Error("Images must be 50 MB or smaller before compression.");
+  if (file.size > MEDIA_IMPORT_LIMITS.imageMiB * MIB) throw new Error(`Images must be ${MEDIA_IMPORT_LIMITS.imageMiB} MiB or smaller before compression.`);
   const url = URL.createObjectURL(file);
   try {
     const image = new Image();
@@ -80,16 +80,16 @@ export async function imageCanvas(file: File): Promise<HTMLCanvasElement> {
 
 /** Raster backgrounds use the existing synced image model; ink remains independently editable. */
 export async function importMediaPages(files: File[], notebookID: string, firstOrder: number, progress: MediaProgress, signal: AbortSignal): Promise<NotePage[]> {
-  if (!files.length || files.length > 100) throw new Error("Choose between 1 and 100 files.");
+  if (!files.length || files.length > MEDIA_IMPORT_LIMITS.pages) throw new Error(`Choose between 1 and ${MEDIA_IMPORT_LIMITS.pages} files.`);
   const pages: NotePage[] = [];
   let bytes = 0;
   const append = async (canvas: HTMLCanvasElement, title: string, remaining: number, dimensions?: { width: number; height: number }): Promise<void> => {
     signal.throwIfAborted();
-    if (pages.length >= 100) throw new Error("Import up to 100 pages at a time. Split this document first.");
+    if (pages.length >= MEDIA_IMPORT_LIMITS.pages) throw new Error(`Import up to ${MEDIA_IMPORT_LIMITS.pages} pages at a time. Split this document first.`);
     const src = await encodePageImage(canvas, Math.min(512 * 1024, Math.floor((IMPORT_IMAGE_BUDGET - bytes) * .75 / remaining)));
     signal.throwIfAborted();
     bytes += src.length;
-    if (bytes > 38 * 1024 * 1024) throw new Error("Imported pages exceed 38 MB. Split this document first.");
+    if (bytes > MEDIA_IMPORT_LIMITS.preparedMiB * MIB) throw new Error(`Imported pages exceed ${MEDIA_IMPORT_LIMITS.preparedMiB} MiB. Split this document first.`);
     const page = createPage(notebookID, title.slice(0, 500));
     // Keep both dimensions within the existing page schema, including panoramic images.
     const ratio = canvas.width / canvas.height;
@@ -113,7 +113,7 @@ export async function importMediaPages(files: File[], notebookID: string, firstO
       try { await append(canvas, title, files.length - fileIndex); } finally { canvas.width = canvas.height = 1; }
       continue;
     }
-    if (file.size > MAX_PDF_FILE_BYTES) throw new Error("PDF files must be 250 MB or smaller before compression.");
+    if (file.size > MEDIA_IMPORT_LIMITS.pdfMiB * MIB) throw new Error(`PDF files must be ${MEDIA_IMPORT_LIMITS.pdfMiB} MiB or smaller before compression.`);
     const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
     const { default: worker } = await import("pdfjs-dist/legacy/build/pdf.worker.min.mjs?url");
     pdfjs.GlobalWorkerOptions.workerSrc = worker;
@@ -134,7 +134,7 @@ export async function importMediaPages(files: File[], notebookID: string, firstO
     task.onPassword = () => { void task.destroy(); };
     try {
       const pdf = await task.promise;
-      if (pdf.numPages + pages.length > 100) throw new Error("Import up to 100 PDF pages at a time. Split this document first.");
+      if (pdf.numPages + pages.length > MEDIA_IMPORT_LIMITS.pages) throw new Error(`Import up to ${MEDIA_IMPORT_LIMITS.pages} PDF pages at a time. Split this document first.`);
       for (let index = 1; index <= pdf.numPages; index++) {
         signal.throwIfAborted();
         progress(`${file.name} · compressing page ${index} of ${pdf.numPages}`);

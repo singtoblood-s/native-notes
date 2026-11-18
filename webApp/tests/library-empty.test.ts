@@ -5,7 +5,7 @@ vi.mock("../src/coordinator", () => ({ SyncCoordinator: class {
   start() {} stop() {} notifyLocalWrite() { writes(); }
 } }));
 vi.mock("../src/storage", () => ({ SQLiteNoteStore: { open: async () => ({
-  accountKey: "https://sync.example.test:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", listNotebooks: async () => [], listPages: async () => [],
+  accountKey: "https://sync.example.test:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", listNotebooks: async () => [], listPageSummaries: async () => [], listPages: async () => [],
   getPage: async () => null, getNotebook: async () => null,
   ensureStarterData: writes, saveNotebook: writes, savePage: writes,
 }) } }));

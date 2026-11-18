@@ -17,7 +17,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { isAbsolute, join, resolve } from "node:path";
 
-const DEFAULT_URL = "http://localhost:4174/native-notes/";
+const DEFAULT_URL = "http://localhost:4173/native-notes/";
 const DEFAULT_API_URL = "http://127.0.0.1:8789";
 const TINY_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 const TINY_PNG_DATA_URL = `data:image/png;base64,${TINY_PNG}`;
@@ -129,7 +129,7 @@ async function assertMenuButtonHit(page, button, selector, label) {
 
 async function libraryBook(page, title) {
   const book = page.locator("#library-books .library-book").filter({
-    has: page.locator(".book-caption strong").filter({ hasText: exactText(title) }),
+    has: page.getByRole("button", { name: `Open notebook ${title}`, exact: true }),
   });
   await book.waitFor({ state: "visible" });
   return book;
@@ -147,9 +147,8 @@ async function waitForLibraryBookPages(page, title, expectedPages, timeout = 200
   try {
     await page.waitForFunction(
       ({ title: wantedTitle, pages }) => [...document.querySelectorAll("#library-books button[data-open-book]")].some((node) => {
-        const caption = node.querySelector(".book-caption small")?.textContent?.trim() || "";
-        const pageLabel = `${pages} page${pages === 1 ? "" : "s"}`;
-        return node.textContent?.includes(wantedTitle) && (caption === pageLabel || caption.startsWith(`${pageLabel} ·`));
+        const caption = node.querySelector(".book-pages")?.textContent?.trim();
+        return node.getAttribute("aria-label") === `Open notebook ${wantedTitle}` && caption === `${pages} page${pages === 1 ? "" : "s"}`;
       }),
       { title, pages: expectedPages },
       { timeout },
@@ -227,7 +226,7 @@ async function runLibraryCardMenuRegression(page, title) {
   await book.locator("[data-open-book]").hover();
   await assertMenuButtonHit(page, menuButton, ".book-menu-button", "Library notebook");
   await menuButton.click();
-  const menu = book.locator(".book-quick-menu");
+  const menu = book.locator(".quick-menu");
   await menu.waitFor({ state: "visible" });
   assert(await page.locator("#library").isVisible() && !(await page.locator("#editor-workspace").isVisible()), "Library menu click navigated into the editor");
   await page.locator("#library-title").click();
@@ -280,7 +279,7 @@ async function runSidebarAndHomeMenuRegression(page, title, context) {
     const copyMenu = copyBook.locator(".book-menu-button");
     await assertMenuButtonHit(page, copyMenu, ".book-menu-button", "Temporary notebook");
     await copyMenu.click();
-    await copyBook.locator(".book-quick-menu").waitFor({ state: "visible" });
+    await copyBook.locator(".quick-menu").waitFor({ state: "visible" });
     await copyBook.locator('[data-action="trash-notebook"]').click();
     await page.waitForFunction((expected) => ![...document.querySelectorAll("#library-books [data-open-book]")].some((node) => node.textContent?.includes(expected)), copyTitle);
     assert(await page.locator("#library").isVisible() && !(await page.locator("#editor-workspace").isVisible()), "Home notebook trash navigated away from the library");
@@ -357,26 +356,14 @@ async function selectPageFromSidebar(page, title) {
   await page.waitForFunction((expected) => document.querySelector("#page-title")?.value === expected, title);
 }
 
-async function syncAndWait(page) {
-  await closeInspector(page);
-  const button = page.locator("#sync-button");
+async function syncAndWait(page, buttonId = "sync-button") {
+  if (buttonId === "sync-button") await closeInspector(page);
   const network = page.waitForResponse(
-    (response) => response.url().includes("/v1/sync/") && response.status() < 500,
+    (response) => response.url().includes("/v1/sync/pull?") && response.ok(),
     { timeout: 20000 },
   );
-  await button.click();
-  await network;
-  await page.waitForFunction(() => document.querySelector("#sync-button")?.dataset.state === "saved", undefined, { timeout: 20000 });
-}
-
-async function syncLibraryAndWait(page) {
-  const network = page.waitForResponse(
-    (response) => response.url().includes("/v1/sync/") && response.status() < 500,
-    { timeout: 20000 },
-  );
-  await page.locator("#library-sync-button").click();
-  await network;
-  await page.waitForFunction(() => document.querySelector("#library-sync-button")?.dataset.state === "saved", undefined, { timeout: 20000 });
+  await Promise.all([network, page.locator(`#${buttonId}`).click()]);
+  await page.waitForFunction((id) => document.getElementById(id)?.getAttribute("aria-label")?.startsWith("Synced ·"), buttonId, { timeout: 20000 });
 }
 
 async function recoveryCount(page) {
@@ -406,56 +393,37 @@ async function runConflictConvergence(page, second, context, secondContext) {
     await secondContext.unroute(route);
     await syncAndWait(second);
 
-    // Recovery copies may be created while a sync is already in flight. Drain
-    // B first so its newly created copy reaches the server, then let A pull it.
-    // Repeat a bounded number of real sync cycles so this catches a lost push
-    // or a non-converging recovery loop instead of treating a stale saved state
-    // as completion.
-    let firstCount = 0;
-    let secondCount = 0;
-    let converged = false;
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      await syncAndWait(second);
-      await syncAndWait(page);
-      firstCount = await recoveryCount(page);
-      secondCount = await recoveryCount(second);
-      if (firstCount > 0 && firstCount === secondCount) {
-        converged = true;
-        break;
-      }
-      await page.waitForTimeout(250);
-    }
-    assert(converged, `Conflict recovery counts did not converge: ${firstCount} vs ${secondCount}`);
     await syncAndWait(page);
     await syncAndWait(second);
-    const stableFirst = await recoveryCount(page);
-    const stableSecond = await recoveryCount(second);
-    assert(stableFirst === firstCount && stableSecond === secondCount, `Conflict recovery count grew after an idempotent sync: ${firstCount}/${secondCount} -> ${stableFirst}/${stableSecond}`);
     const firstArchive = await exportArchive(page);
     const secondArchive = await exportArchive(second);
-    const firstConflicts = firstArchive.pages.filter((candidate) => typeof candidate.conflictOf === "string");
-    const secondConflicts = secondArchive.pages.filter((candidate) => typeof candidate.conflictOf === "string");
-    assert(firstConflicts.length === secondConflicts.length && firstConflicts.length > 0, `Conflict archives did not converge: ${firstConflicts.length} vs ${secondConflicts.length}`);
-    const findConflictPair = (archive) => {
-      const original = archive.pages.find((candidate) => candidate.text === "offline edit from context A" && typeof candidate.conflictOf !== "string");
-      const recovered = original
-        ? archive.pages.find((candidate) => candidate.text === "offline edit from context B" && candidate.conflictOf === original.id)
-        : undefined;
-      return { original, recovered };
-    };
-    const firstPair = findConflictPair(firstArchive);
-    const secondPair = findConflictPair(secondArchive);
-    assert(firstPair.original && firstPair.recovered && secondPair.original && secondPair.recovered,
-      `Conflict archives did not retain both edits: ${describe({ first: firstArchive.pages.map((candidate) => ({ id: candidate.id, text: candidate.text, conflictOf: candidate.conflictOf })), second: secondArchive.pages.map((candidate) => ({ id: candidate.id, text: candidate.text, conflictOf: candidate.conflictOf })) })}`);
-    assert(firstPair.original.id === secondPair.original.id && firstPair.recovered.id === secondPair.recovered.id && firstPair.recovered.conflictOf === firstPair.original.id,
-      "Conflict archives did not reference the same original and recovery page IDs");
-    for (const [label, pair] of [["first", firstPair], ["second", secondPair]]) {
-      assert(Array.isArray(pair.original.strokes) && pair.original.strokes.length > 0 && Array.isArray(pair.original.images) && pair.original.images.length > 0,
-        `Conflict ${label} original page lost ink or images`);
-      assert(Array.isArray(pair.recovered.strokes) && pair.recovered.strokes.length > 0 && Array.isArray(pair.recovered.images) && pair.recovered.images.length > 0,
-        `Conflict ${label} recovery page lost ink or images`);
+    const firstPage = firstArchive.pages.find((candidate) => candidate.text === "offline edit from context A");
+    assert(firstPage, "The first synced edit is missing");
+    const secondPage = secondArchive.pages.find((candidate) => candidate.id === firstPage.id);
+    assert(secondPage?.text === firstPage.text, "Both browsers must converge on the first synced edit");
+    const isOfflineEdit = (version) => version.entityId === firstPage.id && version.payload.text === "offline edit from context B";
+    const saved = (secondArchive.versions ?? []).filter(isOfflineEdit);
+    assert(saved.length === 1 && !(firstArchive.versions ?? []).some(isOfflineEdit), "The losing edit must be saved once on its original device");
+    for (const archive of [firstArchive, secondArchive]) {
+      assert(!archive.pages.some((candidate) => candidate.conflictOf || candidate.text === "offline edit from context B"), "Sync must keep recovery versions out of the live library");
     }
-    console.log(`PASS two-context conflict recovery (${firstConflicts.length} recovered page, both edits and page assets retained)`);
+    const assets = (candidate) => [candidate.strokes.length, candidate.images.length];
+    assert(assets(firstPage).every((count) => count > 0), "The original edit lost its ink or images");
+    assert(describe(assets(firstPage)) === describe(assets(secondPage)) && describe(assets(firstPage)) === describe(assets(saved[0].payload)),
+      "The merged page or the saved version lost ink or images");
+    await closeInspector(second);
+    await second.locator("#back-library").click();
+    await second.locator("#library-settings").click();
+    await second.locator("#saved-versions").click();
+    await second.locator(`[data-restore-version="${saved[0].id}"]`).click();
+    await second.waitForFunction(() => document.getElementById("versions-message")?.textContent?.includes("Restored 1 page"));
+    await second.locator("#close-versions").click();
+    await second.locator("#cancel-settings").click();
+    await second.locator("#library-search").fill("offline edit from context B");
+    const restored = second.locator("[data-search-page]");
+    await restored.waitFor({ state: "visible" });
+    assert(await restored.getAttribute("data-search-page") !== firstPage.id, "Restore as copy replaced the original page");
+    console.log("PASS two-context conflict convergence, one saved local version, and restore as copy");
   } finally {
     await context.unroute(route).catch(() => {});
     await secondContext.unroute(route).catch(() => {});
@@ -464,6 +432,8 @@ async function runConflictConvergence(page, second, context, secondContext) {
 
 async function exportArchive(page) {
   await ensureInspector(page);
+  const more = page.locator(".inspector-secondary-actions > summary");
+  if (await more.count() && !(await more.evaluate((summary) => summary.parentElement.open))) await more.click();
   const downloadPromise = page.waitForEvent("download");
   await page.locator("#export-button").click();
   const download = await downloadPromise;
@@ -533,7 +503,7 @@ async function dispatchRapidPenBurst(page, contacts = 40) {
 
 async function dispatchPendingPreviewStroke(page, targetTitle) {
   await page.evaluate((title) => {
-    const slot = [...document.querySelectorAll(".flow-preview")].find((candidate) => candidate.textContent?.includes(title));
+    const slot = [...document.querySelectorAll(".flow-preview")].find((candidate) => candidate.getAttribute("aria-label") === title);
     const preview = slot?.querySelector("canvas");
     if (!(preview instanceof HTMLCanvasElement)) throw new Error(`Missing preview canvas for ${title}`);
     const rect = preview.getBoundingClientRect();
@@ -604,24 +574,34 @@ async function assertActiveCanvas(page) {
   assert(metrics.parentHeight > 0 && metrics.flowHeight > 0, `Active canvas parent has no height: ${describe(metrics)}`);
 }
 
-async function makeSecondContext(browser, page, url) {
-  const storage = await page.evaluate(() => ({
-    local: Object.fromEntries(Object.entries(localStorage)),
-    session: Object.fromEntries(Object.entries(sessionStorage)),
-  }));
+async function authenticate(page, apiUrl, identifier, password, register = false) {
+  await page.locator("#auth-dialog").waitFor({ state: "visible" });
+  if (register) await page.locator("#register-mode").click();
+  await page.locator("#auth-endpoint").evaluate((input) => { input.closest("details")?.setAttribute("open", ""); });
+  await page.locator("#auth-endpoint").fill(apiUrl);
+  await page.locator("#auth-identifier").fill(identifier);
+  await page.locator("#auth-password").fill(password);
+  await page.locator("#auth-submit").click();
+  await page.locator("#auth-dialog").waitFor({ state: "hidden" });
+  await page.locator("#library").waitFor({ state: "visible" });
+}
+
+async function makeSecondContext(browser, page, url, apiUrl, identifier, password) {
   const context = await browser.newContext({
     acceptDownloads: true,
     serviceWorkers: "block",
     viewport: page.viewportSize(),
   });
-  await context.addInitScript((values) => {
-    for (const [key, value] of Object.entries(values.local)) localStorage.setItem(key, value);
-    for (const [key, value] of Object.entries(values.session)) sessionStorage.setItem(key, value);
-  }, storage);
-  const second = await context.newPage();
-  second.setDefaultTimeout(12000);
-  await second.goto(url, { waitUntil: "domcontentloaded" });
-  return { context, page: second };
+  try {
+    const second = await context.newPage();
+    second.setDefaultTimeout(12000);
+    await second.goto(url, { waitUntil: "domcontentloaded" });
+    await authenticate(second, apiUrl, identifier, password);
+    return { context, page: second };
+  } catch (error) {
+    await context.close();
+    throw error;
+  }
 }
 
 async function run() {
@@ -631,6 +611,11 @@ async function run() {
   assert(browserType?.launch, `Playwright browser '${browserName}' is unavailable`);
   const url = option("--url", process.env.SMOKE_URL || DEFAULT_URL);
   const apiUrl = option("--api", process.env.SMOKE_API_URL || DEFAULT_API_URL).replace(/\/$/, "");
+  for (const target of [url, apiUrl]) {
+    const parsed = new URL(target);
+    assert(["http:", "https:"].includes(parsed.protocol) && ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname),
+      "Run this test with loopback frontend and API URLs and a disposable database");
+  }
   const artifactDirectory = resolve(process.env.SMOKE_ARTIFACT_DIR || resolve(process.cwd(), "test-results"));
   await mkdir(artifactDirectory, { recursive: true });
   const screenshotPath = resolve(artifactDirectory, `smoke-editor-${browserName}.png`);
@@ -655,18 +640,10 @@ async function run() {
     page.setDefaultTimeout(12000);
     page.on("pageerror", (error) => pageErrors.push(error.message));
     await page.goto(url, { waitUntil: "domcontentloaded" });
-    await page.locator("#auth-dialog").waitFor({ state: "visible" });
 
     const identifier = `notepad-smoke-${Date.now()}-${Math.random().toString(36).slice(2, 8)}@example.test`;
     const password = `Smoke-${crypto.randomUUID()}-pass`;
-    await page.locator("#register-mode").click();
-    await page.locator("#auth-endpoint").evaluate((input) => { input.closest("details")?.setAttribute("open", ""); });
-    await page.locator("#auth-endpoint").fill(apiUrl);
-    await page.locator("#auth-identifier").fill(identifier);
-    await page.locator("#auth-password").fill(password);
-    await page.locator("#auth-submit").click();
-    await page.locator("#auth-dialog").waitFor({ state: "hidden" });
-    await page.locator("#library").waitFor({ state: "visible" });
+    await authenticate(page, apiUrl, identifier, password, true);
 
     await page.locator("#library-new").click();
     await page.locator("#new-document-notebook").click();
@@ -777,7 +754,7 @@ async function run() {
 
     await page.locator("#page-view-mode").selectOption("paged");
     await page.waitForFunction(() => document.getElementById("paper-scroll")?.dataset.viewMode === "paged");
-    const pagedPreviewCount = await page.locator(".flow-preview").count();
+    const pagedPreviewCount = await page.locator(".flow-preview:visible").count();
     assert(pagedPreviewCount === 0, `Page-turn mode rendered ${pagedPreviewCount} extra page slots`);
     await page.locator("#page-view-mode").selectOption("continuous");
     await page.waitForFunction(() => document.getElementById("paper-scroll")?.dataset.viewMode === "continuous");
@@ -826,14 +803,14 @@ async function run() {
 
     await syncAndWait(page);
     try {
-      secondContext = await makeSecondContext(browser, page, url);
+      secondContext = await makeSecondContext(browser, page, url, apiUrl, identifier, password);
       const second = secondContext.page;
       second.on("pageerror", (error) => pageErrors.push(`second: ${error.message}`));
       await second.locator("#library").waitFor({ state: "visible" });
-      await syncLibraryAndWait(second);
+      await syncAndWait(second, "library-sync-button");
       const secondBook = second.locator("#library-books button[data-open-book]").filter({ hasText: "Editor smoke notebook" });
       await secondBook.waitFor({ state: "visible", timeout: 20000 });
-       await waitForLibraryBookPages(second, "Editor smoke notebook", 3);
+      await waitForLibraryBookPages(second, "Editor smoke notebook", 3);
       await secondBook.click();
       await second.locator("#editor-workspace").waitFor({ state: "visible" });
       await waitForPageTitles(second, ["First page", "Page 2", "Page 3"], 20000);
@@ -846,6 +823,13 @@ async function run() {
       console.log("PASS second-context sync");
       await runSidebarAndHomeMenuRegression(page, "Editor smoke notebook", context);
       if (process.env.SMOKE_CONFLICT !== "0") await runConflictConvergence(page, second, context, secondContext.context);
+      if (await second.locator("#editor-workspace").isVisible()) await second.locator("#back-library").click();
+      await second.locator("#library-settings").click();
+      await second.locator("#logout-button").click();
+      await second.locator("#auth-dialog").waitFor({ state: "visible" });
+      assert(!(await second.locator("#library").isVisible()), "Signed-out browser still exposes its library");
+      await syncAndWait(page);
+      console.log("PASS signing out one browser keeps the other session usable");
     } catch (error) {
       if (process.env.REQUIRE_TWO_CONTEXT === "1" || process.env.SMOKE_CONFLICT !== "0") throw error;
       console.log(`SKIP second-context sync: ${error instanceof Error ? error.message : error}`);

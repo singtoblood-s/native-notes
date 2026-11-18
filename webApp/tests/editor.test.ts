@@ -1,5 +1,5 @@
 import { expect, it, vi } from "vitest";
-import { createNotebook, createPage, type Notebook, type NotePage } from "../src/models";
+import { createNotebook, createPage, summarizePage, type Notebook, type NotePage } from "../src/models";
 
 const data = vi.hoisted(() => ({ notebooks: [] as Notebook[], pages: [] as NotePage[], failSave: false }));
 vi.mock("../src/coordinator", () => ({ SyncCoordinator: class {
@@ -9,6 +9,7 @@ vi.mock("../src/storage", () => ({ SQLiteNoteStore: { open: async () => ({
   accountKey: "https://sync.example.test:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   listNotebooks: async () => structuredClone(data.notebooks),
   listPages: async (id: string) => structuredClone(data.pages.filter((page) => page.notebookId === id)),
+  listPageSummaries: async () => data.pages.map(summarizePage),
   getNotebook: async (id: string) => structuredClone(data.notebooks.find((notebook) => notebook.id === id)),
   getPage: async (id: string) => structuredClone(data.pages.find((page) => page.id === id)),
   saveNotebook: async (notebook: Notebook) => {
@@ -89,7 +90,7 @@ it("creates notebooks, preserves tool settings, duplicates paper and prevents na
     const libraryMenuButton = libraryCard.querySelector<HTMLButtonElement>(".book-menu-button")!;
     expect(libraryMenuButton.closest(".book-open")).toBeNull();
     libraryMenuButton.click();
-    const libraryMenu = libraryCard.querySelector<HTMLElement>(".book-quick-menu")!;
+    const libraryMenu = libraryCard.querySelector<HTMLElement>(".quick-menu")!;
     expect(libraryMenu.hidden).toBe(false);
     expect(libraryMenu.querySelector("[data-action='trash-notebook']")?.textContent).toContain("Move to trash");
     libraryMenuButton.click();
@@ -129,6 +130,8 @@ it("creates notebooks, preserves tool settings, duplicates paper and prevents na
     data.failSave = true;
     element("previous-page").click();
     await vi.waitFor(() => expect(element("sync-label").textContent).toBe("Disk full"));
+    expect(element("editor-toast").hidden).toBe(false);
+    expect(element("editor-toast").textContent).toContain("Page not saved on this device. Disk full");
     expect(element("page-position").textContent).toBe("3 / 3");
     element("back-library").click();
     await vi.waitFor(() => expect(element("sync-label").textContent).toBe("Disk full"));

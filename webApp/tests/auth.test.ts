@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AuthSession, LEGACY_API_URL, getEndpoint, resolveStorageAccountKey, setEndpoint, workspaceAccountKey } from "../src/auth";
+import { AuthClient, AuthSession, LEGACY_API_URL, getEndpoint, resolveStorageAccountKey, setEndpoint, workspaceAccountKey } from "../src/auth";
 
 const response = (id: string, identifier = `${id}@example.test`) => ({
   user: { id, identifier },
@@ -26,6 +26,30 @@ describe("account-bound browser sessions", () => {
     expect(setEndpoint("http://sync.example.test")).toBe("");
     expect(getEndpoint()).toBe("");
     expect(setEndpoint("http://localhost:8787/notes/")).toBe("http://localhost:8787/notes");
+  });
+
+  it.each(["login", "register", "remember"] as const)("times out a stalled %s body after headers arrive", async operation => {
+    vi.useFakeTimers();
+    const endpoint = setEndpoint("https://qa.example.test");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const body = new ReadableStream({
+        start(stream) {
+          stream.enqueue(new TextEncoder().encode("{"));
+          init!.signal!.addEventListener("abort", () => stream.error(new DOMException("Aborted", "AbortError")));
+        },
+      });
+      return new Response(body, { status: 200 });
+    });
+    try {
+      const client = new AuthClient();
+      const pending = operation === "remember" ? client.remember(response("sample"), endpoint) : client[operation]("sample", "password");
+      const rejected = expect(pending).rejects.toThrow(/timed out/i);
+      await vi.advanceTimersByTimeAsync(15000);
+      await rejected;
+    } finally {
+      fetchSpy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("updates the in-memory identity when a different account signs in", () => {

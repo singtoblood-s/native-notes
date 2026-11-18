@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { expect, it, vi } from "vitest";
-import { createNotebook, createPage, type NotePage, type Notebook } from "../src/models";
+import { createNotebook, createPage, summarizePage, type NotePage, type Notebook } from "../src/models";
 
 const state = vi.hoisted(() => ({
   notebooks: [] as Notebook[],
@@ -22,6 +22,7 @@ vi.mock("../src/storage", () => ({ SQLiteNoteStore: { open: async () => ({
   accountKey: "https://sync.example.test:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   listNotebooks: async () => structuredClone(state.notebooks),
   listPages: async (notebookID: string) => structuredClone(state.pages.filter((page) => page.notebookId === notebookID)),
+  listPageSummaries: async () => state.pages.map(summarizePage),
   getNotebook: async (notebookID: string) => structuredClone(state.notebooks.find((notebook) => notebook.id === notebookID) ?? null),
   getPage: async (pageID: string) => structuredClone(state.pages.find((page) => page.id === pageID) ?? null),
 }) } }));

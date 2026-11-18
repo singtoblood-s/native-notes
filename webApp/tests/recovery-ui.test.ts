@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { expect, it, vi } from "vitest";
-import { createNotebook, createPage, type NotePage, type Notebook } from "../src/models";
+import { createNotebook, createPage, summarizePage, type NotePage, type Notebook } from "../src/models";
 
 const state = vi.hoisted(() => ({
   notebooks: [] as Notebook[],
@@ -22,6 +22,7 @@ vi.mock("../src/storage", () => ({ SQLiteNoteStore: { open: async () => ({
   accountKey: "https://sync.example.test:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   listNotebooks: async () => structuredClone(state.notebooks),
   listPages: async (notebookID: string) => structuredClone(state.pages.filter((page) => page.notebookId === notebookID)),
+  listPageSummaries: async () => state.pages.map(summarizePage),
   getNotebook: async (notebookID: string) => structuredClone(state.notebooks.find((notebook) => notebook.id === notebookID) ?? null),
   getPage: async (pageID: string) => structuredClone(state.pages.find((page) => page.id === pageID) ?? null),
   savePage: (page: NotePage) => state.savePage(page),
@@ -69,9 +70,9 @@ it("keeps recovery copies out of normal lists and exposes a durable keep action"
     await import("../src/main");
     await vi.waitFor(() => expect(document.querySelector("[data-open-book]")).not.toBeNull());
     expect(document.getElementById("recovery-count")?.textContent).toBe("2");
-    const bookCaptions = [...document.querySelectorAll<HTMLElement>(".book-caption small")].map((caption) => caption.textContent ?? "");
-    expect(bookCaptions.some((caption) => caption.startsWith("1 page"))).toBe(true);
-    expect(bookCaptions.some((caption) => caption.startsWith("0 pages"))).toBe(true);
+    const pageCounts = [...document.querySelectorAll<HTMLElement>(".book-pages")].map((count) => count.textContent);
+    expect(pageCounts).toContain("1 page");
+    expect(pageCounts).toContain("0 pages");
     document.querySelector<HTMLButtonElement>('[data-open-book]')!.click();
     await vi.waitFor(() => expect(document.getElementById("page-title-label")?.textContent).toBe("Normal page"));
     expect(document.querySelectorAll("#page-list [data-page]")).toHaveLength(1);

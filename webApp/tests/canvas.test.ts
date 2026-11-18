@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getPanBounds, MAX_HISTORY_POINTS, MOBILE_FIT_GUTTER, PAN_MARGIN, PaperCanvas, renderPagePreview, worldPointAt } from "../src/canvas";
+import { drawPageText, getPanBounds, MAX_HISTORY_POINTS, MOBILE_FIT_GUTTER, PAN_MARGIN, PaperCanvas, renderPagePreview, worldPointAt } from "../src/canvas";
 
 function pointer(type: string, props: Record<string, unknown>): PointerEvent {
   const event = new Event(type, { bubbles: true, cancelable: true }) as PointerEvent;
@@ -51,6 +51,26 @@ beforeEach(() => {
 });
 
 afterEach(() => { document.body.innerHTML = ""; vi.unstubAllGlobals(); });
+
+it("repaints the same Unicode lines without measuring again and reflows for a new paper size", () => {
+  const fillText = vi.fn();
+  const measureText = vi.fn((text: string) => ({ width: [...text].length * 10 }));
+  const context = { canvas: document.createElement("canvas"), fillText, measureText, save: vi.fn(), restore: vi.fn() } as unknown as CanvasRenderingContext2D;
+  const text = "ก้🦊a\n\nบcd";
+  const expected = [["ก้🦊", 32, 32], ["a", 32, 66], ["", 32, 100], ["บcd", 32, 134]];
+  drawPageText(context, text, 94, 200);
+  expect(fillText.mock.calls).toEqual(expected);
+  measureText.mockClear();
+  fillText.mockClear();
+  drawPageText(context, text, 94, 200);
+  expect(fillText.mock.calls).toEqual(expected);
+  expect(measureText).not.toHaveBeenCalled();
+
+  fillText.mockClear();
+  drawPageText(context, text, 110, 132);
+  expect(fillText.mock.calls).toEqual([["ก้🦊a", 32, 32], ["", 32, 66], ["บcd", 32, 100]]);
+  expect(measureText).toHaveBeenCalled();
+});
 
 describe("PaperCanvas pointer contract", () => {
   it("keeps a page at the point limit saveable and allows erasing to resume writing", () => {

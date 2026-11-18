@@ -1,5 +1,3 @@
-import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
-import sqliteWasmUrl from "@sqlite.org/sqlite-wasm/sqlite3.wasm?url";
 import { resolveStorageAccountKey } from "./auth";
 import { type ArchiveImport, MAX_ARCHIVE_BYTES, MAX_ARCHIVE_NOTEBOOKS, MAX_ARCHIVE_PAGES } from "./archive";
 import {
@@ -10,6 +8,7 @@ import {
   MAX_PAGE_IMAGE_BYTES,
   MAX_PAGE_IMAGE_BYTES_TOTAL,
   NotePage,
+  PageSummary,
   Notebook,
   PageImage,
   PullChange,
@@ -29,6 +28,7 @@ import {
   sanitizePageImage,
   sanitizeNotebook,
   sanitizePage,
+  summarizePage,
   toWirePage,
 } from "./models";
 
@@ -46,7 +46,7 @@ function compareNotebookOrder(left: Notebook, right: Notebook): number {
   return compareStrings(left.createdAt, right.createdAt) || compareStrings(left.id, right.id);
 }
 
-function comparePageOrder(left: NotePage, right: NotePage): number {
+function comparePageOrder(left: Pick<NotePage, "id" | "order" | "title">, right: Pick<NotePage, "id" | "order" | "title">): number {
   if (left.order !== undefined && right.order !== undefined) return left.order - right.order || compareStrings(left.id, right.id);
   // Legacy pages have no order. Keep them before newly-created ordered pages
   // and use a stable natural title fallback.
@@ -89,6 +89,7 @@ export interface NoteStore {
   getNotebook(id: string): Promise<Notebook | null>;
   saveNotebook(notebook: Notebook, queue?: boolean): Promise<SaveResult>;
   listPages(notebookId: string, includeDeleted?: boolean): Promise<NotePage[]>;
+  listPageSummaries(includeDeleted?: boolean): Promise<PageSummary[]>;
   getPage(id: string): Promise<NotePage | null>;
   savePage(page: NotePage, queue?: boolean): Promise<SaveResult>;
   importDocument(notebook: Notebook, pages: NotePage[]): Promise<void>;
@@ -341,11 +342,11 @@ export class SnapshotStore {
             return;
           }
           if (value instanceof ArrayBuffer) {
-            finish(() => resolve(new Uint8Array(value.slice(0))));
+            finish(() => resolve(new Uint8Array(value)));
             return;
           }
           if (value instanceof Uint8Array) {
-            finish(() => resolve(new Uint8Array(value)));
+            finish(() => resolve(value));
             return;
           }
           finish(() => reject(new CorruptSnapshotError("Stored SQLite snapshot has an invalid type")));
@@ -372,7 +373,8 @@ export class SnapshotStore {
         let transaction: IDBTransaction;
         try {
           transaction = database.transaction("databases", "readwrite");
-          transaction.objectStore("databases").put(bytes.slice(), key);
+          // IndexedDB clones the value during put; the exported image is already owned by JS.
+          transaction.objectStore("databases").put(bytes, key);
         } catch (error) {
           database.close();
           reject(error);
@@ -470,7 +472,11 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     const namespace = await accountNamespace(accountKey);
     const lock = await acquireExclusiveLock(`inknote:${namespace}`);
     try {
-    const sqlite = await sqlite3InitModule({ locateFile: (path: string) => path.endsWith('.wasm') ? sqliteWasmUrl : path });
+      const [{ default: initialize }, { default: wasmUrl }] = await Promise.all([
+        import("@sqlite.org/sqlite-wasm"),
+        import("@sqlite.org/sqlite-wasm/sqlite3.wasm?url"),
+      ]);
+      const sqlite = await initialize({ locateFile: (path: string) => path.endsWith(".wasm") ? wasmUrl : path });
       let db: SQLiteDatabase | undefined;
       let persistence: "opfs" | "indexeddb" = "indexeddb";
       let image: Uint8Array | null = null;
@@ -563,10 +569,14 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     this.db.exec("BEGIN IMMEDIATE");
     let committed = false;
     try {
+      // All runtime writes use DML. Skip exporting the entire database when a
+      // transaction only checked for changes (e.g. an idle background sync).
+      const previousChanges = this.persistence === "indexeddb" ? this.totalChanges() : null;
       const result = body();
+      const needsSnapshot = previousChanges !== null && previousChanges !== this.totalChanges();
       this.db.exec("COMMIT");
       committed = true;
-      await this.persistSnapshot();
+      if (needsSnapshot) await this.persistSnapshot();
       return result;
     } catch (error) {
       if (!committed) {
@@ -586,11 +596,14 @@ export class SQLiteNoteStoreEngine implements NoteStore {
   }
 
   private async persistSnapshot(): Promise<void> {
-    if (this.persistence === "opfs") return;
     const exported = this.sqlite.capi.sqlite3_js_db_export?.(this.db) ?? this.db.export?.();
     if (!exported) throw new Error("SQLite could not export its local image");
-    const bytes = exported instanceof Uint8Array ? new Uint8Array(exported) : new Uint8Array(exported);
+    const bytes = exported instanceof Uint8Array ? exported : new Uint8Array(exported);
     await SnapshotStore.write(this.snapshotKey, bytes);
+  }
+
+  private totalChanges(): number {
+    return this.query<{ count: number }>("SELECT total_changes() AS count")[0]!.count;
   }
 
   private row(entityID: string, table: "pages" | "notebooks"): Record<string, unknown> | null {
@@ -753,6 +766,17 @@ export class SQLiteNoteStoreEngine implements NoteStore {
   async listPages(notebookID: string, includeDeleted = false): Promise<NotePage[]> {
     const clause = includeDeleted ? "" : " AND deleted_at IS NULL";
     return this.query(`SELECT json FROM pages WHERE notebook_id = ?${clause} ORDER BY id`, [notebookID]).map((row) => this.pageFromRow(row)).filter((value): value is NotePage => value !== null).sort(comparePageOrder);
+  }
+
+  async listPageSummaries(includeDeleted = false): Promise<PageSummary[]> {
+    const clause = includeDeleted ? "" : " WHERE deleted_at IS NULL";
+    // Project in SQLite so images and ink point arrays never cross the worker
+    // boundary when opening or searching the library.
+    return this.query<{ json: string; stroke_count: number | null }>(`
+      SELECT json_remove(json, '$.strokes', '$.images') AS json,
+        json_array_length(json, '$.strokes') AS stroke_count FROM pages${clause}
+    `).map(row => ({ ...summarizePage(this.pageFromRow(row)!), strokeCount: row.stroke_count ?? 0 }))
+      .sort((left, right) => compareStrings(left.notebookId, right.notebookId) || comparePageOrder(left, right));
   }
 
   async getPage(entityID: string): Promise<NotePage | null> { return this.pageFromRow(this.row(entityID, "pages")); }
@@ -1192,7 +1216,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
   private setCursorDirect(cursor: number): void {
     if (!Number.isInteger(cursor) || cursor < 0) throw new Error("Server cursor is invalid");
     this.db.exec({ sql: `INSERT INTO metadata(key, value) VALUES('cursor', ?)
-      ON CONFLICT(key) DO UPDATE SET value=excluded.value`, bind: [String(cursor)] });
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE metadata.value <> excluded.value`, bind: [String(cursor)] });
   }
 
   private pendingForEntityDirect(entityType: SyncEntityType, entityID: string): SyncOperation[] {
@@ -1365,6 +1389,7 @@ export class SQLiteNoteStore implements NoteStore {
   getNotebook(entityID: string): Promise<Notebook | null> { return this.rpc("getNotebook", [entityID]); }
   saveNotebook(notebook: Notebook, queue = true): Promise<SaveResult> { return this.rpc("saveNotebook", [notebook, queue]); }
   listPages(notebookID: string, includeDeleted = false): Promise<NotePage[]> { return this.rpc("listPages", [notebookID, includeDeleted]); }
+  listPageSummaries(includeDeleted = false): Promise<PageSummary[]> { return this.rpc("listPageSummaries", [includeDeleted]); }
   getPage(entityID: string): Promise<NotePage | null> { return this.rpc("getPage", [entityID]); }
   savePage(page: NotePage, queue = true): Promise<SaveResult> { return this.rpc("savePage", [page, queue]); }
   deletePage(entityID: string): Promise<SaveResult> { return this.rpc("deletePage", [entityID]); }

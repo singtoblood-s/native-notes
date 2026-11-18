@@ -42,6 +42,14 @@ function notifyCacheError(error) {
   });
 }
 
+function cacheResponse(event, response) {
+  if (!response.ok) return response;
+  const copy = response.clone();
+  event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy))
+    .catch(() => { /* Runtime caching is best effort when storage is full. */ }));
+  return response;
+}
+
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE)).catch((error) => notifyCacheError(error).then(() => { throw error; })));
   self.skipWaiting();
@@ -53,10 +61,7 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET" || !isAppRequest(event.request)) return;
   if (event.request.mode === "navigate") {
-    event.respondWith(fetch(event.request).then((response) => {
-      if (response.ok) void caches.open(CACHE_NAME).then((cache) => cache.put(event.request, response.clone()));
-      return response;
-    }).catch(async () => {
+    event.respondWith(fetch(event.request).then(response => cacheResponse(event, response)).catch(async () => {
       const cached = await caches.match(event.request);
       if (cached) return cached;
       const fallback = await caches.match(new URL("./index.html", self.registration.scope).toString())
@@ -67,10 +72,8 @@ self.addEventListener("fetch", (event) => {
   }
   // Static precache requests and module/stylesheet requests may carry different
   // Origin headers (Vary: Origin on the preview server). Their asset bytes are identical.
-  event.respondWith(caches.match(event.request, { ignoreVary: true }).then((cached) => cached || fetch(event.request).then((response) => {
-    if (response.ok) void caches.open(CACHE_NAME).then((cache) => cache.put(event.request, response.clone()));
-    return response;
-  })));
+  event.respondWith(caches.match(event.request, { ignoreVary: true }).then(cached =>
+    cached || fetch(event.request).then(response => cacheResponse(event, response))));
 });
 `;
 await writeFile(join(root, "sw.js"), source);

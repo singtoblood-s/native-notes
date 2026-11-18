@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import type { DatabaseSync as Database, SQLInputValue } from "node:sqlite";
 import { afterEach, expect, it, vi } from "vitest";
 import { SQLiteNoteStoreEngine } from "../src/storage";
-import { createNotebook, createPage, type AuthResponse, type PullChange, type PushResult, type SyncOperation } from "../src/models";
+import { createNotebook, createPage, PAGE_METADATA_FORMAT_VERSION, summarizePage, type AuthResponse, type PullChange, type PushResult, type SyncOperation } from "../src/models";
 import { SyncClient } from "../src/sync";
 
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
@@ -24,6 +24,26 @@ function openEngine() {
   internal.initializeSchema();
   return { engine: engine as SQLiteNoteStoreEngine, db };
 }
+
+it("skips unchanged IndexedDB snapshots while persisting new notes and cursor-only advances", async () => {
+  const { engine } = openEngine();
+  const persistSnapshot = vi.fn(async () => {});
+  Object.assign(engine, { persistence: "indexeddb", persistSnapshot });
+  await engine.saveNotebook(createNotebook(), false);
+  expect(persistSnapshot).toHaveBeenCalledTimes(1);
+  await engine.applyRemoteBatch([], 0);
+  await engine.archiveEmptyConflictNotebooks();
+  expect(persistSnapshot).toHaveBeenCalledTimes(1);
+  await engine.applyRemoteBatch([], 1);
+  expect(persistSnapshot).toHaveBeenCalledTimes(2);
+  expect(await engine.getCursor()).toBe(1);
+  await engine.applyRemoteBatch([], 1);
+  expect(persistSnapshot).toHaveBeenCalledTimes(2);
+
+  persistSnapshot.mockRejectedValueOnce(new Error("Disk full"));
+  await expect(engine.setCursor(2)).rejects.toThrow("Disk full");
+  await expect(engine.saveNotebook(createNotebook())).rejects.toThrow("storage is blocked");
+});
 
 it("duplicates a whole notebook atomically, preserving page order and giving content fresh IDs", async () => {
   const { engine, db } = openEngine();
@@ -56,6 +76,25 @@ it("creates a notebook and first page together or leaves neither after failure",
   await expect(engine.importDocument(book, [createPage(book.id)])).rejects.toThrow("Disk full");
   expect(await engine.listNotebooks()).toEqual([]);
   expect(await engine.pendingOperations()).toEqual([]);
+});
+
+it("reads searchable page summaries in display order without returning media or ink", async () => {
+  const { engine, db } = openEngine();
+  const notebook = createNotebook("Metadata");
+  const page10 = createPage(notebook.id, "Page 10");
+  const page2 = createPage(notebook.id, "Page 2");
+  page10.text = "บันทึก Café";
+  page10.formatVersion = PAGE_METADATA_FORMAT_VERSION;
+  page10.images = [{ id: crypto.randomUUID(), src: "data:image/png;base64,AAAA", x: 0, y: 0, width: 2, height: 3 }];
+  page10.strokes = [{ id: crypto.randomUUID(), color: 0xff000000, width: 2, points: [{ x: 1, y: 2, pressure: .5, time: 0, tiltX: null, tiltY: null }] }];
+  await engine.importDocument(notebook, [page10, page2]);
+  db.exec("UPDATE pages SET json = json_remove(json, '$.order')");
+  expect(await engine.listPageSummaries()).toEqual((await engine.listPages(notebook.id)).map(summarizePage));
+  expect((await engine.listPageSummaries()).map(page => page.title)).toEqual(["Page 2", "Page 10"]);
+  await engine.deletePage(page2.id);
+  expect((await engine.listPageSummaries()).map(page => page.id)).toEqual([page10.id]);
+  expect(await engine.listPageSummaries(true)).toHaveLength(2);
+  expect(await engine.getPage(page10.id)).toMatchObject({ text: page10.text, strokes: page10.strokes, images: page10.images });
 });
 
 it("reorders legacy pages and moves an unsent page after its new parent's creation in the outbox", async () => {

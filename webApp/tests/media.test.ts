@@ -124,8 +124,8 @@ it("accepts PDFs above the former 50 MB ceiling without reading the entire file"
 it("rejects sources beyond the device memory guard before decoding", async () => {
   const file = pdfFile();
   Object.defineProperty(file, "size", { value: 251 * 1024 * 1024 });
-  await expect(importMediaPages([file], notebookID, 0, vi.fn(), new AbortController().signal)).rejects.toThrow("250 MB");
+  await expect(importMediaPages([file], notebookID, 0, vi.fn(), new AbortController().signal)).rejects.toThrow("250 MiB");
   const picture = new File(["x"], "large.png", { type: "image/png" });
   Object.defineProperty(picture, "size", { value: 51 * 1024 * 1024 });
-  await expect(imageCanvas(picture)).rejects.toThrow("50 MB");
+  await expect(imageCanvas(picture)).rejects.toThrow("50 MiB");
 });

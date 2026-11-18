@@ -51,9 +51,11 @@ try {
   await page.locator("#saved-versions").click();
   const version = page.locator("#versions-list .recovery-row").filter({ hasText: "My page" });
   await version.waitFor();
-  const downloaded = page.waitForEvent("download");
-  await version.locator("button").click();
-  await (await downloaded).saveAs(`${output}/version.notepad.json`);
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    version.getByRole("button", { name: "Export", exact: true }).click(),
+  ]);
+  await download.saveAs(`${output}/version.notepad.json`);
   const archive = JSON.parse(await readFile(`${output}/version.notepad.json`, "utf8"));
   assert.equal(archive.pages[0].text, "Preserved offline version");
   assert.equal(archive.notebooks[0].title, "Real notes");

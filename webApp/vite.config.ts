@@ -5,6 +5,7 @@ export default defineConfig(({ mode }) => {
   return {
     base: env.VITE_BASE || "/native-notes/",
     server: { host: "127.0.0.1", port: 4173 },
+    worker: { format: "es" },
     build: { target: "es2022", sourcemap: true },
   };
 });
