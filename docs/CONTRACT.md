@@ -155,8 +155,11 @@ Register/login request and response:
 }
 ```
 
-`POST /v1/auth/register` creates the account; `POST /v1/auth/login` returns a
-new revocable session. `POST /v1/auth/logout` revokes the current session.
+`POST /v1/auth/register` creates the account and `POST /v1/auth/login` returns a
+new revocable session. `POST /v1/auth/remember` with a valid bearer token returns
+`{ "expiresAt": "..." }` for the same credential and extends it for one year.
+The installed web app renews that credential silently when it nears expiry.
+`POST /v1/auth/logout` revokes the current session.
 
 Push uses an immutable operation ID and compare-and-swap base revision:
 

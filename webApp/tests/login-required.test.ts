@@ -20,10 +20,13 @@ it("requires authentication before opening data, blocks dismissal, and locks aga
   Object.defineProperty(HTMLDialogElement.prototype, "showModal", { configurable: true, value() { this.setAttribute("open", ""); } });
   Object.defineProperty(HTMLDialogElement.prototype, "close", { configurable: true, value() { this.removeAttribute("open"); } });
   let rejectLogin = true;
+  const expiresAt = new Date(Date.now() + 30 * 86_400_000).toISOString();
+  const rememberedExpiry = new Date(Date.now() + 365 * 86_400_000).toISOString();
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     if (String(input).endsWith("logout")) return new Response(null, { status: 204 });
+    if (String(input).endsWith("remember")) return new Response(JSON.stringify({ expiresAt: rememberedExpiry }));
     if (rejectLogin) return new Response(JSON.stringify({ error: { message: "Invalid credentials" } }), { status: 401 });
-    return new Response(JSON.stringify({ user: { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", identifier: "tester" }, sessionToken: "token", expiresAt: "2099-01-01T00:00:00Z" }));
+    return new Response(JSON.stringify({ user: { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", identifier: "tester" }, sessionToken: "token", expiresAt }));
   });
   vi.stubGlobal("fetch", fetchMock);
   document.body.innerHTML = '<div id="app"></div>';
@@ -54,15 +57,18 @@ it("requires authentication before opening data, blocks dismissal, and locks aga
     expect(element("export-legacy-notes")).toBeNull();
     expect(state.opened).toHaveBeenCalledTimes(1);
     expect(state.opened).toHaveBeenCalledWith("https://sync.example.test:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    await vi.waitFor(() => expect(localStorage.getItem("notepad.session")).toContain(rememberedExpiry));
     element("logout-button").click();
     await vi.waitFor(() => expect(element<HTMLDialogElement>("auth-dialog").open).toBe(true));
     expect(sessionStorage.getItem("notepad.session")).toBeNull();
+    expect(localStorage.getItem("notepad.session")).toBeNull();
     expect(state.opened).not.toHaveBeenCalledWith("guest");
     submit();
     await vi.waitFor(() => expect(state.start).toHaveBeenCalledTimes(2));
     state.status!({ state: "needs-login" });
     expect(element<HTMLDialogElement>("auth-dialog").open).toBe(true);
     expect(sessionStorage.getItem("notepad.session")).toBeNull();
+    expect(localStorage.getItem("notepad.session")).toBeNull();
   } finally {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();

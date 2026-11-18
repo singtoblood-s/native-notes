@@ -9,8 +9,12 @@ export class FloatingTools {
   private readonly workspace: HTMLElement;
   private readonly bubble: HTMLButtonElement;
   private readonly panel: HTMLElement;
+  private readonly quick: HTMLElement;
+  private readonly details: HTMLElement;
+  private readonly more: HTMLButtonElement;
   private readonly toggle: HTMLButtonElement;
   private readonly rows: { element: HTMLElement; home: Comment }[];
+  private readonly shortcuts: { element: HTMLElement; home: Comment }[];
 
   constructor(signal: AbortSignal, private readonly closeMenus: () => void, private readonly canToggle: () => boolean) {
     this.workspace = document.getElementById("editor-workspace")!;
@@ -19,14 +23,26 @@ export class FloatingTools {
     this.workspace.insertAdjacentHTML("beforeend", `
       <button id="floating-tools-button" class="floating-tools-button" hidden aria-controls="floating-tools-panel" aria-expanded="false" aria-describedby="floating-tools-help"><span class="floating-tool-icon" aria-hidden="true"></span><span class="floating-tool-status" aria-hidden="true"></span></button>
       <section id="floating-tools-panel" class="floating-tools-panel" aria-label="Floating tools" hidden>
-        <div class="floating-tools-heading"><strong>Tools</strong><button id="reset-tools-position" class="outline-button">Reset position</button><button id="dock-tools" class="outline-button">Restore bars</button><button id="close-floating-tools" class="icon-button" aria-label="Close floating tools">×</button></div>
-        <p id="floating-tools-help">Drag the circle to move it. Tap to open or close. Use arrow keys to move the focused circle; Esc closes tools.</p>
+        <div class="floating-tools-quick"><button id="more-floating-tools" class="outline-button" aria-controls="floating-tools-details" aria-expanded="false">More</button></div>
+        <div id="floating-tools-details" hidden>
+          <div class="floating-tools-heading"><strong>Tools</strong><button id="reset-tools-position" class="outline-button">Reset position</button><button id="dock-tools" class="outline-button">Restore bars</button><button id="close-floating-tools" class="icon-button" aria-label="Close floating tools">×</button></div>
+          <p id="floating-tools-help">Drag or use arrow keys to move the circle. Esc closes tools.</p>
+        </div>
       </section>`);
     this.bubble = document.getElementById("floating-tools-button") as HTMLButtonElement;
     this.panel = document.getElementById("floating-tools-panel")!;
+    this.quick = this.panel.querySelector<HTMLElement>(".floating-tools-quick")!;
+    this.details = document.getElementById("floating-tools-details")!;
+    this.more = document.getElementById("more-floating-tools") as HTMLButtonElement;
     this.rows = [".topbar", ".editor-toolbar", ".page-bar", ".stage-foot"].map(selector => {
       const element = this.workspace.querySelector<HTMLElement>(selector)!;
       const home = document.createComment("control position");
+      element.before(home);
+      return { element, home };
+    });
+    this.shortcuts = ["pen-tool", "highlighter-tool", "eraser-tool", "undo-button"].map(id => {
+      const element = document.getElementById(id)!;
+      const home = document.createComment("tool position");
       element.before(home);
       return { element, home };
     });
@@ -38,6 +54,7 @@ export class FloatingTools {
       }
     } catch { /* Optional device preference. */ }
     this.toggle.addEventListener("click", () => this.setFloating(true), { signal });
+    this.more.addEventListener("click", () => this.setDetails(this.details.hidden), { signal });
     document.getElementById("dock-tools")!.addEventListener("click", () => this.setFloating(false), { signal });
     document.getElementById("close-floating-tools")!.addEventListener("click", () => this.close(), { signal });
     document.getElementById("reset-tools-position")!.addEventListener("click", () => {
@@ -80,7 +97,8 @@ export class FloatingTools {
         this.panel.hidden = false;
         this.bubble.setAttribute("aria-expanded", "true");
         this.place();
-        document.getElementById("close-floating-tools")!.focus({ preventScroll: true });
+        const first = this.panel.classList.contains("floating-no-page") ? this.more : this.shortcuts[0]!.element;
+        first.focus({ preventScroll: true });
       }
     }, { signal });
     this.bubble.addEventListener("keydown", event => {
@@ -119,6 +137,7 @@ export class FloatingTools {
     if (this.panel.hidden) return;
     this.closeMenus();
     this.panel.hidden = true;
+    this.setDetails(false);
     this.bubble.setAttribute("aria-expanded", "false");
     if (focus) this.bubble.focus({ preventScroll: true });
   }
@@ -136,11 +155,24 @@ export class FloatingTools {
   private apply(): void {
     this.workspace.classList.toggle("floating-tools-mode", this.floating);
     for (const { element, home } of this.rows) {
-      if (this.floating) this.panel.append(element);
+      if (this.floating) this.details.append(element);
+      else home.after(element);
+    }
+    for (const { element, home } of this.shortcuts) {
+      if (this.floating) this.quick.insertBefore(element, this.more);
       else home.after(element);
     }
     this.toggle.hidden = this.floating;
     this.bubble.hidden = !this.floating;
+    this.place();
+  }
+
+  private setDetails(expanded: boolean): void {
+    if (!expanded) this.closeMenus();
+    this.details.hidden = !expanded;
+    this.more.textContent = expanded ? "Less" : "More";
+    this.more.setAttribute("aria-expanded", String(expanded));
+    this.panel.scrollTop = 0;
     this.place();
   }
 
@@ -165,7 +197,7 @@ export class FloatingTools {
     this.bubble.style.top = `${top}px`;
     if (this.panel.hidden) return;
     this.panel.style.maxHeight = `${Math.max(SIZE, bounds.height)}px`;
-    this.panel.style.width = `${Math.min(560, bounds.width + SIZE)}px`;
+    this.panel.style.width = `${Math.min(this.details.hidden ? 284 : 560, bounds.width + SIZE)}px`;
     const width = this.panel.offsetWidth, height = this.panel.offsetHeight;
     const beside = left >= bounds.left + width + GAP ? left - width - GAP : left + SIZE + GAP;
     this.panel.style.left = `${Math.max(bounds.left, Math.min(beside, bounds.left + bounds.width + SIZE - width))}px`;

@@ -42,7 +42,7 @@ beforeEach(() => {
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => { callback(0); return 1; });
   vi.stubGlobal("cancelAnimationFrame", vi.fn());
   Object.defineProperty(HTMLCanvasElement.prototype, "getContext", { configurable: true, value: () => ({
-    setTransform: vi.fn(), clearRect: vi.fn(), fillRect: vi.fn(), save: vi.fn(), restore: vi.fn(), beginPath: vi.fn(), moveTo: vi.fn(), lineTo: vi.fn(), stroke: vi.fn(), arc: vi.fn(), fill: vi.fn(), drawImage: vi.fn(),
+    setTransform: vi.fn(), clearRect: vi.fn(), fillRect: vi.fn(), save: vi.fn(), restore: vi.fn(), beginPath: vi.fn(), moveTo: vi.fn(), lineTo: vi.fn(), bezierCurveTo: vi.fn(), stroke: vi.fn(), arc: vi.fn(), fill: vi.fn(), drawImage: vi.fn(),
   }) });
   Object.defineProperty(HTMLCanvasElement.prototype, "setPointerCapture", { configurable: true, value: vi.fn() });
   Object.defineProperty(HTMLCanvasElement.prototype, "releasePointerCapture", { configurable: true, value: vi.fn() });
@@ -109,6 +109,21 @@ describe("PaperCanvas pointer contract", () => {
     const before = transformOf(paper);
     canvasController.setPage("next", 1024, 1366, "blank", []);
     expect(transformOf(paper)).toEqual(before);
+    canvasController.destroy();
+  });
+
+  it("keeps the custom zoom and paper origin through a height-only viewport change", () => {
+    const { canvas, paper, viewportRect, canvasController } = setup();
+    canvasController.zoomBy(2);
+    const zoomed = transformOf(paper);
+    canvas.dispatchEvent(pointer("pointerdown", {}));
+    viewportRect.height -= 80;
+    window.dispatchEvent(new Event("resize"));
+    expect(transformOf(paper)).toEqual(zoomed);
+    canvas.dispatchEvent(pointer("pointerup", {}));
+    expect(transformOf(paper)).toEqual(zoomed);
+    canvasController.setPage("landscape", 1366, 1024, "blank", []);
+    expect(transformOf(paper).scale).toBe(zoomed.scale);
     canvasController.destroy();
   });
   it.each(["continuous", "horizontal"] as const)("pans with two fingers across page previews and gutters in %s mode", (mode) => {
@@ -334,19 +349,41 @@ describe("PaperCanvas pointer contract", () => {
     const frames: FrameRequestCallback[] = [];
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => { frames.push(callback); return frames.length; });
     const { canvas, canvasController } = setup();
-    const renderStroke = vi.spyOn(canvasController as unknown as { renderStroke: (ctx: unknown, stroke: { points: unknown[] }) => void }, "renderStroke");
+    const context = (canvasController as unknown as { context: CanvasRenderingContext2D }).context;
     canvas.dispatchEvent(pointer("pointerdown", { clientX: 10 }));
     frames.shift()!(0);
     for (let i = 1; i <= 100; i++) {
-      renderStroke.mockClear();
+      vi.mocked(context.stroke).mockClear();
       canvas.dispatchEvent(pointer("pointermove", { clientX: 10 + i }));
       frames.shift()!(i);
-      expect(renderStroke).toHaveBeenCalledTimes(1);
-      expect(renderStroke.mock.calls[0]![1].points).toHaveLength(2);
+      expect(context.stroke).toHaveBeenCalledTimes(1);
     }
     const renderStatic = vi.spyOn(canvasController as unknown as { renderStatic: () => void }, "renderStatic");
     canvas.dispatchEvent(pointer("pointerup", { clientX: 110 }));
     expect(renderStatic).not.toHaveBeenCalled();
+    canvasController.destroy();
+  });
+
+  it("commits the same measured curve as live ink and ignores the off-contact Pencil lift position", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => { frames.push(callback); return frames.length; });
+    const { canvas, canvasController, changes } = setup();
+    const { context, staticContext } = canvasController as unknown as {
+      context: CanvasRenderingContext2D;
+      staticContext: CanvasRenderingContext2D;
+    };
+    canvas.dispatchEvent(pointer("pointerdown", { clientX: 10, clientY: 10 }));
+    canvas.dispatchEvent(pointer("pointermove", { clientX: 20, clientY: 10 }));
+    frames.shift()!(0);
+    canvas.dispatchEvent(pointer("pointermove", { clientX: 30, clientY: 14 }));
+    frames.shift()!(16);
+    canvas.dispatchEvent(pointer("pointerup", { clientX: 30, clientY: 5, pressure: 0, buttons: 0 }));
+    expect(context.bezierCurveTo).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(staticContext.bezierCurveTo).mock.calls).toEqual(vi.mocked(context.bezierCurveTo).mock.calls);
+    expect(changes.mock.lastCall![0][0].points.map(({ x, y }: { x: number; y: number }) => [x, y])).toEqual([[20, 20], [40, 20], [60, 28]]);
+    const [, , clearedWidth, clearedHeight] = vi.mocked(context.clearRect).mock.lastCall!;
+    expect(clearedWidth).toBeLessThan(100);
+    expect(clearedHeight).toBeLessThan(100);
     canvasController.destroy();
   });
 

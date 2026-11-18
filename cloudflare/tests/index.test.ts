@@ -136,6 +136,15 @@ describe("native-notes Cloudflare Worker", () => {
 
   it("registers, keeps sessions revocable, and returns idempotent receipts", async () => {
     const { token, userId } = await auth();
+    const bearer = { Origin: ORIGIN, Authorization: `Bearer ${token}` };
+    const remember = () => request("/v1/auth/remember", { method: "POST", headers: bearer });
+    const remembered = await remember();
+    expect(remembered.status).toBe(200);
+    const { expiresAt: expiry } = await remembered.json() as { expiresAt: string };
+    expect(Date.parse(expiry) - Date.now()).toBeGreaterThan(364 * 86_400_000);
+    expect(Date.parse(expiry) - Date.now()).toBeLessThanOrEqual(365 * 86_400_000);
+    expect(await env.DB.prepare("SELECT expires_at FROM sessions WHERE user_id = ?").bind(userId).first("expires_at")).toBe(expiry);
+    expect((await remember()).status).toBe(200);
     const row = await env.DB.prepare("SELECT salt, password_hash FROM users WHERE id = ?").bind(userId).first<{ salt: string; password_hash: string }>();
     expect(row?.salt).toMatch(/^[A-Za-z0-9_-]{22}$/);
     expect(row?.password_hash).toMatch(/^[A-Za-z0-9_-]{43}$/);
@@ -160,6 +169,7 @@ describe("native-notes Cloudflare Worker", () => {
     await request("/v1/auth/logout", { method: "POST", headers: { ...jsonHeaders, Authorization: `Bearer ${token}` }, body: "{}" });
     const afterLogout = await request("/v1/sync/pull?cursor=0", { headers: { Origin: ORIGIN, Authorization: `Bearer ${token}` } });
     expect(afterLogout.status).toBe(401);
+    expect((await remember()).status).toBe(401);
   });
 
   it("keeps the web operation fingerprint stable", async () => {

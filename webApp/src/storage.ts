@@ -1,6 +1,7 @@
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import sqliteWasmUrl from "@sqlite.org/sqlite-wasm/sqlite3.wasm?url";
 import { resolveStorageAccountKey } from "./auth";
+import { type ArchiveImport, MAX_ARCHIVE_BYTES, MAX_ARCHIVE_NOTEBOOKS, MAX_ARCHIVE_PAGES } from "./archive";
 import {
   ConflictCopy,
   INK_FORMAT_VERSION,
@@ -34,9 +35,6 @@ import {
 type SQLiteRuntime = any;
 type SQLiteDatabase = any;
 
-const MAX_ARCHIVE_BYTES = 50 * 1024 * 1024;
-const MAX_ARCHIVE_NOTEBOOKS = 1_000;
-const MAX_ARCHIVE_PAGES = 10_000;
 const MAX_NOTEBOOK_TITLE = 500;
 const MAX_PAGE_TEXT = 1_000_000;
 const MAX_PAGE_TITLE = 500;
@@ -76,6 +74,12 @@ export interface Archive {
   versions?: ConflictCopy[];
 }
 
+interface ArchiveImportResult {
+  notebooks: number;
+  pages: number;
+  alreadyImported?: boolean;
+}
+
 export type OperationState = "pending" | "sending";
 
 export interface NoteStore {
@@ -110,7 +114,7 @@ export interface NoteStore {
   listConflicts(): Promise<ConflictCopy[]>;
   deleteConflict(conflictID: string): Promise<void>;
   exportArchive(notebookID?: string): Promise<Archive>;
-  importArchive(archive: Archive): Promise<{ notebooks: number; pages: number }>;
+  importArchive(archive: ArchiveImport): Promise<ArchiveImportResult>;
   ensureStarterData(): Promise<{ notebook: Notebook; page: NotePage }>;
   /** Keep the database open while a network sync is applying its ACKs. */
   acquireSyncLease?(): () => void;
@@ -1018,23 +1022,28 @@ export class SQLiteNoteStoreEngine implements NoteStore {
     return { version: 1, exportedAt: now(), account: this.accountKey, notebooks, pages, versions };
   }
 
-  async importArchive(archive: Archive): Promise<{ notebooks: number; pages: number }> {
-    const rawArchive = record(archive, "Archive");
-    if (rawArchive.version !== 1 || !Array.isArray(rawArchive.notebooks) || !Array.isArray(rawArchive.pages)) throw new Error("Unsupported NotePad archive");
-    requiredString(rawArchive.account, "Archive account", 2_000);
-    requiredString(rawArchive.exportedAt, "Archive exportedAt");
-    if (rawArchive.notebooks.length > MAX_ARCHIVE_NOTEBOOKS || rawArchive.pages.length > MAX_ARCHIVE_PAGES) throw new Error("Archive has too many notes");
-    let archiveBytes: number;
-    try {
-      const serialized = JSON.stringify(rawArchive);
-      if (typeof serialized !== "string") throw new Error("Archive is not serializable");
-      archiveBytes = new TextEncoder().encode(serialized).byteLength;
-    } catch (error) {
-      throw new Error(`Archive could not be read: ${error instanceof Error ? error.message : "invalid JSON"}`);
-    }
-    if (archiveBytes > MAX_ARCHIVE_BYTES) throw new Error("Archive is larger than 50 MB");
+  async importArchive(archive: ArchiveImport): Promise<ArchiveImportResult> {
+    const bundle = archive && "parts" in archive ? archive : { parts: [archive] };
+    const { parts } = bundle;
+    if (!Array.isArray(parts) || parts.length === 0) throw new Error("Backup has no parts.");
+    const importKey = "importID" in bundle && bundle.importID !== undefined
+      ? `backup-import:${requireUUID(bundle.importID, "Backup ID")}`
+      : null;
+    const encoder = new TextEncoder();
+    const sections = parts.map((part, index) => {
+      const raw = record(part, "Backup part");
+      if (raw.version !== 1 || !Array.isArray(raw.notebooks) || !Array.isArray(raw.pages)) throw new Error("Unsupported NotePad archive");
+      const account = requiredString(raw.account, "Archive account", 2_000);
+      const exportedAt = requiredString(raw.exportedAt, "Archive exportedAt");
+      if (index > 0 && (account !== parts[0]!.account || exportedAt !== parts[0]!.exportedAt)) throw new Error("Backup parts do not belong together.");
+      if (raw.notebooks.length > MAX_ARCHIVE_NOTEBOOKS || raw.pages.length > MAX_ARCHIVE_PAGES) throw new Error("A backup part has too many notes.");
+      const versions = raw.versions ?? [];
+      if (!Array.isArray(versions) || versions.length > MAX_ARCHIVE_PAGES) throw new Error("Archive versions are invalid");
+      if (encoder.encode(JSON.stringify(raw)).byteLength > MAX_ARCHIVE_BYTES) throw new Error("A backup part is larger than 50 MiB.");
+      return { notebooks: raw.notebooks, pages: raw.pages, versions };
+    });
 
-    const notebooks = rawArchive.notebooks.map((value, index) => {
+    const notebooks = sections.flatMap(section => section.notebooks).map((value, index) => {
       try { return validateNotebookSnapshot(value); }
       catch (error) { throw new Error(`Archive notebook ${index + 1} is invalid: ${error instanceof Error ? error.message : "invalid snapshot"}`); }
     });
@@ -1043,7 +1052,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       if (notebookIDs.has(notebook.id)) throw new Error(`Archive contains duplicate notebook ID at item ${index + 1}`);
       notebookIDs.add(notebook.id);
     });
-    const pages = rawArchive.pages.map((value, index) => {
+    const pages = sections.flatMap(section => section.pages).map((value, index) => {
       try { return validatePageSnapshot(value); }
       catch (error) { throw new Error(`Archive page ${index + 1} is invalid: ${error instanceof Error ? error.message : "invalid snapshot"}`); }
     });
@@ -1053,9 +1062,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       pageIDs.add(page.id);
       if (!notebookIDs.has(page.notebookId)) throw new Error(`Archive page ${index + 1} refers to a missing notebook`);
     });
-    const versions = rawArchive.versions ?? [];
-    if (!Array.isArray(versions) || versions.length > MAX_ARCHIVE_PAGES) throw new Error("Archive versions are invalid");
-    const checkedVersions = versions.map(value => {
+    const checkedVersions = sections.flatMap(section => section.versions).map(value => {
       const version = record(value, "Saved version");
       if (version.entityType !== "page" && version.entityType !== "notebook") throw new Error("Saved version type is invalid");
       const entityId = requireUUID(version.entityId, "Saved version entity ID");
@@ -1063,6 +1070,9 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       return { entityType: version.entityType, entityId, payload };
     });
     return this.transaction(() => {
+      if (importKey && this.query("SELECT 1 FROM metadata WHERE key = ?", [importKey]).length > 0) {
+        return { notebooks: 0, pages: 0, alreadyImported: true };
+      }
       const occupied = new Set<string>();
       for (const row of this.query<{ id: unknown }>("SELECT id FROM notebooks UNION SELECT id FROM pages")) if (typeof row.id === "string") occupied.add(row.id);
       const freshID = (): string => {
@@ -1075,7 +1085,7 @@ export class SQLiteNoteStoreEngine implements NoteStore {
       const inputNotebooks = notebooks.map((notebook) => {
         const newID = freshID();
         remappedNotebookIDs.set(notebook.id, newID);
-        return { ...notebook, id: newID, revision: 0, deletedAt: null, updatedAt: now() };
+        return { ...notebook, id: newID, revision: 0, updatedAt: now() };
       });
       const remappedPageIDs = new Map(pages.map(page => [page.id, freshID()]));
       const inputPages = pages.map((page) => ({
@@ -1083,18 +1093,21 @@ export class SQLiteNoteStoreEngine implements NoteStore {
         id: remappedPageIDs.get(page.id)!,
         notebookId: remappedNotebookIDs.get(page.notebookId)!,
         revision: 0,
-        deletedAt: null,
-        conflictOf: undefined,
+        conflictOf: page.conflictOf ? remappedPageIDs.get(page.conflictOf.toLowerCase()) ?? page.conflictOf : undefined,
         updatedAt: now(),
       }));
-      inputNotebooks.forEach((notebook) => this.saveNotebookRow(notebook, true));
+      // Upload every child before its parent tombstone. The sync server needs
+      // a live parent to accept a child that is hidden by the notebook's trash.
+      inputNotebooks.forEach((notebook) => this.saveNotebookRow({ ...notebook, deletedAt: null }, true));
       inputPages.forEach((page) => this.savePageRow(page, true));
+      for (const notebook of inputNotebooks) if (notebook.deletedAt) this.saveNotebookRow(notebook, true);
       checkedVersions.forEach(version => {
         const entityId = (version.entityType === "page" ? remappedPageIDs : remappedNotebookIDs).get(version.entityId) ?? version.entityId;
         const payload = { ...version.payload, id: entityId } as unknown as Record<string, unknown>;
         if (typeof payload.notebookId === "string") payload.notebookId = remappedNotebookIDs.get(payload.notebookId) ?? payload.notebookId;
         this.insertConflictDirect(version.entityType as SyncEntityType, entityId, payload, "Imported saved version", 0);
       });
+      if (importKey) this.db.exec({ sql: "INSERT INTO metadata (key, value) VALUES (?, '1')", bind: [importKey] });
       return { notebooks: inputNotebooks.length, pages: inputPages.length };
     });
   }
@@ -1374,7 +1387,7 @@ export class SQLiteNoteStore implements NoteStore {
   listConflicts(): Promise<ConflictCopy[]> { return this.rpc("listConflicts"); }
   deleteConflict(conflictID: string): Promise<void> { return this.rpc("deleteConflict", [conflictID]); }
   exportArchive(notebookID?: string): Promise<Archive> { return this.rpc("exportArchive", [notebookID]); }
-  importArchive(archive: Archive): Promise<{ notebooks: number; pages: number }> { return this.rpc("importArchive", [archive]); }
+  importArchive(archive: ArchiveImport): Promise<ArchiveImportResult> { return this.rpc("importArchive", [archive]); }
   importDocument(notebook: Notebook, pages: NotePage[]): Promise<void> { return this.rpc("importDocument", [notebook, pages]); }
   duplicateNotebook(notebookID: string): Promise<Notebook> { return this.rpc("duplicateNotebook", [notebookID]); }
   movePage(pageID: string, notebookID: string, position: number): Promise<void> { return this.rpc("movePage", [pageID, notebookID, position]); }

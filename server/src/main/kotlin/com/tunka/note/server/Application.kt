@@ -104,6 +104,9 @@ fun Application.module(database: ServerDatabase) {
             val request = call.receiveJson<AuthRequest>(MAX_AUTH_BODY)
             call.respond(auth.login(request, call.clientKey()))
         }
+        post("/v1/auth/remember") {
+            call.respond(mapOf("expiresAt" to auth.rememberSession(call.bearerToken())))
+        }
         post("/v1/auth/logout") {
             auth.logout(call.bearerToken())
             call.respondText("", status = HttpStatusCode.NoContent)

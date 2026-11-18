@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AuthResponse, SyncOperation } from "../src/models";
 import { NoteStore } from "../src/storage";
-import { SyncClient } from "../src/sync";
+import { SyncClient, SyncHttpError } from "../src/sync";
 import { SyncCoordinator } from "../src/coordinator";
 
 const session: AuthResponse = {
@@ -35,6 +35,29 @@ afterEach(() => {
 });
 
 describe("automatic sync coordinator", () => {
+  it("ignores a late unauthorized response for a superseded device token", async () => {
+    vi.useFakeTimers();
+    localStorage.setItem("notepad.endpoint", "https://sync.example.test");
+    const store = fakeStore();
+    let activeSession = session;
+    let rejectPrevious!: (error: Error) => void;
+    const sync = vi.fn(async () => ({ pushed: 0, pulled: 0, conflicts: 0 }))
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectPrevious = reject; }));
+    const onStatus = vi.fn();
+    const coordinator = new SyncCoordinator({
+      getStore: () => store, getSession: () => activeSession, client: { sync } as unknown as SyncClient, onStatus,
+    });
+    coordinator.start();
+    try {
+      await settle();
+      activeSession = { ...session, sessionToken: "replacement" };
+      rejectPrevious(new SyncHttpError(401, "Authentication required"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sync).toHaveBeenLastCalledWith(store, activeSession);
+      expect(onStatus.mock.calls.some(([status]) => status.state === "needs-login")).toBe(false);
+    } finally { coordinator.stop(); }
+  });
+
   it("syncs during continuous writing instead of postponing every time a save arrives", async () => {
     vi.useFakeTimers();
     localStorage.setItem("notepad.endpoint", "https://sync.example.test");

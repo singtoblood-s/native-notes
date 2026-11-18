@@ -11,6 +11,8 @@ import com.tunka.note.shared.PushStatus
 import com.tunka.note.shared.SyncAction
 import com.tunka.note.shared.SyncEntityType
 import com.tunka.note.shared.SyncOperation
+import java.time.Duration
+import java.time.Instant
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.jsonObject
@@ -49,8 +51,11 @@ class ServerTest {
             ServerDatabase(path).use { database ->
                 val auth = AuthService(database)
                 assertEquals(response.user.identifier, auth.authenticate(response.sessionToken).identifier)
+                val expiresAt = auth.rememberSession(response.sessionToken)
+                assertTrue(Duration.between(Instant.now(), Instant.parse(expiresAt)).toDays() in 364L..365L)
                 auth.logout(response.sessionToken)
                 assertFailsWith<AuthFailure> { auth.authenticate(response.sessionToken) }
+                assertFailsWith<AuthFailure> { auth.rememberSession(response.sessionToken) }
             }
         } finally {
             path.deleteIfExists()

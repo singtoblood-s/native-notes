@@ -81,6 +81,9 @@ try {
   assert(await panel.isVisible());
   await page.locator("#highlighter-tool").click();
   assert.match(await bubble.getAttribute("aria-label"), /Highlighter/);
+  const more = page.locator("#more-floating-tools");
+  assert(!(await page.locator("#toolbar-insert").isVisible()));
+  await more.click();
   await page.locator("#toolbar-insert").click();
   assert(await page.locator("#insert-menu").isVisible());
   await page.keyboard.press("Escape");
@@ -90,6 +93,7 @@ try {
   assert(!(await panel.isVisible()));
   assert(await bubble.evaluate(element => document.activeElement === element));
   await bubble.click();
+  await more.click();
   await page.locator("#next-page").click();
   await page.waitForFunction(() => document.querySelector("#page-position").textContent === "2 / 2");
   await page.locator("#previous-page").click();
@@ -110,7 +114,7 @@ try {
   await bubble.click();
   assert(await page.locator("#undo-button").isEnabled(), "Writing while collapsed must retain undo history");
   await page.locator("#undo-button").click();
-  await page.locator("#close-floating-tools").click();
+  await bubble.click();
   // Native touch drag must not write on the page or open the panel.
   const bubbleTouch = await context.newCDPSession(page);
   const touchStart = await bubble.boundingBox();
@@ -131,12 +135,14 @@ try {
   const mobilePanel = await panel.boundingBox();
   assert(mobilePanel.x >= 0 && mobilePanel.x + mobilePanel.width <= 390);
   assert(mobilePanel.y >= 0 && mobilePanel.y + mobilePanel.height <= 844);
+  assert(mobilePanel.height < 100 && await more.isVisible(), "Quick tools must fit in a short mobile row");
   assert(mobilePanel.y + mobilePanel.height <= mobileBubble.y || mobilePanel.y >= mobileBubble.y + 56, "Mobile panel must leave the circle reachable");
   assert(await panel.evaluate(element => element.scrollWidth <= element.clientWidth), "Controls must fit the mobile panel");
   await page.screenshot({ path: `${output}/floating-tools-mobile.png`, animations: "disabled" });
-  await page.locator("#close-floating-tools").click();
+  await bubble.click();
   await page.setViewportSize({ width: 1024, height: 900 });
   await bubble.click();
+  await more.click();
   await page.locator("#reset-tools-position").click();
   await page.screenshot({ path: `${output}/floating-tools-desktop.png`, animations: "disabled" });
   await page.locator("#close-floating-tools").click();
@@ -149,6 +155,7 @@ try {
   const restoredPosition = await bubble.boundingBox();
   assert(Math.abs(savedPosition.x - restoredPosition.x) < 1 && Math.abs(savedPosition.y - restoredPosition.y) < 1);
   await bubble.click();
+  await more.click();
   await page.locator("#back-library").click();
   await page.locator("#library").waitFor({ state: "visible" });
   assert(!(await bubble.isVisible()));
@@ -156,6 +163,7 @@ try {
   await bubble.waitFor({ state: "visible" });
   assert(!(await panel.isVisible()));
   await bubble.click();
+  await more.click();
   await page.locator("#dock-tools").click();
   assert(!(await bubble.isVisible()));
   assert(await page.locator("#float-tools").isVisible());

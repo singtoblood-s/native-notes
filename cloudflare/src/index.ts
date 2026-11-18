@@ -162,6 +162,7 @@ const PBKDF2_BITS = 256;
 const SALT_BYTES = 16;
 const SESSION_BYTES = 32;
 const SESSION_DAYS = 30;
+const REMEMBERED_SESSION_DAYS = 365;
 const MAX_AUTH_BODY = 64 * 1024;
 const MAX_SYNC_BODY = 36 * 1024 * 1024;
 // Free D1 allows 50 queries per invocation. Multi-operation pushes are capped
@@ -285,6 +286,9 @@ async function handleRequest(request: Request, env: Env, object: ApiDurableObjec
     if (url.pathname === "/v1/auth/login" && request.method === "POST") {
       const body = parseAuthRequest(await readJsonBody(request, MAX_AUTH_BODY));
       return jsonResponse(await login(env.DB, body, clientKey(request), object), 200, cors);
+    }
+    if (url.pathname === "/v1/auth/remember" && request.method === "POST") {
+      return jsonResponse(await rememberSession(env.DB, bearerToken(request)), 200, cors);
     }
     if (url.pathname === "/v1/auth/logout" && request.method === "POST") {
       await logout(env.DB, bearerToken(request));
@@ -540,6 +544,17 @@ async function authenticate(db: D1Database, token: string | null): Promise<{ id:
 async function logout(db: D1Database, token: string | null): Promise<void> {
   if (!token || token.length > 256) return;
   await db.prepare("UPDATE sessions SET revoked_at = ? WHERE token_hash = ?").bind(new Date().toISOString(), await sha256Base64(token)).run();
+}
+
+async function rememberSession(db: D1Database, token: string | null): Promise<{ expiresAt: string }> {
+  if (!token) throw new ApiFailure(401, "unauthorized", "Authentication required");
+  await authenticate(db, token);
+  const expiry = new Date(Date.now() + REMEMBERED_SESSION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const expiresAt = await db.prepare(
+    "UPDATE sessions SET expires_at = max(expires_at, ?) WHERE token_hash = ? AND revoked_at IS NULL RETURNING expires_at",
+  ).bind(expiry, await sha256Base64(token)).first<string>("expires_at");
+  if (!expiresAt) throw new ApiFailure(401, "unauthorized", "Authentication required");
+  return { expiresAt };
 }
 
 async function hashPassword(password: string): Promise<{ salt: string; hash: string }> {

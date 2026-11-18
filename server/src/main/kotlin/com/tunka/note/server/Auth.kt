@@ -16,6 +16,7 @@ private const val PBKDF2_ITERATIONS = 600_000
 private const val HASH_BITS = 256
 private const val SALT_BYTES = 16
 private const val SESSION_DAYS = 30L
+private const val REMEMBERED_SESSION_DAYS = 365L
 
 data class AuthFailure(val status: Int, val code: String, override val message: String) : RuntimeException(message)
 
@@ -159,6 +160,30 @@ class AuthService(private val database: ServerDatabase) {
             throw AuthFailure(401, "invalid_credentials", "Invalid credentials")
         }
         return database.transaction { connection -> issueSession(connection, credentials.id, credentials.identifier) }
+    }
+
+    fun rememberSession(token: String?): String {
+        if (token.isNullOrBlank()) throw AuthFailure(401, "unauthorized", "Authentication required")
+        authenticate(token)
+        return database.transaction { connection ->
+            val expiry = Instant.now().plus(Duration.ofDays(REMEMBERED_SESSION_DAYS)).toString()
+            connection.prepareStatement(
+                """
+                UPDATE sessions
+                SET expires_at = CASE WHEN julianday(expires_at) < julianday(?) THEN ? ELSE expires_at END
+                WHERE token_hash = ? AND revoked_at IS NULL
+                RETURNING expires_at
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, expiry)
+                statement.setString(2, expiry)
+                statement.setString(3, token.sha256Base64())
+                statement.executeQuery().use { rows ->
+                    if (!rows.next()) throw AuthFailure(401, "unauthorized", "Authentication required")
+                    rows.getString("expires_at")
+                }
+            }
+        }
     }
 
     fun authenticate(token: String?): SessionUser {

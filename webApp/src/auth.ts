@@ -5,6 +5,7 @@ const ENDPOINT_KEY = "notepad.endpoint";
 const WORKSPACE_KEY = "notepad.workspace";
 const WORKSPACES_KEY = "notepad.workspaces";
 const ACTIVE_WORKSPACE_KEY = "notepad.active-workspace";
+const REMEMBERED_SESSION_REFRESH_WINDOW_MS = 335 * 24 * 60 * 60 * 1000;
 /** The public tunnel used by builds before the D1 worker migration. */
 export const LEGACY_API_URL = "https://nascar-essay-what-josh.trycloudflare.com";
 
@@ -86,18 +87,19 @@ export class AuthSession {
   private readonly identities: Map<string, WorkspaceIdentity>;
 
   constructor() {
-    this.current = readSession();
+    const remembered = readSession(localStorage);
+    const legacySession = readSession(sessionStorage);
+    const endpoint = getEndpoint();
+    this.current = remembered ?? (legacySession?.endpoint === endpoint ? legacySession : null);
+    if (this.current && !remembered) localStorage.setItem(SESSION_KEY, JSON.stringify(this.current));
+    sessionStorage.removeItem(SESSION_KEY);
     this.identities = readWorkspaceIdentities();
     const activeKey = localStorage.getItem(ACTIVE_WORKSPACE_KEY);
     const legacy = !localStorage.getItem(WORKSPACES_KEY) ? readWorkspaceIdentity() : null;
     const activeIdentity = activeKey ? this.identities.get(activeKey) ?? this.identities.get(canonicalWorkspaceKey(activeKey)) ?? null : null;
     this.identity = activeIdentity ?? legacy;
     if (activeIdentity && activeKey !== workspaceIdentityKey(activeIdentity)) localStorage.setItem(ACTIVE_WORKSPACE_KEY, workspaceIdentityKey(activeIdentity));
-    if (this.current && (this.current.endpoint !== getEndpoint() || isExpired(this.current.expiresAt))) {
-      this.current = null;
-      sessionStorage.removeItem(SESSION_KEY);
-    }
-    if (this.current) {
+    if (this.current?.endpoint === endpoint) {
       this.identity = this.remember({ endpoint: this.current.endpoint, userID: this.current.user.id, identifier: this.current.user.identifier });
       localStorage.setItem(ACTIVE_WORKSPACE_KEY, workspaceIdentityKey(this.identity));
     } else if (legacy) {
@@ -107,7 +109,8 @@ export class AuthSession {
   }
 
   get session(): AuthResponse | null { return this.activeSession(); }
-  get user(): User | null { return this.activeSession()?.user ?? null; }
+  get canOpenWorkspace(): boolean { return this.rememberedSession() !== null; }
+  get user(): User | null { return this.rememberedSession()?.user ?? null; }
   get workspaceKey(): string | null {
     const session = this.activeSession();
     return session ? workspaceAccountKey(session.endpoint, session.user.id) : this.identity ? workspaceAccountKey(this.identity.endpoint, this.identity.userID) : null;
@@ -118,33 +121,39 @@ export class AuthSession {
   get savedWorkspaces(): readonly WorkspaceIdentity[] { return [...this.identities.values()]; }
 
   private activeSession(): StoredSession | null {
-    if (!this.current) return null;
-    if (this.current.endpoint !== getEndpoint() || isExpired(this.current.expiresAt)) {
-      this.current = null;
-      sessionStorage.removeItem(SESSION_KEY);
-      return null;
-    }
-    return this.current;
+    const session = this.rememberedSession();
+    return session && !isExpired(session.expiresAt) ? session : null;
+  }
+
+  private rememberedSession(): StoredSession | null {
+    if (!this.current || this.current.endpoint !== getEndpoint()) return null;
+    const saved = readSession(localStorage);
+    // A tab is tied to the workspace it opened. Signing out or switching
+    // accounts in another tab must invalidate it without clearing the new login.
+    return saved?.endpoint === this.current.endpoint && saved.user.id === this.current.user.id ? saved : null;
   }
 
   set(response: AuthResponse | null): void {
-    this.current = null;
     if (response) {
       const endpoint = getEndpoint();
-      const stored: StoredSession = { ...response, endpoint };
+      const stored: StoredSession = { ...response, user: { ...response.user, id: response.user.id.toLowerCase() }, endpoint };
       const identity: WorkspaceIdentity = { endpoint, userID: response.user.id.toLowerCase(), identifier: response.user.identifier };
       this.current = stored;
       this.identity = this.remember(identity);
       localStorage.setItem(ACTIVE_WORKSPACE_KEY, workspaceIdentityKey(identity));
-      sessionStorage.setItem(SESSION_KEY, JSON.stringify(stored));
+      localStorage.setItem(SESSION_KEY, JSON.stringify(stored));
     } else {
-      sessionStorage.removeItem(SESSION_KEY);
       // Preserve account databases and outboxes for the next authenticated login.
-      localStorage.removeItem(ACTIVE_WORKSPACE_KEY);
-      localStorage.removeItem(WORKSPACE_KEY);
+      const saved = readSession(localStorage);
+      if (!saved || (this.current?.endpoint === saved.endpoint && this.current.user.id === saved.user.id)) {
+        localStorage.removeItem(SESSION_KEY);
+        localStorage.removeItem(ACTIVE_WORKSPACE_KEY);
+        localStorage.removeItem(WORKSPACE_KEY);
+      }
       this.identity = null;
       this.current = null;
     }
+    sessionStorage.removeItem(SESSION_KEY);
   }
 
   clear(): void { this.set(null); }
@@ -181,6 +190,20 @@ export class AuthClient {
 
   async login(identifier: string, password: string): Promise<AuthResponse> {
     return this.request("/v1/auth/login", { identifier, password });
+  }
+
+  async remember(session: AuthResponse, endpoint: string): Promise<AuthResponse | null> {
+    const currentExpiry = Date.parse(session.expiresAt);
+    if (currentExpiry - Date.now() > REMEMBERED_SESSION_REFRESH_WINDOW_MS || endpoint !== getEndpoint()) return null;
+    const response = await fetchWithTimeout(`${endpoint}/v1/auth/remember`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${session.sessionToken}` },
+    });
+    // Older self-hosted servers can still sync with their original token.
+    if (!response.ok) return null;
+    const payload = await parseJSON(response);
+    if (typeof payload.expiresAt !== "string" || !(Date.parse(payload.expiresAt) > currentExpiry)) return null;
+    return { ...session, expiresAt: payload.expiresAt };
   }
 
   async logout(token: string, boundEndpoint = getEndpoint()): Promise<void> {
@@ -251,12 +274,13 @@ export function readError(payload: Record<string, unknown>, fallback: string): s
   return fallback;
 }
 
-function readSession(): StoredSession | null {
+function readSession(storage: Storage): StoredSession | null {
   try {
-    const raw = sessionStorage.getItem(SESSION_KEY);
+    const raw = storage.getItem(SESSION_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<StoredSession>;
-    if (typeof parsed.sessionToken !== "string" || !parsed.user || typeof parsed.expiresAt !== "string" || typeof parsed.endpoint !== "string") return null;
+    if (typeof parsed.sessionToken !== "string" || !parsed.sessionToken || !parsed.user || typeof parsed.expiresAt !== "string" ||
+        !Number.isFinite(Date.parse(parsed.expiresAt)) || typeof parsed.endpoint !== "string") return null;
     if (typeof parsed.user.id !== "string" || typeof parsed.user.identifier !== "string") return null;
     const endpoint = normalizeEndpoint(parsed.endpoint);
     if (!endpoint) return null;

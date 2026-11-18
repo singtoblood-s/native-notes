@@ -166,6 +166,46 @@ it("keeps saved versions linked after archive import and includes them in single
   expect((await restored.exportArchive(destination.id)).versions).toHaveLength(1);
 });
 
+it("restores split backups atomically, keeps Trash and recovery flags, and recognizes a retry", async () => {
+  const activeBook = createNotebook("Active notebook");
+  const deletedAt = "2026-09-12T00:00:00.000Z";
+  const archivedBook = { ...createNotebook("Archived notebook"), deletedAt };
+  const active = createPage(activeBook.id, "Active page");
+  const deleted = { ...createPage(activeBook.id, "Trashed page"), deletedAt };
+  const recovered = { ...createPage(activeBook.id, "Recovered page"), formatVersion: 2, conflictOf: active.id };
+  const child = createPage(archivedBook.id, "Child under the archived notebook");
+  const metadata = { version: 1 as const, exportedAt: deletedAt, account: "backup source" };
+  const bundle = {
+    importID: crypto.randomUUID(),
+    parts: [
+      { ...metadata, notebooks: [activeBook, archivedBook], pages: [active] },
+      { ...metadata, notebooks: [], pages: [deleted, recovered, child] },
+    ],
+  };
+  const { engine, db } = openEngine();
+  db.exec("CREATE TRIGGER fail_restore BEFORE INSERT ON pages WHEN json_extract(NEW.json, '$.title') = 'Trashed page' BEGIN SELECT RAISE(ABORT, 'Disk full'); END");
+  await expect(engine.importArchive(bundle)).rejects.toThrow("Disk full");
+  expect(await engine.listNotebooks(true)).toHaveLength(0);
+  expect(await engine.pendingOperations()).toHaveLength(0);
+  db.exec("DROP TRIGGER fail_restore");
+  await expect(engine.importArchive(bundle)).resolves.toEqual({ notebooks: 2, pages: 4 });
+  await expect(engine.importArchive(bundle)).resolves.toEqual({ notebooks: 0, pages: 0, alreadyImported: true });
+
+  const [visibleBook] = await engine.listNotebooks();
+  const trashedBook = (await engine.listNotebooks(true)).find(book => book.deletedAt === deletedAt)!;
+  expect(visibleBook!.title).toBe("Active notebook");
+  expect(trashedBook.title).toBe("Archived notebook");
+  const pages = await engine.listPages(visibleBook!.id, true);
+  expect(pages.find(page => page.title === deleted.title)?.deletedAt).toBe(deletedAt);
+  expect(pages.find(page => page.title === recovered.title)?.conflictOf).toBe(pages.find(page => page.title === active.title)?.id);
+  const [archivedChild] = await engine.listPages(trashedBook.id, true);
+  expect(archivedChild).toMatchObject({ title: child.title, deletedAt: null });
+  const relevantOperations = (await engine.pendingOperations()).filter(op => [trashedBook.id, archivedChild!.id].includes(op.entityId));
+  expect(relevantOperations.map(op => [op.entityType, op.action])).toEqual([["notebook", "upsert"], ["page", "upsert"], ["notebook", "delete"]]);
+  await engine.restoreNotebook(trashedBook.id);
+  expect((await engine.listPages(trashedBook.id))[0]?.title).toBe(child.title);
+});
+
 it("preserves valid small page, image and stroke dimensions through backup round trips", async () => {
   const { engine } = openEngine();
   const book = createNotebook("Small format");

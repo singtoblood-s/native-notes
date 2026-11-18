@@ -4,7 +4,7 @@ import { FloatingTools } from "../src/floating-tools";
 let controller: AbortController;
 function setup() {
   controller = new AbortController();
-  document.body.innerHTML = `<main id="editor-workspace"><header class="topbar"><div class="top-actions"></div><button id="sync-button" aria-label="Saved locally" data-state="saved"><span data-sync-icon>✓</span></button></header><div id="editor-content"><div class="editor-toolbar"><button class="tool-button active" id="pen-tool"><svg></svg></button></div><div class="page-bar"></div><div class="stage-foot"><span id="tool-name">Pen</span></div></div></main>`;
+  document.body.innerHTML = `<main id="editor-workspace"><header class="topbar"><div class="top-actions"></div><button id="sync-button" aria-label="Saved locally" data-state="saved"><span data-sync-icon>✓</span></button></header><div id="editor-content"><div class="editor-toolbar"><button class="tool-button active" id="pen-tool"><svg></svg></button><button id="highlighter-tool"></button><button id="eraser-tool"></button><button id="undo-button"></button></div><div class="page-bar"></div><div class="stage-foot"><span id="tool-name">Pen</span></div></div></main>`;
   const closeMenus = vi.fn();
   const canToggle = vi.fn(() => true);
   new FloatingTools(controller.signal, closeMenus, canToggle);
@@ -26,9 +26,12 @@ it("preserves controls, guards active strokes and restores the docked layout", (
   expect(element("floating-tools-button").hidden).toBe(false);
   expect(element("floating-tools-panel").hidden).toBe(true);
   element("floating-tools-button").click();
-  expect(element("floating-tools-panel").contains(pen)).toBe(true);
+  expect(pen.parentElement?.classList.contains("floating-tools-quick")).toBe(true);
+  expect(element("floating-tools-details").hidden).toBe(true);
   pen.click();
   expect(clicked).toHaveBeenCalledOnce();
+  element("more-floating-tools").click();
+  expect(element("floating-tools-details").hidden).toBe(false);
   element("dock-tools").click();
   expect(element("editor-content").contains(pen)).toBe(true);
   expect(document.activeElement).toBe(element("float-tools"));

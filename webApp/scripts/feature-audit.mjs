@@ -17,7 +17,7 @@ const archive = {
   version: 1, account: "QA", exportedAt: timestamp,
   notebooks: [book(ids[0], "Alpha"), book(ids[1], "Beta")],
   pages: [sheet(ids[2], ids[0], "One", "First", 0), sheet(ids[3], ids[0], "Two", "Cafe\u0301\n THAI", 1), sheet(ids[4], ids[1], "Three", "ข้อความครบ\n".repeat(100), 0)],
-  versions: [{ id: ids[5], entityType: "page", entityId: ids[3], payload: sheet(ids[3], ids[0], "Earlier version", "Preserved history", 1), createdAt: timestamp, reason: "QA", sequence: 0 }],
+  versions: [{ id: ids[5], entityType: "page", entityId: ids[3], payload: sheet(ids[3], ids[0], "Earlier version", "An old copy with a long introduction. ".repeat(12) + "Preserved history <fixture>", 1), createdAt: timestamp, reason: "QA", sequence: 0 }],
 };
 let browser;
 try {
@@ -44,6 +44,7 @@ try {
   await page.locator("#cancel-settings").click();
   await page.locator("#library-search").fill("café thai");
   assert.equal(await page.locator("[data-search-page]").count(), 1);
+  assert.equal(await page.locator("[data-search-page] mark").textContent(), "Café THAI");
   await page.screenshot({ animations: "disabled", path: `${output}/search.png` });
   await page.locator("[data-search-page]").click();
   await page.waitForFunction(() => document.querySelector("#page-title-label").textContent === "Two");
@@ -96,9 +97,14 @@ try {
   assert.equal(await page.locator("#library-sort").inputValue(), "name");
   assert.equal(await page.locator("#library-layout").getAttribute("aria-pressed"), "true");
   await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator("#library-tab-search").click();
   await page.locator("#library-search").fill("Preserved history");
   await page.screenshot({ animations: "disabled", path: `${output}/mobile-search.png` });
   assert.equal(await page.locator("[data-search-page]").count(), 1);
+  assert.equal(await page.locator("[data-search-page] mark").textContent(), "Preserved history");
+  assert.match(await page.locator("[data-search-page] small").textContent(), /<fixture>/);
+  assert(await page.evaluate(() => document.querySelector("#library-page-results").nextElementSibling.id === "library-books"));
+  assert((await page.locator("[data-search-page]").boundingBox()).y < 844);
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
   await page.locator("#library-documents").click();
   await page.locator("#library-settings").click();

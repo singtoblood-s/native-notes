@@ -71,23 +71,52 @@ describe("account-bound browser sessions", () => {
     expect(localStorage.getItem("notepad.workspaces")).toContain("second");
   });
 
+  it("remembers a previous sign-in in a new tab and migrates a tab-only session", () => {
+    setEndpoint("https://sync.example.test");
+    sessionStorage.setItem("notepad.session", JSON.stringify({ ...response("ACCOUNT"), endpoint: getEndpoint() }));
+    const migrated = new AuthSession();
+    expect(migrated.session?.sessionToken).toBe("token-ACCOUNT");
+    expect(sessionStorage.getItem("notepad.session")).toBeNull();
+    sessionStorage.clear();
+    const reopened = new AuthSession();
+    expect(reopened.canOpenWorkspace).toBe(true);
+    expect(reopened.session?.sessionToken).toBe("token-ACCOUNT");
+  });
+
   it("keeps an expired account workspace offline until explicit sign-out", () => {
     setEndpoint("https://sync.example.test");
     const session = new AuthSession();
-    session.set(response("ACCOUNT"));
-    sessionStorage.clear();
+    session.set({ ...response("ACCOUNT"), expiresAt: new Date(Date.now() - 1000).toISOString() });
 
     const restored = new AuthSession();
     expect(restored.session).toBeNull();
+    expect(restored.canOpenWorkspace).toBe(true);
     expect(restored.workspaceKey).toBe("https://sync.example.test:account");
     expect(restored.workspaceIdentifier).toBe("ACCOUNT@example.test");
     expect(restored.boundEndpoint).toBe("https://sync.example.test");
 
     restored.clear();
+    expect(restored.canOpenWorkspace).toBe(false);
+    expect(session.canOpenWorkspace).toBe(false);
+    expect(new AuthSession().canOpenWorkspace).toBe(false);
     expect(restored.workspaceKey).toBeNull();
     expect(restored.workspaceIdentifier).toBeNull();
     expect(restored.boundEndpoint).toBeNull();
     expect(localStorage.getItem("notepad.workspace")).toBeNull();
+  });
+
+  it("does not expose or remove a different account's remembered session from an older tab", () => {
+    setEndpoint("https://sync.example.test");
+    const firstTab = new AuthSession();
+    firstTab.set(response("FIRST"));
+    const secondTab = new AuthSession();
+    secondTab.set(response("SECOND"));
+
+    expect(firstTab.canOpenWorkspace).toBe(false);
+    expect(firstTab.session).toBeNull();
+    firstTab.clear();
+    expect(secondTab.canOpenWorkspace).toBe(true);
+    expect(new AuthSession().session?.user.id).toBe("second");
   });
 
   it("migrates a persisted legacy endpoint when the build has a valid canonical HTTPS endpoint", () => {

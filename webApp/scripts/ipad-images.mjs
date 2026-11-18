@@ -71,13 +71,22 @@ try {
   const imageSource = await page.locator(".image-select img").getAttribute("src");
   await page.waitForFunction(() => window.qa.saves.some(save => save.images === 1));
   assert.equal(await page.evaluate(() => window.qa.persistence), "indexeddb");
+  await page.locator("#zoom-in").click();
+  await page.locator("#zoom-in").click();
+  const paperPosition = () => page.evaluate(() => {
+    const scroll = document.querySelector("#paper-scroll");
+    const rect = document.querySelector("#ink-canvas").getBoundingClientRect();
+    return { x: rect.x, y: rect.y, width: rect.width, scrollTop: scroll.scrollTop, scrollLeft: scroll.scrollLeft };
+  });
+  await page.evaluate(() => document.querySelector("#paper-scroll").scrollTo(80, 120));
+  const writingPosition = await paperPosition();
   const frames = [];
   for (const tool of ["pen", "highlighter"]) {
     await page.locator(`#${tool}-tool`).click();
     frames.push(...await page.evaluate(async () => {
       const canvas = document.querySelector("#ink-canvas");
       const rect = canvas.getBoundingClientRect();
-      const event = (type, x, y) => canvas.dispatchEvent(new PointerEvent(type, { pointerId: 11, pointerType: "pen", bubbles: true, cancelable: true, isPrimary: true, button: 0, buttons: type === "pointerup" ? 0 : 1, pressure: .5, clientX: rect.left + x, clientY: rect.top + y }));
+      const event = (type, x, y) => canvas.dispatchEvent(new PointerEvent(type, { pointerId: 11, pointerType: "pen", bubbles: true, cancelable: true, isPrimary: true, button: 0, buttons: type === "pointerup" ? 0 : 1, pressure: type === "pointerup" ? 0 : .5, clientX: rect.left + x, clientY: rect.top + y }));
       const times = []; let previous = performance.now();
       event("pointerdown", 90, 180);
       for (let index = 0; index < 40; index++) {
@@ -96,8 +105,38 @@ try {
     const a = ink.getBoundingClientRect(); const b = background.getBoundingClientRect();
     return { delta: Math.abs(a.x-b.x) + Math.abs(a.y-b.y) + Math.abs(a.width-b.width) + Math.abs(a.height-b.height), imagePixel: [...background.getContext("2d").getImageData(300, 300, 1, 1).data] };
   });
-  assert(geometry.delta < 5, "Photo and ink layers must align");
+  assert(geometry.delta < .05, "Preview ink and committed ink must have identical page coordinates");
   assert.equal(geometry.imagePixel[3], 255);
+  assert.deepEqual(await paperPosition(), writingPosition, "Lifting the Pencil and saving must not move the zoomed page");
+
+  let notebookChange;
+  await page.route("https://qa.invalid/v1/sync/**", route => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const headers = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Authorization, Content-Type", "Access-Control-Allow-Methods": "GET, POST, OPTIONS" };
+    if (request.method() === "OPTIONS") return route.fulfill({ status: 204, headers });
+    if (url.pathname.endsWith("/push")) {
+      const results = request.postDataJSON().operations.map(operation => {
+        const revision = operation.baseRevision + 1;
+        if (operation.entityType === "notebook") {
+          notebookChange = {
+            sequence: 1, entityType: "notebook", entityId: operation.entityId, revision: revision + 1, action: "upsert",
+            payload: { ...operation.payload, title: "Synced iPad notebook", revision: revision + 1, updatedAt: new Date().toISOString() },
+          };
+        }
+        return { opId: operation.opId, status: "acked", revision };
+      });
+      return route.fulfill({ headers, json: { results, cursor: 0 } });
+    }
+    const cursor = Number(url.searchParams.get("cursor"));
+    return route.fulfill({ headers, json: {
+      changes: notebookChange && cursor === 0 ? [notebookChange] : [],
+      nextCursor: notebookChange ? 1 : 0, hasMore: false,
+    } });
+  });
+  await page.locator("#sync-button").click();
+  await page.waitForFunction(() => document.querySelector("#notebook-name").textContent === "Synced iPad notebook");
+  assert.deepEqual(await paperPosition(), writingPosition, "A pulled change must preserve the active page's zoom and scroll position");
   await mkdir("test-results/ipad", { recursive: true });
   await page.screenshot({ path: `test-results/ipad/${engine.name()}-photo-ink.png` });
   await page.locator("#add-page").click();

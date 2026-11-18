@@ -270,6 +270,10 @@ export class SyncCoordinator {
       if (this.started && this.generation === generation && !this.requested) this.schedule(this.intervalMs, "periodic");
     } catch (error) {
       await this.refreshPending(store, generation);
+      if (!this.isRunCurrent(generation, store, session)) {
+        if (this.started && this.generation === generation && !this.requested) this.schedule(0, "auth");
+        return;
+      }
       const status = error instanceof SyncHttpError && error.status === 401 ? "needs-login" : this.isOnline() ? "error" : "offline";
       const message = status === "offline" || status === "needs-login" ? null : safeError(error);
       this.publishIfCurrent(generation, { state: status, error: message });
@@ -306,7 +310,8 @@ export class SyncCoordinator {
   private isRunCurrent(generation: number, store: NoteStore, session: AuthResponse): boolean {
     if (!this.started || generation !== this.generation) return false;
     const endpoint = getEndpoint();
-    return Boolean(endpoint && store.accountKey === `${endpoint}:${session.user.id.toLowerCase()}`);
+    return store === this.getStore() && this.getSession()?.sessionToken === session.sessionToken &&
+      Boolean(endpoint && store.accountKey === `${endpoint}:${session.user.id.toLowerCase()}`);
   }
 
   private publish(patch: Partial<SyncCoordinatorStatus>): void {
