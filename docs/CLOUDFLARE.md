@@ -135,6 +135,20 @@ keeps its conservative row estimate below 2,000,000 bytes for imported legacy
 rows; newly synced large snapshots use the additive chunk table and remain
 readable through documents, changes, conflicts, and retries.
 
+The Worker compresses snapshots and individual chunks of at least 8 KiB
+when gzip saves at least 10 percent after encoding. Pull responses use
+the original UTF-8 size for pagination. Both compressed and legacy plain
+rows produce the same sync JSON. Retain a Worker with this codec when
+rolling back a deployment that has written compressed rows.
+
+If D1 refuses a push because storage is full, the next authenticated push
+runs a bounded recovery pass over that account's history. Each update checks
+that the compressed value expands to the original and that the stored row
+still matches. Matching current documents can share the same encoding. The
+client retries the original operation with its existing ID. Revision history,
+chunk references and sync receipts are preserved. Further failed pushes resume
+the scan, with a one-hour cooldown after a complete sweep.
+
 See [D1 limits](https://developers.cloudflare.com/d1/platform/limits/),
 [D1 import/export](https://developers.cloudflare.com/d1/best-practices/import-export-data/),
 and [Wrangler D1 commands](https://developers.cloudflare.com/d1/wrangler-commands/)

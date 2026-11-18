@@ -136,6 +136,21 @@ describe("PaperCanvas pointer contract", () => {
     canvasController.destroy();
   });
 
+  it("uses the last touching Pencil sample when lifting reports an off-page hover", () => {
+    const { select, drag, original, canvasController, canvas, changes } = selectionFixture();
+    select("pen");
+    drag("pointerdown", 20, 20);
+    drag("pointermove", 30, 30);
+    const contact = pointer("pointermove", { clientX: 45, clientY: 50, pressure: .2, buttons: 1 });
+    const hover = pointer("pointermove", { clientX: 1000, clientY: -1000, pressure: 0, buttons: 0 });
+    canvas.dispatchEvent(pointer("pointerup", { clientX: -2000, clientY: 2000, pressure: 0, buttons: 0,
+      getCoalescedEvents: () => [contact, hover] }));
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(changes.mock.calls[0]![0][0].points[0]).toEqual({ ...original[0]!.points[0], x: 70, y: 84 });
+    expect(changes.mock.calls[0]![0][1]).toEqual(original[1]);
+    canvasController.destroy();
+  });
+
   it("clamps a selection at page edges and discards cancelled or read-only gestures", () => {
     const { select, drag, original, canvasController, changes } = selectionFixture();
     select("pen");

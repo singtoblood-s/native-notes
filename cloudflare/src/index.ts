@@ -1,6 +1,8 @@
 import { pbkdf2Async } from "@noble/hashes/pbkdf2.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { DurableObject } from "cloudflare:workers";
+import { compactHistory, type CompactionCursor } from "./compact-history";
+import { packSnapshot, unpackSnapshot, snapshotSizeSql } from "./snapshot-codec";
 
 export interface Env {
   DB: D1Database;
@@ -12,6 +14,12 @@ type JsonRecord = Record<string, unknown>;
 type EntityType = "notebook" | "page";
 type SyncAction = "upsert" | "delete";
 type PushStatus = "acked" | "conflict" | "rejected";
+
+interface StorageRecovery {
+  pending: boolean;
+  cursor?: CompactionCursor;
+  nextSweepAt?: number;
+}
 
 interface Operation {
   opId: string;
@@ -144,7 +152,7 @@ type WritePlan = AckPlan | FinalPlan;
 
 interface PayloadChunks {
   storedPayload: string;
-  chunks: string[];
+  chunks: { data: string; packed: boolean }[];
 }
 
 interface RawChange {
@@ -247,6 +255,33 @@ export class ApiDurableObject extends DurableObject<Env> {
     return this.state.blockConcurrencyWhile(() => handleRequest(request, this.runtimeEnv, this));
   }
 
+  async syncPush(userId: string, operations: Operation[]) {
+    const key = "storage-recovery:" + userId;
+    const recovery = await this.state.storage.get<StorageRecovery>(key);
+    if (recovery?.pending) {
+      // Leave the full D1 query budget available for the following write.
+      // Even if maintenance fails, the next request can try the original write.
+      await this.state.storage.put(key, { ...recovery, pending: false });
+      const result = await compactHistory(this.runtimeEnv.DB, userId, recovery.cursor);
+      const next: StorageRecovery = result.finished
+        ? { pending: false, nextSweepAt: Date.now() + 60 * 60_000 }
+        : { pending: false, cursor: result.cursor };
+      await this.state.storage.put(key, next);
+      if (result.finished && !result.bytesSaved) throw storageFull();
+      throw new ApiFailure(503, "sync_space_recovery", "The sync server is reclaiming storage. Your changes are queued on this device for retry.");
+    }
+    try {
+      return await push(this.runtimeEnv.DB, userId, operations);
+    } catch (error) {
+      if (error instanceof ApiFailure) throw error;
+      const failure = syncFailure(error, true);
+      if (failure.code === "sync_storage_full" && (recovery?.nextSweepAt ?? 0) <= Date.now()) {
+        await this.state.storage.put(key, { ...recovery, pending: true });
+      }
+      throw failure;
+    }
+  }
+
   getClientLimiter(): LoginRateLimiter {
     return this.clientLimiter;
   }
@@ -297,7 +332,7 @@ async function handleRequest(request: Request, env: Env, object: ApiDurableObjec
     if (url.pathname === "/v1/sync/push" && request.method === "POST") {
       const user = await authenticate(env.DB, bearerToken(request));
       const body = parsePushRequest(await readJsonBody(request, MAX_SYNC_BODY));
-      return jsonResponse(await push(env.DB, user.id, body), 200, cors);
+      return jsonResponse(await object.syncPush(user.id, body), 200, cors);
     }
     if (url.pathname === "/v1/sync/pull" && request.method === "GET") {
       const user = await authenticate(env.DB, bearerToken(request));
@@ -308,8 +343,39 @@ async function handleRequest(request: Request, env: Env, object: ApiDurableObjec
     throw new ApiFailure(404, "not_found", "Not found");
   } catch (error) {
     if (error instanceof ApiFailure) return errorResponse(error, cors);
+    const path = new URL(request.url).pathname;
+    if (path === "/v1/sync/push" || path === "/v1/sync/pull") {
+      return errorResponse(syncFailure(error, path.endsWith("/push")), cors);
+    }
     return errorResponse(new ApiFailure(500, "internal_error", "The server could not complete the request"), cors);
   }
+}
+
+function storageFull(): ApiFailure {
+  return new ApiFailure(507, "sync_storage_full", "The sync server is out of storage. Changes stay on this device until space is available.");
+}
+
+function syncFailure(error: unknown, uploading: boolean): ApiFailure {
+  // D1 errors may include SQL or bound values. Return only predefined messages.
+  const detail = error instanceof Error ? [error.message, error.cause instanceof Error ? error.cause.message : ""].join(" ") : "";
+  if (/exceeded maximum db size|storage limit|SQLITE_FULL|database or disk is full/i.test(detail)) {
+    return storageFull();
+  }
+  if (/daily row (read|write) limit/i.test(detail)) {
+    return new ApiFailure(503, "sync_daily_limit", "The sync server reached its daily database limit. Your device will retry later.");
+  }
+  if (/no such table|no such column/i.test(detail)) {
+    return new ApiFailure(503, "sync_schema_unavailable", "The sync database needs an update. Your device will keep the pending changes.");
+  }
+  if (/SQLITE_TOOBIG|too (?:big|large|long)|exceed(?:ed|s) (?:the )?maximum (?:request|response|row|statement|query|length|size)/i.test(detail)) {
+    return new ApiFailure(413, "sync_batch_too_large", "The sync database could not process this batch at its current size.");
+  }
+  if (/overloaded|timed out|exceeded timeout|network connection lost|reset|exceeded.*(?:CPU|memory|queries)/i.test(detail)) {
+    return new ApiFailure(503, "sync_database_busy", "The sync database is busy. Your device will retry.");
+  }
+  return uploading
+    ? new ApiFailure(500, "sync_upload_failed", "The server could not save the uploaded changes. They remain on this device for retry.")
+    : new ApiFailure(500, "sync_download_failed", "The server could not load changes for this device. Sync will retry.");
 }
 
 function corsHeaders(request: Request, env: Env): Headers {
@@ -873,8 +939,12 @@ function canonicalPayload(value: NotebookPayload | PagePayload, action: SyncActi
 
 async function payloadChunks(payload: string): Promise<PayloadChunks> {
   const bytes = textEncoder.encode(payload);
-  if (bytes.byteLength <= INLINE_PAYLOAD_BYTES) return { storedPayload: payload, chunks: [] };
-  const chunks = splitUtf8(bytes);
+  if (bytes.byteLength <= INLINE_PAYLOAD_BYTES) return { storedPayload: await packSnapshot(payload), chunks: [] };
+  const chunks: PayloadChunks["chunks"] = [];
+  for (const raw of splitUtf8(bytes)) {
+    const data = await packSnapshot(raw);
+    chunks.push({ data, packed: data !== raw });
+  }
   const payloadRef = await sha256Base64(payload);
   return {
     storedPayload: `${PAYLOAD_MARKER_PREFIX}${payloadRef}:${bytes.byteLength}:${chunks.length}`,
@@ -888,7 +958,7 @@ function splitUtf8(bytes: Uint8Array): string[] {
     let end = Math.min(bytes.byteLength, start + PAYLOAD_CHUNK_BYTES);
     while (end < bytes.byteLength && (bytes[end]! & 0xc0) === 0x80) end -= 1;
     if (end <= start) throw new ApiFailure(500, "internal_error", "The server could not split a note payload");
-    chunks.push(new TextDecoder().decode(bytes.slice(start, end)));
+    chunks.push(new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes.subarray(start, end)));
     start = end;
   }
   return chunks;
@@ -921,13 +991,13 @@ async function hydratePayloads(db: D1Database, userId: string, storedPayloads: s
   for (const group of chunks(markers, MAX_SQL_PARAMETERS - 1)) {
     const placeholders = group.map(() => "?").join(",");
     statements.push(db.prepare(
-      `SELECT payload_ref, chunk_index, payload FROM payload_chunks WHERE user_id = ? AND payload_ref IN (${placeholders}) ORDER BY payload_ref, chunk_index`,
+      `SELECT payload_ref, chunk_index, typeof(payload) AS kind, CAST(payload AS TEXT) AS payload FROM payload_chunks WHERE user_id = ? AND payload_ref IN (${placeholders}) ORDER BY payload_ref, chunk_index`,
     ).bind(userId, ...group.map((marker) => marker.ref)));
   }
   const rows = await db.batch(statements);
   for (const batch of rows) {
     for (const row of rowsFrom(batch)) {
-      const typed = row as { payload_ref?: unknown; chunk_index?: unknown; payload?: unknown };
+      const typed = row as { payload_ref?: unknown; chunk_index?: unknown; payload?: unknown; kind?: unknown };
       if (typeof typed.payload_ref !== "string" || typeof typed.payload !== "string") {
         throw new ApiFailure(500, "internal_error", "The server could not complete the request");
       }
@@ -936,7 +1006,8 @@ async function hydratePayloads(db: D1Database, userId: string, storedPayloads: s
       if (index === null || !target || index !== target.length) {
         throw new ApiFailure(500, "internal_error", "The server could not complete the request");
       }
-      target.push(typed.payload);
+      // A legacy TEXT chunk may begin with any user-written text, including the codec prefix.
+      target.push(typed.kind === "blob" ? await unpackSnapshot(typed.payload, PAYLOAD_CHUNK_BYTES) : typed.payload);
     }
   }
   const result = new Map<string, string>();
@@ -961,7 +1032,7 @@ async function hydrateDocument(db: D1Database, userId: string, document: StoredD
       .bind(userId, document.entityType, document.entityId)
       .first<{ payload?: unknown }>();
     if (typeof row?.payload === "string") {
-      payload = row.payload;
+      payload = await unpackSnapshot(row.payload, MAX_PAYLOAD_BYTES);
       document.storedPayload = row.payload;
     }
   }
@@ -1208,7 +1279,7 @@ async function hydrateStoredOperation(db: D1Database, userId: string, operation:
     .first<{ server_payload?: unknown }>();
   if (typeof row?.server_payload !== "string") throw new ApiFailure(500, "internal_error", "The server could not complete the request");
   operation.serverPayloadStorage = row.server_payload;
-  operation.server_payload = row.server_payload;
+  operation.server_payload = await unpackSnapshot(row.server_payload, MAX_PAYLOAD_BYTES);
 }
 
 async function loadDocuments(db: D1Database, userId: string, operations: Operation[]): Promise<Map<string, StoredDocument>> {
@@ -1390,10 +1461,10 @@ function ackStatements(db: D1Database, userId: string, plan: AckPlan): D1Prepare
   const marker = stored.chunks.length > 0 ? parsePayloadMarker(stored.storedPayload) : null;
   if (stored.chunks.length > 0 && !marker) throw new ApiFailure(500, "internal_error", "The server could not store a note payload");
   const chunkWrites = chunks(stored.chunks, MAX_CHUNKS_PER_STATEMENT).map((group, groupIndex) => {
-    const values = group.map(() => "(?, ?, ?, ?)").join(",");
+    const values = group.map(chunk => chunk.packed ? "(?, ?, ?, CAST(? AS BLOB))" : "(?, ?, ?, ?)").join(",");
     const bindings: unknown[] = [];
     for (let index = 0; index < group.length; index += 1) {
-      bindings.push(userId, marker!.ref, groupIndex * MAX_CHUNKS_PER_STATEMENT + index, group[index]!);
+      bindings.push(userId, marker!.ref, groupIndex * MAX_CHUNKS_PER_STATEMENT + index, group[index]!.data);
     }
     return db.prepare(
       `WITH input(user_id, payload_ref, chunk_index, payload) AS (VALUES ${values})
@@ -1429,7 +1500,7 @@ async function pull(db: D1Database, userId: string, cursor: number, limit: numbe
     db.prepare(
       `SELECT sequence, entity_type, entity_id, revision, action,
          CASE WHEN substr(payload, 1, ${PAYLOAD_MARKER_PREFIX.length}) = '${PAYLOAD_MARKER_PREFIX}' THEN payload ELSE '' END AS payload_marker,
-         length(CAST(payload AS BLOB)) AS payload_bytes
+         ${snapshotSizeSql} AS payload_bytes
        FROM changes WHERE user_id = ? AND sequence > ? ORDER BY sequence LIMIT ?`,
     ).bind(userId, cursor, limit + 1),
   ]);
@@ -1490,7 +1561,7 @@ async function pull(db: D1Database, userId: string, cursor: number, limit: numbe
     for (const change of inline) {
       const payload = payloadBySequence.get(change.sequence);
       if (payload === undefined) throw new ApiFailure(500, "internal_error", "The server could not complete the request");
-      change.storedPayload = payload;
+      change.storedPayload = await unpackSnapshot(payload, MAX_PAYLOAD_BYTES);
     }
   }
   const hydrated = await hydratePayloads(db, userId, selected.map((change) => change.storedPayload));

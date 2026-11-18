@@ -2,6 +2,7 @@ import { exports as workerExports, env } from "cloudflare:workers";
 import { reset } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { derivePassword } from "../src/index";
+import { unpackSnapshot } from "../src/snapshot-codec";
 
 const ORIGIN = "https://singtoblood-s.github.io";
 const jsonHeaders = { "Content-Type": "application/json", Origin: ORIGIN };
@@ -192,6 +193,79 @@ describe("native-notes Cloudflare Worker", () => {
     expect(row?.request_hash).toBe("JGgMdGiaJk2Ec31uNUn_sBgwSx0lf-M35NDuP-_9ado");
   });
 
+  it("keeps packed inline pages readable through pull, conflict receipts and retry", async () => {
+    const { token } = await auth();
+    const bookId = id(), pageId = id();
+    const text = "บันทึกการเขียน 🖋\n".repeat(8_000);
+    const data = { ...page(pageId, bookId), text };
+    await push(token, [operation("notebook", bookId, notebook(bookId))]);
+    const save = operation("page", pageId, data);
+    const result = await push(token, [save]);
+    expect(result.results[0]).toMatchObject({ status: "acked", revision: 1 });
+    const encoded = await env.DB.prepare("SELECT payload FROM documents WHERE entity_id = ?").bind(pageId).first<string>("payload");
+    expect(encoded).toMatch(/^@gzip:/);
+    expect(encoded!.length).toBeLessThan(text.length / 10);
+    expect((await push(token, [save])).results[0]).toEqual(result.results[0]);
+    const response = await request("/v1/sync/pull?cursor=1", { headers: { Authorization: `Bearer ${token}` } });
+    const history = await response.json() as { changes: { payload: { text: string } }[] };
+    expect(history.changes[0]?.payload.text).toBe(text);
+    const stale = operation("page", pageId, { ...data, text: "Different edit" }, 0);
+    const conflict = await push(token, [stale]);
+    expect(conflict.results[0]).toMatchObject({ status: "conflict", serverPayload: { text } });
+    expect((await push(token, [stale])).results).toEqual(conflict.results);
+  });
+
+  it("recovers from full storage on a separate push and saves the retried edit exactly once", async () => {
+    const { token, userId } = await auth();
+    const bookId = id(), pageId = id();
+    const priorText = "บันทึกเดิม 🖋\n".repeat(4000);
+    const priorPage = { ...page(pageId, bookId), text: priorText };
+    await push(token, [operation("notebook", bookId, notebook(bookId)), operation("page", pageId, priorPage)]);
+    const stored = await env.DB.prepare("SELECT payload FROM changes WHERE user_id=? AND entity_id=? AND revision=1")
+      .bind(userId, pageId).first<string>("payload");
+    expect(stored).toMatch(/^@gzip:/);
+    const raw = await unpackSnapshot(stored!, 1_000_000);
+    // Simulate an existing account that still has pre-compression history.
+    await env.DB.batch([
+      env.DB.prepare("UPDATE changes SET payload=? WHERE user_id=? AND entity_id=? AND revision=1").bind(raw, userId, pageId),
+      env.DB.prepare("UPDATE documents SET payload=? WHERE user_id=? AND entity_id=? AND revision=1").bind(raw, userId, pageId),
+    ]);
+    const latestText = priorText + "new ink";
+    const edit = operation("page", pageId, { ...priorPage, text: latestText }, 1);
+    const headers = { ...jsonHeaders, Authorization: `Bearer ${token}` };
+    const send = () => request("/v1/sync/push", { method: "POST", headers, body: JSON.stringify({ operations: [edit] }) });
+    // SQLite does not accept bound parameters in trigger definitions. The ID is a freshly issued UUID.
+    expect(userId).toMatch(/^[a-f0-9-]{36}$/);
+    await env.DB.prepare(`CREATE TRIGGER qa_full_storage BEFORE INSERT ON changes
+      WHEN new.user_id='${userId}' BEGIN SELECT RAISE(ABORT, 'SQLITE_FULL: database or disk is full'); END`).run();
+    try {
+      const full = await send();
+      expect(full.status).toBe(507);
+      expect(await full.json()).toMatchObject({ error: { code: "sync_storage_full" } });
+      const recovering = await send();
+      expect(recovering.status).toBe(503);
+      expect(await recovering.json()).toMatchObject({ error: { code: "sync_space_recovery" } });
+      expect(await env.DB.prepare("SELECT substr(payload,1,6) FROM changes WHERE user_id=? AND entity_id=? AND revision=1")
+        .bind(userId, pageId).first("substr(payload,1,6)")).toBe("@gzip:");
+      expect(await env.DB.prepare("SELECT count(*) AS n FROM sync_operations WHERE user_id=? AND op_id=?")
+        .bind(userId, edit.opId).first("n")).toBe(0);
+    } finally {
+      await env.DB.prepare("DROP TRIGGER qa_full_storage").run();
+    }
+    const accepted = await send();
+    expect(accepted.status).toBe(200);
+    const receipt = await accepted.json();
+    expect(receipt).toMatchObject({ results: [{ opId: edit.opId, status: "acked", revision: 2 }] });
+    const replay = await send();
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toEqual(receipt);
+    const response = await request("/v1/sync/pull?cursor=0&limit=100", { headers });
+    expect(response.status).toBe(200);
+    const history = await response.json() as { changes: { entityId: string; revision: number; payload: { text: string } }[] };
+    expect(history.changes.filter(item => item.entityId === pageId).map(item => [item.revision, item.payload.text]))
+      .toEqual([[1, priorText], [2, latestText]]);
+  }, 30_000);
+
   it("stores and hydrates a large page without losing ink across retry, conflict, pull, or delete", async () => {
     const { token } = await auth();
     const notebookId = id();
@@ -211,6 +285,9 @@ describe("native-notes Cloudflare Worker", () => {
     expect(documentRow?.payload).toMatch(/^@payload:[A-Za-z0-9_-]{43}:/);
     const chunkCount = await env.DB.prepare("SELECT COUNT(*) AS count FROM payload_chunks").first<{ count: number }>();
     expect(Number(chunkCount?.count)).toBeGreaterThan(1);
+    const bytes = await env.DB.prepare("SELECT sum(length(payload)) FROM payload_chunks WHERE typeof(payload)='blob'").first<number>("sum(length(payload))");
+    expect(bytes).toBeGreaterThan(0);
+    expect(bytes).toBeLessThan(500_000);
 
     const retry = await push(token, [pageOperation]);
     expect(retry.results[0]).toEqual(first.results[0]);
