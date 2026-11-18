@@ -251,7 +251,7 @@ try {
     await page.locator("#ink-canvas").dispatchEvent("pointerdown", contact);
     await page.locator("#ink-canvas").dispatchEvent("pointermove", { ...contact, clientX: mode === "horizontal" ? 350 : 450, clientY: mode === "continuous" ? 350 : 450 });
     const afterDrag = await page.locator("#paper-scroll").evaluate((element, mode) => mode === "horizontal" ? element.scrollLeft : element.scrollTop, mode);
-    assert(Math.abs(afterDrag - beforeDrag - 100) < 2, `${mode}: hand dragging after zoom must scroll between sheets`);
+    assert.equal(afterDrag, beforeDrag, `${mode}: one finger must leave the zoomed sheet stationary in Hand mode`);
     await page.locator("#ink-canvas").dispatchEvent("pointercancel", contact);
     await page.locator("#pen-tool").click();
     await page.screenshot({ path: `${output}/${mode}-zoom.png` });

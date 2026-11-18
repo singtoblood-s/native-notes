@@ -67,6 +67,18 @@ try {
       assert(Math.abs(await paperWidth() - original) < 2, "Typing in a field must not change paper zoom");
       assert.equal(await webScale(), 1);
       await page.locator("#close-inspector").click();
+      for (const mode of ["continuous", "horizontal", "paged"]) {
+        await page.locator("#page-view-mode").selectOption(mode);
+        await page.locator("#fit-button").click();
+        await page.locator("#zoom-in").click();
+        await page.locator("#zoom-in").click();
+        for (const tool of ["pen", "hand", "select"]) {
+          await page.locator(`#${tool}-tool`).click();
+          await checkFingerCounts(page, mode, tool);
+        }
+      }
+      await page.locator("#page-view-mode").selectOption("continuous");
+      await page.locator("#fit-button").click();
       if (engine === chromium) {
         const session = await context.newCDPSession(page);
         const pinch = async (y, expectedPaperZoom) => {
@@ -84,6 +96,22 @@ try {
         const area = await page.locator("#paper-scroll").boundingBox();
         await pinch(area.y + 180, true);
         await page.locator("#fit-button").click();
+        const nativeState = () => page.evaluate(() => {
+          const scroll = document.querySelector("#paper-scroll");
+          return [scroll.scrollLeft, scroll.scrollTop, document.querySelector("#paper").style.transform];
+        });
+        const initial = await nativeState();
+        const points = [{ id: 1, x: 300, y: area.y + 220 }, { id: 2, x: 480, y: area.y + 220 }, { id: 3, x: 560, y: area.y + 220 }];
+        await session.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: points.slice(0, 1) });
+        points[0].y -= 50;
+        await session.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: points.slice(0, 1) });
+        assert.deepEqual(await nativeState(), initial, "A real one-finger drag must leave the paper fixed");
+        await session.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: points.slice(0, 2) });
+        await session.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: points });
+        for (const point of points) point.y -= 40;
+        await session.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: points });
+        assert.deepEqual(await nativeState(), initial, "A real three-finger drag must leave the paper fixed");
+        await session.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
         await page.locator("#paper-scroll").evaluate(element => { element.scrollTop = 0; });
         const fingers = [{ id: 1, x: 300, y: area.y + 180 }, { id: 2, x: 450, y: area.y + 180 }];
         await session.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: fingers });
@@ -97,7 +125,49 @@ try {
       await page.setViewportSize({ width: 1024, height: 768 });
       assert.equal(await webScale(), 1, "Rotation must keep browser scale fixed");
       assert.deepEqual(errors, []);
-      console.log(`PASS ${engine.name()}: library, toolbar, dialogs, form focus, wheel, Safari gesture cancellation, keyboard paper zoom, rotation${engine === chromium ? ", native mobile pinch" : ""}`);
+      console.log(`PASS ${engine.name()}: 1/2/3-finger transitions in Scroll, Book scroll and Page turn with pen/hand/select, library, toolbar, dialogs, form focus, wheel, Safari gesture cancellation, keyboard paper zoom, rotation${engine === chromium ? ", native mobile pinch" : ""}`);
     } finally { await browser.close(); }
   }
 } finally { server.kill(); }
+
+async function checkFingerCounts(page, mode, tool) {
+  const label = `${mode}/${tool}`;
+  const samples = await page.evaluate(() => {
+    const canvas = document.querySelector("#ink-canvas");
+    const scroll = document.querySelector("#paper-scroll");
+    const bounds = scroll.getBoundingClientRect();
+    const snapshot = () => [scroll.scrollLeft, scroll.scrollTop, canvas.parentElement.style.transform];
+    const send = (type, id, x, y) => canvas.dispatchEvent(new PointerEvent(type, {
+      pointerType: "touch", pointerId: id, bubbles: true, cancelable: true, isPrimary: id === 101,
+      clientX: bounds.left + x, clientY: bounds.top + y, button: 0, buttons: type === "pointerup" ? 0 : 1,
+    }));
+    const initial = snapshot();
+    send("pointerdown", 101, 220, 230);
+    send("pointermove", 101, 190, 200);
+    const single = snapshot();
+    send("pointerdown", 102, 390, 200);
+    send("pointermove", 101, 170, 175);
+    send("pointermove", 102, 370, 175);
+    const pair = snapshot();
+    send("pointerdown", 103, 480, 230);
+    send("pointermove", 101, 120, 135);
+    send("pointermove", 102, 320, 135);
+    send("pointermove", 103, 490, 250);
+    const three = snapshot();
+    send("pointercancel", 101, 120, 135);
+    send("pointermove", 102, 320, 135);
+    const resumed = snapshot();
+    send("pointermove", 103, 530, 230);
+    const newPair = snapshot();
+    send("pointerup", 103, 530, 230);
+    send("pointermove", 102, 250, 85);
+    send("pointerup", 102, 250, 85);
+    return { initial, single, pair, three, resumed, newPair, afterRelease: snapshot() };
+  });
+  assert.deepEqual(samples.single, samples.initial, `${label}: one touch moved the viewport`);
+  assert.notDeepEqual(samples.pair, samples.single, `${label}: the pair did not move the viewport`);
+  assert.deepEqual(samples.three, samples.pair, `${label}: three touches moved the viewport`);
+  assert.deepEqual(samples.resumed, samples.three, `${label}: replacing a finger jumped`);
+  assert.notDeepEqual(samples.newPair, samples.resumed, `${label}: the new pair did not resume`);
+  assert.deepEqual(samples.afterRelease, samples.newPair, `${label}: the remaining finger moved the viewport`);
+}

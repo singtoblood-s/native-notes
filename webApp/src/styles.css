@@ -308,6 +308,11 @@ h1, h2, h3, p { margin: 0; }
 .paper-background-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 #ink-canvas { position: relative; z-index: 1; display: block; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
 .trash-mode #ink-canvas { pointer-events: none; cursor: default; }
+.ink-selection-box { position: absolute; z-index: 3; pointer-events: none; border: 2px dashed #2466ad; background: rgb(75 143 212 / 8%); box-sizing: border-box; }
+.ink-selection-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: 0 0 auto; min-height: 44px; padding: 0 12px; border-bottom: 1px solid var(--line); background: var(--paper); font-size: 13px; }
+.ink-selection-actions button { display: inline-flex; align-items: center; gap: 4px; min-height: 44px; }
+.ink-selection-actions svg { width: 17px; height: 17px; }
+@media print { .ink-selection-box, .ink-selection-actions { display: none !important; } }
 .paper-image-layer { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
 .paper-image-object { position: absolute; border: 2px solid transparent; touch-action: none; }
 .paper-image-object.selected { border-color: var(--accent); box-shadow: 0 0 0 1px #fff; }

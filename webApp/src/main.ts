@@ -29,7 +29,7 @@ import { removeGuestData } from "./remove-guest-data";
 import { FloatingTools } from "./floating-tools";
 
 const BASE = import.meta.env.BASE_URL;
-const APP_BUILD = "2026.11.18.3";
+const APP_BUILD = "2026.11.19.1";
 const editDate = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
 const olderEditDate = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" });
 type OfflineCacheStatus = "preparing" | "ready" | "error" | "unsupported" | "development";
@@ -112,7 +112,7 @@ class NotePadApp {
   } | null = null;
   private readonly forwardedFlowEvents = new WeakSet<Event>();
   private selectedTool: CanvasTool["kind"] = "pen";
-  private lastInkTool: Exclude<CanvasTool["kind"], "hand" | "eraser"> = "pen";
+  private lastInkTool: Exclude<CanvasTool["kind"], "hand" | "eraser" | "select"> = "pen";
   private returnAfterErase = true;
   private showEraserShortcut = true;
   private floatingTools?: FloatingTools;
@@ -260,6 +260,7 @@ class NotePadApp {
     const canvas = byId<HTMLCanvasElement>("ink-canvas");
     this.canvas = new PaperCanvas(canvas, byId("paper"), byId("paper-viewport"), {
       onChange: (strokes) => this.handleCanvasChange(strokes),
+      onSelectionChange: () => this.updateInkSelection(),
       onEraseComplete: () => {
         if (this.returnAfterErase && this.selectedTool === "eraser") this.selectTool(this.lastInkTool);
       },
@@ -444,6 +445,10 @@ class NotePadApp {
     onClick("eraser-tool", () => this.selectTool("eraser"));
     onClick("highlighter-tool", () => this.selectTool("highlighter"));
     onClick("line-tool", () => this.selectTool("line"));
+    onClick("select-tool", () => this.selectTool("select"));
+    onClick("delete-selected-ink", () => {
+      if (!this.showTrash) this.canvas?.deleteSelectedInk();
+    });
     onClick("hand-tool", () => this.selectTool("hand"));
     onClick("previous-page", () => { void this.turnPage(-1); });
     onClick("next-page", () => { void this.turnPage(1); });
@@ -547,7 +552,7 @@ class NotePadApp {
     });
     byId<HTMLInputElement>("width-range").addEventListener("input", (event) => {
       const width = Number((event.target as HTMLInputElement).value);
-      if (this.selectedTool === "hand") return;
+      if (this.selectedTool === "hand" || this.selectedTool === "select") return;
       this.toolSettings[this.selectedTool].width = width;
       this.selectTool(this.selectedTool);
     });
@@ -1264,6 +1269,10 @@ class NotePadApp {
     if (this.view === "library") return;
     const page = this.currentPage;
     const hasPage = Boolean(page);
+    byId<HTMLButtonElement>("select-tool").disabled = !hasPage || this.showTrash;
+    if (!hasPage || this.showTrash) this.canvas?.clearInkSelection?.();
+    if (this.selectedTool === "select") this.canvas?.setTool({ kind: this.showTrash || !hasPage ? "hand" : "select" });
+    this.updateInkSelection();
     document.body.classList.toggle("trash-mode", this.showTrash);
     document.body.classList.toggle("recovery-mode", this.showRecovery);
     byId("editor-empty").classList.toggle("hidden", hasPage);
@@ -1637,7 +1646,7 @@ class NotePadApp {
       }
       object.addEventListener("pointerdown", (event) => {
         if (this.showTrash || this.selectedTool !== "hand") return;
-        if (this.imageDrag || this.imageResize) return;
+        if (this.imageDrag || this.imageResize || (event.pointerType === "touch" && this.heldPointers.size > 1)) return;
         const target = event.target as HTMLElement;
         if (target.closest("[data-image-resize]")) {
           event.preventDefault();
@@ -1900,15 +1909,18 @@ class NotePadApp {
       menu.style.top = `${clampNumber(y, 8, window.innerHeight - menu.offsetHeight - 8)}px`;
       byId<HTMLButtonElement>("clipboard-copy").disabled = !this.selectedImageID;
     };
-    paper.addEventListener("contextmenu", event => { event.preventDefault(); show(event.clientX, event.clientY); });
+    paper.addEventListener("contextmenu", event => {
+      event.preventDefault();
+      if (this.selectedTool !== "select") show(event.clientX, event.clientY);
+    });
     document.addEventListener("pointerdown", event => {
       this.heldPointers.add(event.pointerId);
+      if (event.pointerType === "touch" && this.heldPointers.size > 1) this.imageDrag = this.imageResize = null;
       this.cancelLongPress();
-      if (event.pointerType !== "touch" || this.heldPointers.size !== 1 || this.canvas?.isWriting || !paper.contains(event.target as Node) || !this.canInsertImage()) return;
+      if (event.pointerType !== "touch" || this.heldPointers.size !== 1 || this.selectedTool === "select" || this.canvas?.isWriting || !paper.contains(event.target as Node) || !this.canInsertImage()) return;
       const timer = window.setTimeout(() => {
         this.longPress = null;
         this.suppressPaperClickUntil = performance.now() + 1000;
-        byId("ink-canvas").dispatchEvent(new PointerEvent("pointercancel", { pointerId: event.pointerId, pointerType: "touch", bubbles: true }));
         this.imageDrag = this.imageResize = null;
         show(event.clientX, event.clientY);
       }, 550);
@@ -2136,6 +2148,16 @@ class NotePadApp {
     byId<HTMLButtonElement>("next-page").disabled = this.showTrash || index < 0 || index >= pages.length - 1;
     byId<HTMLButtonElement>("add-page").disabled = this.showTrash || this.showRecovery || !this.currentNotebook;
     byId<HTMLButtonElement>("duplicate-page").disabled = this.showTrash || this.showRecovery || !this.currentPage;
+  }
+
+  private updateInkSelection(): void {
+    const available = this.selectedTool === "select" && Boolean(this.currentPage) && !this.showTrash;
+    byId("ink-selection-actions").hidden = !available;
+    const count = this.canvas?.selectedStrokeCount ?? 0;
+    byId("ink-selection-count").textContent = count
+      ? `${count} ${count === 1 ? "stroke" : "strokes"} selected · Drag to move`
+      : "Drag around whole strokes to select.";
+    byId<HTMLButtonElement>("delete-selected-ink").hidden = !count || !available;
   }
 
   private async turnPage(direction: number): Promise<void> {
@@ -2370,20 +2392,21 @@ class NotePadApp {
   }
 
   private selectTool(kind: CanvasTool["kind"], color?: number): void {
+    if (kind === "select" && this.showTrash) return;
     const changeImageInteraction = (this.selectedTool === "hand") !== (kind === "hand");
     this.selectedTool = kind;
-    if (kind !== "hand" && kind !== "eraser") this.lastInkTool = kind;
-    for (const name of ["pen", "highlighter", "line", "eraser", "hand"]) {
+    if (kind === "pen" || kind === "line" || kind === "highlighter") this.lastInkTool = kind;
+    for (const name of ["pen", "highlighter", "line", "eraser", "hand", "select"]) {
       byId(`${name}-tool`).classList.toggle("active", kind === name);
       byId(`${name}-tool`).setAttribute("aria-pressed", String(kind === name));
     }
-    byId("ink-options").classList.toggle("hidden", kind === "hand");
+    byId("ink-options").classList.toggle("hidden", kind === "hand" || kind === "select");
     const inkToggle = byId<HTMLButtonElement>("ink-options-toggle");
-    inkToggle.disabled = kind === "hand";
+    inkToggle.disabled = kind === "hand" || kind === "select";
     if (inkToggle.disabled) inkToggle.setAttribute("aria-expanded", "false");
     byId("pen-style").classList.toggle("hidden", kind !== "pen");
-    byId("tool-name").textContent = ({ pen: "Pen", highlighter: "Highlighter", line: "Straight line", eraser: "Stroke eraser", hand: "Read & pan" })[kind];
-    if (kind === "hand") this.canvas?.setTool({ kind });
+    byId("tool-name").textContent = ({ pen: "Pen", highlighter: "Highlighter", line: "Straight line", eraser: "Stroke eraser", hand: "Read & pan", select: "Select ink" })[kind];
+    if (kind === "hand" || kind === "select") this.canvas?.setTool({ kind });
     else {
       const settings = this.toolSettings[kind];
       if ("color" in settings && color !== undefined) settings.color = color;
@@ -2409,6 +2432,7 @@ class NotePadApp {
       });
     }
     this.saveToolSettings();
+    this.updateInkSelection();
     this.updateToolbar();
     if (changeImageInteraction && this.currentPage) this.renderImageLayer(this.currentPage);
   }
@@ -2438,7 +2462,7 @@ class NotePadApp {
         if (Number.isFinite(value.width) && value.width >= 1 && value.width <= max) target.width = value.width;
         if ("color" in target && Number.isInteger(value.color) && value.color >= 0 && value.color <= 0xffffffff) target.color = value.color;
       }
-      if (["pen", "highlighter", "line", "eraser", "hand"].includes(saved.kind)) this.selectedTool = saved.kind;
+      if (["pen", "highlighter", "line", "eraser", "hand", "select"].includes(saved.kind)) this.selectedTool = saved.kind;
       if (saved.lastInkTool === "pen" || saved.lastInkTool === "highlighter" || saved.lastInkTool === "line") this.lastInkTool = saved.lastInkTool;
       if (saved.penStyle === "ball" || saved.penStyle === "fountain") byId<HTMLSelectElement>("pen-style").value = saved.penStyle;
       if (typeof saved.returnAfterErase === "boolean") this.returnAfterErase = saved.returnAfterErase;
@@ -2950,12 +2974,16 @@ class NotePadApp {
       if (event.key === "0") { this.canvas?.fitToViewport(); return; }
     }
     if (!event.metaKey && !event.ctrlKey && !event.altKey && !this.showTrash) {
-      if (this.selectedImageID && (event.key === "Delete" || event.key === "Backspace")) {
+      if (this.selectedTool === "select" && this.canvas?.selectedStrokeCount) {
+        if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); this.canvas.deleteSelectedInk(); return; }
+        if (event.key === "Escape") { event.preventDefault(); this.canvas.clearInkSelection(); return; }
+      }
+      if (this.selectedTool !== "select" && this.selectedImageID && (event.key === "Delete" || event.key === "Backspace")) {
         event.preventDefault();
         void this.removeSelectedImage();
         return;
       }
-      const shortcut = ({ p: "pen", h: "highlighter", e: "eraser", l: "line", v: "hand" } as const)[event.key.toLowerCase() as "p" | "h" | "e" | "l" | "v"];
+      const shortcut = ({ p: "pen", h: "highlighter", e: "eraser", l: "line", v: "hand", s: "select" } as const)[event.key.toLowerCase() as "p" | "h" | "e" | "l" | "v" | "s"];
       if (shortcut) { event.preventDefault(); this.selectTool(shortcut); return; }
       if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); void this.turnPage(event.key === "ArrowLeft" ? -1 : 1); return; }
     }
@@ -3022,8 +3050,9 @@ class NotePadApp {
   }
 }
 
-function toolIcon(name: "hand" | "pen" | "highlighter" | "eraser" | "line" | "book" | "search" | "star" | "settings" | "user" | "trash" | "list" | "grid" | "picture" | "file" | "upload" | "plus" | "undo" | "redo" | "back" | "text" | "previous" | "next"): string {
+function toolIcon(name: "hand" | "pen" | "highlighter" | "eraser" | "select" | "line" | "book" | "search" | "star" | "settings" | "user" | "trash" | "list" | "grid" | "picture" | "file" | "upload" | "plus" | "undo" | "redo" | "back" | "text" | "previous" | "next"): string {
   const paths = {
+    select: '<rect x="3" y="4" width="17" height="15" rx="1.5" stroke-dasharray="3 3"/><path d="m13 12 2 10 2-4 4-2Z"/>',
     book: '<rect x="4" y="3" width="16" height="19" rx="2"/><path d="M8 3v19M12 8h4M12 12h4"/>',
     search: '<circle cx="10" cy="10" r="6.5"/><path d="m15 15 6 6"/>',
     star: '<path d="m12 3 3 6 7 1-5 5 1 7-6-3-6 3 1-7-5-5 7-1Z"/>',
@@ -3134,6 +3163,7 @@ function shellMarkup(auth: AuthSession): string {
           <button class="tool-button" id="highlighter-tool" aria-label="Highlighter tool" title="Highlighter (H)">${toolIcon("highlighter")}</button>
           <button class="tool-button" id="eraser-tool" aria-label="Whole stroke eraser" title="Stroke eraser (E)">${toolIcon("eraser")}</button>
           <button class="tool-button" id="line-tool" aria-label="Straight line tool" title="Straight line (L)">${toolIcon("line")}</button>
+          <button class="tool-button" id="select-tool" aria-label="Select ink" title="Select ink (S)">${toolIcon("select")}</button>
           <span class="toolbar-divider"></span>
           <button class="quiet-button" id="undo-button" aria-label="Undo" title="Undo (Ctrl/⌘ Z)" disabled>${toolIcon("undo")}</button>
           <button class="quiet-button" id="redo-button" aria-label="Redo" title="Redo (Ctrl/⌘ Shift Z)" disabled>${toolIcon("redo")}</button>
@@ -3149,6 +3179,10 @@ function shellMarkup(auth: AuthSession): string {
           <label class="width-control"><span id="width-value">3px</span><input id="width-range" type="range" min="1" max="12" step="0.5" value="3" aria-label="Stroke width" /></label>
         </div>
       </div>
+          <div class="ink-selection-actions" id="ink-selection-actions" hidden>
+            <span id="ink-selection-count" role="status"></span>
+            <button class="quiet-button" id="delete-selected-ink" aria-label="Delete selected ink" hidden>${toolIcon("trash")} Delete</button>
+          </div>
           <div class="page-bar">
             <div class="page-heading">
               <button class="page-title-button" id="rename-page" aria-label="Rename page" aria-describedby="page-title-label recovery-page-badge" title="Rename page"><strong id="page-title-label">First page</strong><span class="recovery-badge" id="recovery-page-badge" hidden>Recovered copy</span></button>
@@ -3164,7 +3198,7 @@ function shellMarkup(auth: AuthSession): string {
           </div>
           <div class="paper-scroll" id="paper-scroll"><div class="page-flow" id="page-flow"><article class="flow-page active" id="active-page-slot" data-flow-page=""><div class="paper-viewport" id="paper-viewport"><div class="paper" id="paper"><canvas id="ink-canvas" aria-label="Note page drawing surface"></canvas><div class="paper-image-layer" id="paper-image-layer" aria-label="Page images"></div></div></div></article></div></div>
           <div class="print-note" aria-hidden="true"><h1 id="print-title"></h1><p id="print-text"></p></div>
-          <div class="stage-foot" title="Two fingers to move or zoom · Hand tool for one-finger pan">
+          <div class="stage-foot" title="Use two fingers to move or zoom the paper">
             <span id="tool-name" aria-live="polite">Pen</span>
             <select id="page-view-mode" aria-label="Page view mode" title="Page view mode"><option value="continuous">Scroll</option><option value="horizontal">Book scroll</option><option value="paged">Page turn</option></select>
             <div class="view-controls">

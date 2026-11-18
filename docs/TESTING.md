@@ -54,8 +54,8 @@ orientation changes, the on-screen keyboard and iPad suspension/resume.
 - The editor opens with both drawers closed. Check phone and tablet portrait
   and landscape, including opening the keyboard and returning to handwriting.
 - Pinch around a word with two fingers, move both fingers, then release one
-  and continue panning. The paper should keep its anchor without jumping.
-- Try a third finger, palm contact during pen input, lifting the pen outside
+  and move the remaining finger. The paper must stop. Add another finger to resume without jumping.
+- A third finger pauses scrolling and zoom until exactly two remain. Check palm contact during pen input, lifting the pen outside
   the page, undo/redo, rotation, and repeated zoom at the page edges.
 - Test a server outage, expired login, switching accounts, and changes made
   while a sync is in flight. Local data must remain accessible and failures
