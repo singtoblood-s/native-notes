@@ -5,9 +5,12 @@ const GAP = 12;
 /** Move the existing controls so their state, listeners and save behavior stay intact. */
 export class FloatingTools {
   private floating = false;
+  private showEraserShortcut = false;
   private position = { x: 1, y: .65 };
   private readonly workspace: HTMLElement;
   private readonly bubble: HTMLButtonElement;
+  private readonly eraserShortcut: HTMLButtonElement;
+  private readonly eraserTool: HTMLButtonElement;
   private readonly panel: HTMLElement;
   private readonly quick: HTMLElement;
   private readonly details: HTMLElement;
@@ -22,6 +25,7 @@ export class FloatingTools {
     this.toggle = document.getElementById("float-tools") as HTMLButtonElement;
     this.workspace.insertAdjacentHTML("beforeend", `
       <button id="floating-tools-button" class="floating-tools-button" hidden aria-controls="floating-tools-panel" aria-expanded="false" aria-describedby="floating-tools-help"><span class="floating-tool-icon" aria-hidden="true"></span><span class="floating-tool-status" aria-hidden="true"></span></button>
+      <button id="floating-eraser-button" class="floating-tools-button floating-eraser-button" type="button" hidden aria-label="Quick eraser" aria-pressed="false" title="Quick eraser (E)"><span class="floating-tool-icon" aria-hidden="true"></span></button>
       <section id="floating-tools-panel" class="floating-tools-panel" aria-label="Floating tools" hidden>
         <div class="floating-tools-quick"><button id="more-floating-tools" class="outline-button" aria-controls="floating-tools-details" aria-expanded="false">More</button></div>
         <div id="floating-tools-details" hidden>
@@ -30,6 +34,12 @@ export class FloatingTools {
         </div>
       </section>`);
     this.bubble = document.getElementById("floating-tools-button") as HTMLButtonElement;
+    this.eraserShortcut = document.getElementById("floating-eraser-button") as HTMLButtonElement;
+    this.eraserTool = document.getElementById("eraser-tool") as HTMLButtonElement;
+    this.eraserShortcut.firstElementChild!.replaceChildren(this.eraserTool.querySelector("svg")?.cloneNode(true) ?? "Erase");
+    this.eraserShortcut.addEventListener("click", () => {
+      if (!this.eraserShortcut.hidden && this.canToggle()) this.eraserTool.click();
+    }, { signal });
     this.panel = document.getElementById("floating-tools-panel")!;
     this.quick = this.panel.querySelector<HTMLElement>(".floating-tools-quick")!;
     this.details = document.getElementById("floating-tools-details")!;
@@ -142,6 +152,11 @@ export class FloatingTools {
     if (focus) this.bubble.focus({ preventScroll: true });
   }
 
+  setEraserShortcut(visible: boolean): void {
+    this.showEraserShortcut = visible;
+    this.place();
+  }
+
   private setFloating(value: boolean): void {
     if (!this.canToggle()) return;
     this.close(false);
@@ -195,6 +210,16 @@ export class FloatingTools {
     const top = bounds.top + bounds.height * this.position.y;
     this.bubble.style.left = `${left}px`;
     this.bubble.style.top = `${top}px`;
+    const before = left - SIZE - GAP;
+    const after = left + SIZE + GAP;
+    const fitsBefore = before >= bounds.left;
+    const fitsAfter = after <= bounds.left + bounds.width;
+    this.eraserShortcut.hidden = !this.floating || !this.showEraserShortcut || !this.panel.hidden ||
+      this.workspace.hidden || this.panel.classList.contains("floating-no-page") || (!fitsBefore && !fitsAfter);
+    if (!this.eraserShortcut.hidden) {
+      this.eraserShortcut.style.left = `${fitsBefore && (!fitsAfter || this.position.x >= .5) ? before : after}px`;
+      this.eraserShortcut.style.top = `${top}px`;
+    }
     if (this.panel.hidden) return;
     this.panel.style.maxHeight = `${Math.max(SIZE, bounds.height)}px`;
     this.panel.style.width = `${Math.min(this.details.hidden ? 284 : 560, bounds.width + SIZE)}px`;
@@ -219,6 +244,7 @@ export class FloatingTools {
     const active = this.workspace.querySelector<HTMLElement>(".tool-button.active");
     this.bubble.querySelector(".floating-tool-icon")!.innerHTML = active?.querySelector("svg")?.outerHTML ?? "✎";
     const tool = document.getElementById("tool-name")!.textContent ?? "Tools";
+    this.eraserShortcut.setAttribute("aria-pressed", String(this.eraserTool.getAttribute("aria-pressed") === "true"));
     const sync = document.getElementById("sync-button")!;
     const label = `Tools · ${tool} · ${sync.getAttribute("aria-label") ?? ""}`;
     this.bubble.setAttribute("aria-label", label);

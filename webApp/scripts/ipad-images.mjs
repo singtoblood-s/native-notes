@@ -168,9 +168,76 @@ try {
   await page.locator("#close-inspector").click();
   await page.locator(".image-delete-button").tap();
   await page.waitForFunction(() => window.qa.saves.some(save => save.strokes === 2 && save.images === 0));
+
+  await page.locator("#add-page").click();
+  await page.waitForFunction(() => document.querySelector("#page-position").textContent === "3 / 3");
+  await page.locator("#pen-tool").click();
+  await page.locator("#pen-style").selectOption("ball");
+  const color = page.getByRole("button", { name: "Terracotta", exact: true });
+  await color.click();
+  await page.locator('button[data-width="6"]').click();
+  const contact = (x, y) => page.evaluate(({ x, y }) => {
+    const canvas = document.querySelector("#ink-canvas");
+    const rect = canvas.getBoundingClientRect();
+    const event = (type, offset) => canvas.dispatchEvent(new PointerEvent(type, {
+      pointerId: 31, pointerType: "pen", isPrimary: true, bubbles: true, cancelable: true, button: 0,
+      buttons: type === "pointerup" ? 0 : 1, pressure: type === "pointerup" ? 0 : .5,
+      clientX: rect.left + x + offset, clientY: rect.top + y,
+    }));
+    event("pointerdown", 0);
+    event("pointermove", 16);
+    const eraserDuringContact = document.querySelector("#eraser-tool").getAttribute("aria-pressed");
+    event("pointerup", 16);
+    return eraserDuringContact;
+  }, { x, y });
+  const clearSaves = () => page.evaluate(() => { window.qa.saves.length = 0; });
+  const waitForStrokes = (strokes) => page.waitForFunction(strokes =>
+    window.qa.saves.some(save => save.strokes === strokes && save.images === 0), strokes);
+  await clearSaves();
+  await contact(95, 155);
+  await waitForStrokes(1);
+  await page.locator("#float-tools").click();
+  const eraser = page.locator("#floating-eraser-button");
+  await eraser.tap();
+  assert.equal(await eraser.getAttribute("aria-pressed"), "true");
+  await contact(280, 230);
+  assert.equal(await eraser.getAttribute("aria-pressed"), "true", "A miss keeps the eraser ready");
+  assert.equal(await contact(95, 155), "true", "Keep erasing until the Pencil lifts");
+  await waitForStrokes(0);
+  await page.waitForFunction(() => document.querySelector("#pen-tool").getAttribute("aria-pressed") === "true");
+  assert.equal(await page.locator("#pen-style").inputValue(), "ball");
+  assert.equal(await page.locator("#width-range").inputValue(), "6");
+  assert.equal(await page.locator('[aria-label="Terracotta"]').getAttribute("aria-pressed"), "true");
+  assert.equal(await eraser.getAttribute("aria-pressed"), "false");
+  await page.locator("#floating-tools-button").click();
+  assert.equal(await eraser.isVisible(), false, "The palette should show only one eraser");
+  await page.locator("#more-floating-tools").click();
+  await page.locator("#dock-tools").click();
+  await page.locator("#auth-button").click();
+  const settings = page.locator("#settings-form");
+  await settings.locator("#return-after-erase").uncheck();
+  await settings.locator("#show-eraser-shortcut").uncheck();
+  await settings.getByRole("button", { name: "Save settings" }).click();
+  await settings.waitFor({ state: "hidden" });
+  await clearSaves();
+  await contact(95, 155);
+  await waitForStrokes(1);
+  await page.keyboard.press("e");
+  await contact(95, 155);
+  await waitForStrokes(0);
+  assert.equal(await page.locator("#eraser-tool").getAttribute("aria-pressed"), "true", "Turning off auto-return keeps eraser selected");
+  await page.locator("#float-tools").click();
+  assert.equal(await eraser.isVisible(), false);
+  await page.locator("#floating-tools-button").click();
+  await page.locator("#more-floating-tools").click();
+  await page.locator("#back-library").click();
+  await page.reload();
+  await page.locator("#library-settings").click();
+  assert.equal(await settings.locator("#return-after-erase").isChecked(), false);
+  assert.equal(await settings.locator("#show-eraser-shortcut").isChecked(), false);
   assert.deepEqual(errors, []);
   frames.sort((a, b) => a - b);
-  console.log(JSON.stringify({ engine: engine.name(), persistence: "indexeddb", photoSurvivedReload: true, strokesSurvivedReload: true, fullPageCopies: 0, frameP95Ms: Math.round(frames[Math.floor(frames.length * .95)]), saves }, null, 2));
+  console.log(JSON.stringify({ engine: engine.name(), persistence: "indexeddb", photoSurvivedReload: true, strokesSurvivedReload: true, eraserSettingsVerified: true, fullPageCopies: 0, frameP95Ms: Math.round(frames[Math.floor(frames.length * .95)]), saves }, null, 2));
 } finally {
   await browser?.close();
   server.kill();

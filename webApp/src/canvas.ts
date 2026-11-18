@@ -128,6 +128,7 @@ export function offsetAtAnchor(world: CanvasPoint, scale: number, anchor: Canvas
 export interface CanvasCallbacks {
   onChange: (strokes: InkStroke[]) => void;
   onZoom: (scale: number) => void;
+  onEraseComplete?: () => void;
   onLimit?: (message: string) => void;
 }
 
@@ -703,13 +704,15 @@ export class PaperCanvas {
     if (this.tool.kind === "eraser") {
       if (this.eraserPointerID !== event.pointerId) return;
       this.eraseAt(this.pagePoint(event));
-      if (this.eraserBefore && this.eraserBefore !== this.strokes) {
-        this.pushUndo(this.eraserBefore);
-        this.redoStack = [];
-        this.callbacks.onChange(cloneStrokes(this.strokes));
-      }
+      const before = this.eraserBefore;
       this.eraserBefore = null;
       this.eraserPointerID = null;
+      if (before && before !== this.strokes) {
+        this.pushUndo(before);
+        this.redoStack = [];
+        this.callbacks.onChange(cloneStrokes(this.strokes));
+        this.callbacks.onEraseComplete?.();
+      }
       if (this.resizePending) this.handleResize();
       return;
     }

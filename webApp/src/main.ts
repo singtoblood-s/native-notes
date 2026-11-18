@@ -27,7 +27,7 @@ import { removeGuestData } from "./remove-guest-data";
 import { FloatingTools } from "./floating-tools";
 
 const BASE = import.meta.env.BASE_URL;
-const APP_BUILD = "2026.11.18.1";
+const APP_BUILD = "2026.11.18.2";
 type OfflineCacheStatus = "preparing" | "ready" | "error" | "unsupported" | "development";
 interface SavedSelection { notebookID?: string; pageID?: string; }
 
@@ -103,6 +103,10 @@ class NotePadApp {
   } | null = null;
   private readonly forwardedFlowEvents = new WeakSet<Event>();
   private selectedTool: CanvasTool["kind"] = "pen";
+  private lastInkTool: Exclude<CanvasTool["kind"], "hand" | "eraser"> = "pen";
+  private returnAfterErase = true;
+  private showEraserShortcut = true;
+  private floatingTools?: FloatingTools;
   private readonly toolSettings = {
     pen: { color: 0xff252429, width: 3 },
     highlighter: { color: 0xfff2ca52, width: 18 },
@@ -239,6 +243,9 @@ class NotePadApp {
     const canvas = byId<HTMLCanvasElement>("ink-canvas");
     this.canvas = new PaperCanvas(canvas, byId("paper"), byId("paper-viewport"), {
       onChange: (strokes) => this.handleCanvasChange(strokes),
+      onEraseComplete: () => {
+        if (this.returnAfterErase && this.selectedTool === "eraser") this.selectTool(this.lastInkTool);
+      },
       onLimit: message => this.toast(message),
       onZoom: (scale) => {
         byId("zoom-label").textContent = `${Math.round(scale * 100)}%`;
@@ -254,7 +261,8 @@ class NotePadApp {
     this.setOfflineCacheStatus(this.offlineCacheStatus, this.offlineCacheMessage);
     this.syncDrawerState();
     this.applyViewMode();
-    new FloatingTools(this.shellEvents.signal, () => this.closeQuickMenus(), () => !this.canvasInputActive());
+    this.floatingTools = new FloatingTools(this.shellEvents.signal, () => this.closeQuickMenus(), () => !this.canvasInputActive());
+    this.floatingTools.setEraserShortcut(this.showEraserShortcut);
   }
 
   private viewModeStorageKey(): string { return `notepad.page-view:${this.accountKey()}`; }
@@ -782,6 +790,8 @@ class NotePadApp {
   }
 
   private openSettings(): void {
+    byId<HTMLInputElement>("return-after-erase").checked = this.returnAfterErase;
+    byId<HTMLInputElement>("show-eraser-shortcut").checked = this.showEraserShortcut;
     this.renderWorkspaceRecovery();
     this.openDialog("settings-dialog");
   }
@@ -2237,7 +2247,9 @@ class NotePadApp {
   }
 
   private selectTool(kind: CanvasTool["kind"], color?: number): void {
+    const changeImageInteraction = (this.selectedTool === "hand") !== (kind === "hand");
     this.selectedTool = kind;
+    if (kind !== "hand" && kind !== "eraser") this.lastInkTool = kind;
     for (const name of ["pen", "highlighter", "line", "eraser", "hand"]) {
       byId(`${name}-tool`).classList.toggle("active", kind === name);
       byId(`${name}-tool`).setAttribute("aria-pressed", String(kind === name));
@@ -2270,13 +2282,22 @@ class NotePadApp {
         pressureSensitive: byId<HTMLSelectElement>("pen-style").value === "fountain",
       });
     }
+    this.saveToolSettings();
+    this.updateToolbar();
+    if (changeImageInteraction && this.currentPage) this.renderImageLayer(this.currentPage);
+  }
+
+  private saveToolSettings(): void {
     try {
       localStorage.setItem("notepad.writing-tools", JSON.stringify({
-        settings: this.toolSettings, kind, penStyle: byId<HTMLSelectElement>("pen-style").value,
+        settings: this.toolSettings,
+        kind: this.selectedTool,
+        lastInkTool: this.lastInkTool,
+        penStyle: byId<HTMLSelectElement>("pen-style").value,
+        returnAfterErase: this.returnAfterErase,
+        showEraserShortcut: this.showEraserShortcut,
       }));
     } catch { /* Tool preferences are optional; note durability uses SQLite. */ }
-    this.updateToolbar();
-    if (this.currentPage) this.renderImageLayer(this.currentPage);
   }
 
   private restoreToolSettings(): void {
@@ -2292,7 +2313,10 @@ class NotePadApp {
         if ("color" in target && Number.isInteger(value.color) && value.color >= 0 && value.color <= 0xffffffff) target.color = value.color;
       }
       if (["pen", "highlighter", "line", "eraser", "hand"].includes(saved.kind)) this.selectedTool = saved.kind;
+      if (saved.lastInkTool === "pen" || saved.lastInkTool === "highlighter" || saved.lastInkTool === "line") this.lastInkTool = saved.lastInkTool;
       if (saved.penStyle === "ball" || saved.penStyle === "fountain") byId<HTMLSelectElement>("pen-style").value = saved.penStyle;
+      if (typeof saved.returnAfterErase === "boolean") this.returnAfterErase = saved.returnAfterErase;
+      if (typeof saved.showEraserShortcut === "boolean") this.showEraserShortcut = saved.showEraserShortcut;
     } catch { /* Ignore unavailable storage or damaged preferences. */ }
   }
 
@@ -2677,6 +2701,10 @@ class NotePadApp {
       byId("settings-message").textContent = "Use an HTTPS URL. HTTP is allowed only for localhost development.";
       return;
     }
+    this.returnAfterErase = byId<HTMLInputElement>("return-after-erase").checked;
+    this.showEraserShortcut = byId<HTMLInputElement>("show-eraser-shortcut").checked;
+    this.saveToolSettings();
+    this.floatingTools?.setEraserShortcut(this.showEraserShortcut);
     if (previous !== next) {
       this.rememberSelection();
       this.requireLogin();
@@ -2930,7 +2958,14 @@ function dialogMarkup(auth: AuthSession): string {
   <dialog class="dialog" id="jump-dialog" aria-labelledby="jump-title"><form class="dialog-form" id="jump-form"><div class="dialog-head"><h2 id="jump-title">Go to page</h2><button type="button" class="icon-button" id="close-jump" aria-label="Close">×</button></div><label>Page number<input type="number" min="1" step="1" required id="jump-page-number" /></label><button type="submit" class="primary-button">Go</button></form></dialog>
   <dialog class="dialog" id="organize-dialog" aria-labelledby="organize-title"><form class="dialog-form" id="organize-form"><div class="dialog-head"><h2 id="organize-title">Move / reorder page</h2><button type="button" class="icon-button" id="close-organize" aria-label="Close">×</button></div><label>Notebook<select id="organize-notebook"></select></label><label>Position<select id="organize-position"></select></label><p class="form-hint">Move this page within its notebook or to another notebook. Ink, images and text stay together.</p><p id="organize-message" role="alert"></p><button type="submit" class="primary-button" id="organize-submit">Move page</button></form></dialog>
   <dialog class="dialog" id="versions-dialog"><div class="dialog-form"><div class="dialog-head"><h2>Saved versions</h2><button type="button" class="icon-button" id="close-versions" aria-label="Close saved versions">×</button></div><p>Sync resolves simultaneous edits without creating extra notebooks. Earlier versions stay on this device. Restore as copy creates a new notebook without replacing current notes. Notebook versions contain notebook details only; page versions include ink, images and text.</p><div id="versions-list"></div><p id="versions-message" role="status"></p></div></dialog>
-  <dialog class="dialog" id="settings-dialog"><form class="dialog-form" id="settings-form"><div class="dialog-head"><div><span class="eyebrow">SETTINGS</span><h2>Sync & backup</h2></div><button type="button" class="icon-button" id="cancel-settings" aria-label="Close">×</button></div><label>Sync server URL<input id="endpoint-input" type="url" inputmode="url" placeholder="https://notes.example.com" /></label><p class="form-hint">Use the same HTTPS server on every device. Changing servers requires signing in again.</p><div class="account-line"><span>Sync</span><strong id="settings-sync-label" aria-live="polite" title="Sign in required">Sign in required</strong><button class="outline-button compact" type="button" id="settings-sync-button">Sync now</button></div><p class="form-message offline-cache-status" id="offline-cache-status" role="status">Preparing offline cache…</p><div class="settings-actions"><button class="outline-button" type="button" id="browse-import">Import backup</button><button class="outline-button" type="button" id="settings-export">Export backup</button><button class="outline-button" type="button" id="settings-share">Share backup</button><button class="outline-button" type="button" id="saved-versions">Saved versions</button></div><input id="import-input" type="file" accept="application/json,.json,.notepad" hidden /><p class="form-message" id="settings-message"></p>${thisAccountMarkup(auth)}<div class="app-build"><span>Web app build ${APP_BUILD}</span><button class="outline-button compact" type="button" id="reload-app">Reload app</button></div><button class="primary-button" type="submit">Save settings</button></form></dialog>
+  <dialog class="dialog" id="settings-dialog"><form class="dialog-form" id="settings-form">
+    <div class="dialog-head"><h2>Settings</h2><button type="button" class="icon-button" id="cancel-settings" aria-label="Close">×</button></div>
+    <fieldset class="writing-settings"><legend>Writing</legend>
+      <label><input id="return-after-erase" type="checkbox" />Return to previous pen after erasing</label>
+      <label><input id="show-eraser-shortcut" type="checkbox" />Show quick eraser in Focus mode</label>
+    </fieldset>
+    <label>Sync server URL<input id="endpoint-input" type="url" inputmode="url" placeholder="https://notes.example.com" /></label><p class="form-hint">Use the same HTTPS server on every device. Changing servers requires signing in again.</p><div class="account-line"><span>Sync</span><strong id="settings-sync-label" aria-live="polite" title="Sign in required">Sign in required</strong><button class="outline-button compact" type="button" id="settings-sync-button">Sync now</button></div><p class="form-message offline-cache-status" id="offline-cache-status" role="status">Preparing offline cache…</p><div class="settings-actions"><button class="outline-button" type="button" id="browse-import">Import backup</button><button class="outline-button" type="button" id="settings-export">Export backup</button><button class="outline-button" type="button" id="settings-share">Share backup</button><button class="outline-button" type="button" id="saved-versions">Saved versions</button></div><input id="import-input" type="file" accept="application/json,.json,.notepad" hidden /><p class="form-message" id="settings-message"></p>${thisAccountMarkup(auth)}<div class="app-build"><span>Web app build ${APP_BUILD}</span><button class="outline-button compact" type="button" id="reload-app">Reload app</button></div><button class="primary-button" type="submit">Save settings</button>
+  </form></dialog>
   <dialog class="dialog" id="notebook-dialog"><form class="dialog-form" id="notebook-form"><div class="dialog-head"><div><span class="eyebrow">NOTEBOOK</span><h2>Rename notebook</h2></div><button type="button" class="icon-button" id="cancel-notebook" aria-label="Close">×</button></div><label>Name<input id="notebook-title" type="text" maxlength="500" autocomplete="off" required /></label><div id="new-notebook-options" hidden><label>Paper<select id="new-paper"><option value="blank">Blank</option><option value="ruled" selected>Ruled lines</option><option value="grid">Grid</option></select></label><div class="paper-choices" role="group" aria-label="Paper preview"><button type="button" class="paper-sample paper-blank" data-paper="blank" aria-pressed="false">Blank</button><button type="button" class="paper-sample paper-ruled" data-paper="ruled" aria-pressed="true">Ruled</button><button type="button" class="paper-sample paper-grid" data-paper="grid" aria-pressed="false">Grid</button></div></div><p class="form-error" id="notebook-error" role="alert"></p><button class="primary-button" type="submit">Save name</button></form></dialog>
 `;
 }

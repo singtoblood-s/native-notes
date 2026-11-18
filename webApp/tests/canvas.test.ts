@@ -14,6 +14,7 @@ function setup(): {
   paper: HTMLElement;
   viewport: HTMLElement;
   changes: ReturnType<typeof vi.fn>;
+  eraseComplete: ReturnType<typeof vi.fn>;
   canvasController: PaperCanvas;
   viewportRect: { width: number; height: number; top: number };
 } {
@@ -27,9 +28,10 @@ function setup(): {
   Object.defineProperty(viewport, "getBoundingClientRect", { configurable: true, value: () => ({ left: 0, top: viewportRect.top, width: viewportRect.width, height: viewportRect.height, right: viewportRect.width, bottom: viewportRect.height }) });
   Object.defineProperty(canvas, "getBoundingClientRect", { value: () => ({ left: 0, top: 0, width: 512, height: 683, right: 512, bottom: 683 }) });
   const changes = vi.fn();
-  const canvasController = new PaperCanvas(canvas, paper, viewport, { onChange: changes, onZoom: vi.fn() });
+  const eraseComplete = vi.fn();
+  const canvasController = new PaperCanvas(canvas, paper, viewport, { onChange: changes, onZoom: vi.fn(), onEraseComplete: eraseComplete });
   canvasController.setPage("page", 1024, 1366, "blank", []);
-  return { canvas, paper, viewport, changes, canvasController, viewportRect };
+  return { canvas, paper, viewport, changes, eraseComplete, canvasController, viewportRect };
 }
 
 function transformOf(paper: HTMLElement): { x: number; y: number; scale: number } {
@@ -320,7 +322,7 @@ describe("PaperCanvas pointer contract", () => {
   });
 
   it("ignores unrelated pointers and palm movement during erasing, and restores cancelled ink", () => {
-    const { canvas, paper, changes, canvasController } = setup();
+    const { canvas, paper, changes, eraseComplete, canvasController } = setup();
     canvas.dispatchEvent(pointer("pointerdown", {}));
     canvas.dispatchEvent(pointer("pointerup", {}));
     const original = changes.mock.lastCall![0];
@@ -337,11 +339,21 @@ describe("PaperCanvas pointer contract", () => {
     expect(changes).not.toHaveBeenCalled();
     canvas.dispatchEvent(pointer("pointercancel", { pointerId: 7 }));
     expect(canvasController.isInputActive).toBe(false);
+    expect(eraseComplete).not.toHaveBeenCalled();
+    canvas.dispatchEvent(pointer("pointerdown", { pointerId: 7, clientX: 200 }));
+    canvas.dispatchEvent(pointer("pointerup", { pointerId: 7, clientX: 200 }));
+    expect(eraseComplete).not.toHaveBeenCalled();
+    eraseComplete.mockImplementation(() => {
+      expect(canvasController.isWriting).toBe(false);
+      canvasController.setTool({ kind: "pen", width: 3, color: 0xff000000 });
+    });
     canvas.dispatchEvent(pointer("pointerdown", { pointerId: 7 }));
     canvas.dispatchEvent(pointer("pointerup", { pointerId: 7 }));
     expect(changes.mock.lastCall![0]).toEqual([]);
+    expect(eraseComplete).toHaveBeenCalledOnce();
     canvasController.undo();
     expect(changes.mock.lastCall![0]).toEqual(original);
+    expect(eraseComplete).toHaveBeenCalledOnce();
     canvasController.destroy();
   });
 
