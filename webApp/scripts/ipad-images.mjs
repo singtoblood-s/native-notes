@@ -17,7 +17,7 @@ try {
   }
   const engine = process.env.QA_ENGINE === "chromium" ? chromium : webkit;
   browser = await engine.launch({ headless: true });
-  const context = await browser.newContext({ ...devices["iPad (gen 7)"] });
+  const context = await browser.newContext({ ...devices["iPad (gen 7)"], serviceWorkers: "block" });
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", error => errors.push(error.message));

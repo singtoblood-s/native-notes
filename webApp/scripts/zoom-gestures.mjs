@@ -133,6 +133,7 @@ try {
         await session.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
         await session.detach();
       }
+      await checkFirstPreviewStroke(page);
       await page.setViewportSize({ width: 1024, height: 768 });
       assert.equal(await webScale(), 1, "Rotation must keep browser scale fixed");
       assert.deepEqual(errors, []);
@@ -243,8 +244,49 @@ async function checkPalmRejection(page) {
   }
   assert(samples.tentative[1] > samples.baseline[1] + 10, "Expected an actual pan before the stylus arrived");
   assert(samples.intentional[1] > samples.baseline[1] + 10, "A fresh single finger could not scroll after palms lifted");
+  const archive = await notebookBackup(page);
+  assert.equal(archive.pages[0].strokes.length, 3, "The three Pencil contacts must produce exactly three strokes");
+}
+
+async function notebookBackup(page) {
   await page.locator("#notebook-menu").click();
   const [download] = await Promise.all([page.waitForEvent("download"), page.locator("#notebook-menu-popup [data-action=export-notebook-backup]").click()]);
-  const archive = JSON.parse(await readFile(await download.path(), "utf8"));
-  assert.equal(archive.pages[0].strokes.length, 3, "The three Pencil contacts must produce exactly three strokes");
+  return JSON.parse(await readFile(await download.path(), "utf8"));
+}
+
+async function checkFirstPreviewStroke(page) {
+  await page.locator("#add-page").click();
+  await page.waitForFunction(() => document.querySelector("#page-position").textContent === "2 / 2");
+  await page.evaluate(async () => {
+    const scroll = document.querySelector("#paper-scroll");
+    const slot = document.querySelector(".flow-preview");
+    const clip = scroll.getBoundingClientRect();
+    const frame = () => new Promise(requestAnimationFrame);
+    // Put the seam between the two sheets in view, then hit-test each point.
+    scroll.scrollTop += slot.getBoundingClientRect().bottom - (clip.top + clip.height * .4);
+    await frame(); await frame();
+    const active = document.querySelector("#ink-canvas").getBoundingClientRect();
+    const previous = slot.getBoundingClientRect();
+    const overlapX = (Math.max(clip.left, active.left, previous.left) + Math.min(clip.right, active.right, previous.right)) / 2;
+    const palmY = Math.max(clip.top, active.top) + 40;
+    const penY = Math.min(clip.bottom, previous.bottom) - 60;
+    const palm = document.elementFromPoint(overlapX, palmY);
+    const pen = document.elementFromPoint(overlapX, penY);
+    if (palm?.id !== "ink-canvas" || pen?.closest(".flow-preview") !== slot) throw new Error("Neighboring sheets must both be visible");
+    const send = (target, type, pointerType, pointerId, y, dy = 0) => target.dispatchEvent(new PointerEvent(type, {
+      pointerType, pointerId, isPrimary: true, bubbles: true, cancelable: true, width: 8, height: 8, button: 0,
+      clientX: overlapX + dy, clientY: y + dy, buttons: type === "pointerup" ? 0 : 1, pressure: type === "pointerup" ? 0 : .45,
+    }));
+    send(palm, "pointerdown", "touch", 121, palmY);
+    await new Promise(resolve => setTimeout(resolve, 405));
+    // No pointerover or hover event precedes this first pen contact.
+    send(pen, "pointerdown", "pen", 122, penY);
+    send(document, "pointermove", "pen", 122, penY, 15);
+    send(document, "pointerup", "pen", 122, penY, 28);
+    send(palm, "pointerup", "touch", 121, palmY);
+  });
+  await page.waitForFunction(() => document.querySelector("#page-position").textContent === "1 / 2", null, { timeout: 5000 });
+  const archive = await notebookBackup(page);
+  assert.deepEqual(archive.pages.map(sheet => [sheet.title, sheet.strokes.length]), [["First page", 4], ["Page 2", 0]],
+    "The first non-hovering preview stroke must land only on the sheet it touched");
 }
