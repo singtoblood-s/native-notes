@@ -54,7 +54,7 @@ orientation changes, the on-screen keyboard and iPad suspension/resume.
 - The editor opens with both drawers closed. Check phone and tablet portrait
   and landscape, including opening the keyboard and returning to handwriting.
 - With a writing tool selected, drag one finger on the paper to pan, then pinch around a word with two fingers. Release one finger. Check the handoff for jumps and start a new one-finger drag after lifting. In Select, a one-finger drag selects or moves ink.
-- Enable **Settings → Writing → Require two fingers to scroll while writing**, save and reload. A single finger leaves the page fixed with the pen selected. Hand still pans the paper with one finger. Uncheck the setting to restore one-finger writing navigation.
+- Open **Settings → Scroll while writing**, choose **Two fingers only**, then close Settings with ×. With Pen selected, verify that one finger leaves the paper still and two fingers move it. In Read & pan, check that one finger still scrolls. Reload and confirm **Two fingers only** is selected. Switch to **One finger**, close Settings and verify scrolling again.
 - Rest a palm before, during and after a pen stroke. Check for unintended panning, page selection, image movement or Paste menus. Hold one finger in Hand to open Paste. Try a broad contact and pen hover over an adjacent preview while holding. Preserve mouse right-click and keyboard paste.
 - A third finger pauses scrolling and zoom until exactly two remain. Check lifting the pen outside
   the page, undo/redo, rotation, and repeated zoom at the page edges.

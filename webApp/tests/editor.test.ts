@@ -50,7 +50,7 @@ it("creates notebooks, preserves tool settings, duplicates paper and prevents na
   localStorage.setItem("notepad.endpoint", "https://sync.example.test");
   sessionStorage.setItem("notepad.session", JSON.stringify({ endpoint: "https://sync.example.test", user: { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", identifier: "tester" }, sessionToken: "test-token", expiresAt: "2099-01-01T00:00:00Z" }));
   // Damaged optional settings must not stop the notebook from opening.
-  localStorage.setItem("notepad.writing-tools", '{"kind":"unknown","settings":{"pen":{"width":-1}}}');
+  localStorage.setItem("notepad.writing-tools", '{"kind":"unknown","settings":{"pen":{"width":-1}},"requireTwoFingersWhileWriting":true}');
   const notebook = createNotebook("Original notebook");
   const original = createPage(notebook.id, "Original page");
   original.background = "grid";
@@ -70,6 +70,25 @@ it("creates notebooks, preserves tool settings, duplicates paper and prevents na
     await vi.waitFor(() => expect(document.querySelector("[data-open-book]")).not.toBeNull());
     expect(element("library").hidden).toBe(false);
     expect(element("editor-workspace").hidden).toBe(true);
+    element("library-settings").click();
+    const oneFinger = element<HTMLInputElement>("scroll-one-finger");
+    const twoFingers = element<HTMLInputElement>("require-two-fingers");
+    expect(twoFingers.checked).toBe(true);
+    const endpointInput = element<HTMLInputElement>("endpoint-input");
+    const endpoint = endpointInput.value;
+    endpointInput.value = "unfinished URL";
+    oneFinger.click();
+    expect(twoFingers.checked).toBe(false);
+    expect(element("paper-gesture-hint").textContent).toContain("one finger");
+    expect(JSON.parse(localStorage.getItem("notepad.writing-tools")!).requireTwoFingersWhileWriting).toBe(false);
+    element("cancel-settings").click();
+    element("library-settings").click();
+    expect(oneFinger.checked).toBe(true);
+    twoFingers.click();
+    expect(element("paper-gesture-hint").textContent).toContain("two fingers");
+    expect(JSON.parse(localStorage.getItem("notepad.writing-tools")!).requireTwoFingersWhileWriting).toBe(true);
+    endpointInput.value = endpoint;
+    element("cancel-settings").click();
     const notebookMenuButton = document.querySelector<HTMLButtonElement>("#notebook-list .nav-menu-button")!;
     notebookMenuButton.click();
     expect(notebookMenuButton.closest(".nav-row-wrap")?.querySelector<HTMLElement>(".quick-menu")?.hidden).toBe(false);

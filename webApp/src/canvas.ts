@@ -1,5 +1,6 @@
 import { InkStroke, PageBackground, StrokePoint, id } from "./models";
 import { type InkRect, type InkSelection, offsetInkRect, selectInk } from "./ink-selection";
+import { PaperTouchFallback } from "./paper-touch-fallback";
 
 export type CanvasTool =
   | { kind: "pen" | "highlighter" | "line"; color: number; width: number; pressureSensitive?: boolean }
@@ -55,18 +56,19 @@ interface SingleFingerPan {
   id: number;
   start: CanvasPoint;
   startedAt: number;
-  movedBeforeRest: boolean;
   active: boolean;
 }
 
 // Screen coordinates stay independent of zoom, page size and handedness.
-const FINGER_INTENT_MS = 85;
 const PALM_REST_MS = 350;
 const PEN_TAKEOVER_MS = 300;
 const AFTER_PEN_MS = 320;
 function broadContact(event: PointerEvent): boolean {
+  // Safari can report a whole finger pad as a roughly 40–55 CSS px contact.
+  // Reserve geometry alone for a much larger patch or the long edge of a hand.
   const short = Math.min(event.width, event.height);
-  return short >= 30 || (short >= 12 && Math.max(event.width, event.height) >= 48);
+  const long = Math.max(event.width, event.height);
+  return (short >= 48 && long >= 64) || (short >= 26 && long >= 80);
 }
 
 interface CachedImage {
@@ -159,6 +161,7 @@ export interface CanvasCallbacks {
   onSelectionChange?: (count: number) => void;
   onZoom: (scale: number) => void;
   onEraseComplete?: () => void;
+  onPageTurn?: (direction: -1 | 1) => void;
   onLimit?: (message: string) => void;
 }
 
@@ -213,6 +216,7 @@ export class PaperCanvas {
   private readonly viewport: HTMLElement;
   /** Shared gesture surface for the active sheet, adjacent previews and gutters. */
   private scrollViewport: HTMLElement;
+  private touchFallback?: PaperTouchFallback;
   private readonly context: CanvasRenderingContext2D;
   private readonly staticCanvas: HTMLCanvasElement;
   private readonly staticContext: CanvasRenderingContext2D;
@@ -641,6 +645,7 @@ export class PaperCanvas {
   };
 
   private bindScrollGestures(surface: HTMLElement): void {
+    this.touchFallback = new PaperTouchFallback(surface);
     for (const type of ["pointerdown", "pointermove", "pointerup", "pointercancel"] as const) {
       surface.addEventListener(type, this.handleSurfaceTouch, { capture: true, passive: false });
     }
@@ -654,6 +659,7 @@ export class PaperCanvas {
   }
 
   private unbindScrollGestures(surface: HTMLElement): void {
+    this.touchFallback?.destroy();
     for (const type of ["pointerdown", "pointermove", "pointerup", "pointercancel"] as const) {
       surface.removeEventListener(type, this.handleSurfaceTouch, true);
     }
@@ -703,7 +709,8 @@ export class PaperCanvas {
     if (this.active && this.tool.kind !== "hand" && (samePointerContact || previousCaptureLost)) this.commitActiveStroke();
     if (event.pointerType === "touch") {
       this.trackTouch(event);
-      if (this.tool.kind === "select" && event.target === this.canvas && this.touchPointers.size === 1 && this.touchPointers.has(event.pointerId)) this.beginSelection(event);
+      if (this.tool.kind === "select" && event.target === this.canvas && this.touchPointers.size === 1 &&
+          this.touchPointers.has(event.pointerId) && !this.isPalmTouch(event)) this.beginSelection(event);
       return;
     }
     if (event.pointerType !== "pen" && event.pointerType !== "mouse") return;
@@ -783,9 +790,20 @@ export class PaperCanvas {
     }
     if (this.touchPointers.has(event.pointerId)) {
       const previous = this.touchPointers.get(event.pointerId)!;
-      this.touchPointers.set(event.pointerId, this.touchPoint(event));
+      const point = this.touchPoint(event);
+      this.touchPointers.set(event.pointerId, point);
+      if (this.isPalmTouch(event)) {
+        // This fresh finger landed just after a pen lift. It can take over
+        // after the guard interval without lifting or replaying hidden motion.
+        if (this.singlePan) {
+          this.singlePan.start = point;
+          this.singlePan.startedAt = performance.now();
+        }
+        if (this.pinchStart) this.beginPinch();
+        return;
+      }
       if (this.pinchStart) this.updatePinch();
-      else if (this.singlePan?.id === event.pointerId) this.moveSingleFinger(this.touchPointers.get(event.pointerId)!, previous);
+      else if (this.singlePan?.id === event.pointerId) this.moveSingleFinger(point, previous);
       return;
     }
     if (this.eraserPointerID === event.pointerId) this.eraseAt(this.pagePoint(event));
@@ -973,7 +991,7 @@ export class PaperCanvas {
 
   private rejectTouchMove(event: PointerEvent): boolean {
     if (this.palmContacts.has(event.pointerId)) return true;
-    if (this.touchPointers.has(event.pointerId) && this.isPalmTouch(event)) {
+    if (this.touchPointers.has(event.pointerId) && (this.palmContacts.size || this.isWriting || broadContact(event))) {
       this.rejectHeldTouches();
       return true;
     }
@@ -1023,13 +1041,13 @@ export class PaperCanvas {
   private trackTouch(event: PointerEvent): void {
     this.stopMomentum();
     // A fresh down may reuse a pointer ID after the browser lost its last up.
+    if (event.isPrimary && !this.isWriting && this.palmContacts.size && !this.touchPointers.size) this.palmContacts.clear();
     this.palmContacts.delete(event.pointerId);
     this.draggedContacts.delete(event.pointerId);
     this.lastDragRelease = null;
     const now = performance.now();
-    const resting = this.singlePan && this.tool.kind !== "hand" && !this.singlePan.movedBeforeRest &&
-      now - this.singlePan.startedAt >= PALM_REST_MS;
-    if (this.isPalmTouch(event) || resting) {
+    const penContact = this.isWriting || this.handDrag !== null || this.selectionDrag?.pointerType === "pen";
+    if (this.palmContacts.size || penContact || broadContact(event)) {
       this.rejectHeldTouches();
       this.palmContacts.add(event.pointerId);
       return;
@@ -1050,26 +1068,28 @@ export class PaperCanvas {
     if (this.touchPointers.size !== 1 || (this.tool.kind !== "hand" && this.requireTwoWhileWriting) ||
         (this.tool.kind === "select" && event.target === this.canvas) ||
         (event.target instanceof Element && event.target.closest("button, input, select, textarea, a, .paper-image-object"))) return;
-    this.singlePan = { id: event.pointerId, start: point, startedAt: now, movedBeforeRest: false, active: false };
+    this.singlePan = { id: event.pointerId, start: point, startedAt: now, active: false };
   }
 
   private moveSingleFinger(point: CanvasPoint, previous: CanvasPoint): void {
     const pan = this.singlePan!;
     if (!pan.active) {
-      const elapsed = performance.now() - pan.startedAt;
+      const now = performance.now();
+      const elapsed = now - pan.startedAt;
       const writing = this.tool.kind !== "hand";
-      if (writing && elapsed >= PALM_REST_MS && !pan.movedBeforeRest) {
-        this.rejectHeldTouches();
-        return;
-      }
       const travel = distance(point, pan.start);
-      if (travel > 5) pan.movedBeforeRest = true;
-      if (travel < (writing ? 9 : 4)) return;
+      // A fresh fingertip can rest briefly after writing. Require a clearer drag
+      // near the pen, but keep accepting movement from that same finger.
+      const restedNearPen = elapsed >= PALM_REST_MS && this.lastPenAt >= pan.startedAt - AFTER_PEN_MS;
+      const slop = writing ? (restedNearPen ? 20 : 9) : 4;
+      if (travel <= slop) return;
       this.draggedContacts.add(pan.id);
-      if (writing && elapsed < FINGER_INTENT_MS) return;
+      if (writing && elapsed < 45 && travel < 20) return;
       pan.active = true;
-      // Discard the uncertain part of the gesture. Future deltas track 1:1.
-      return;
+      // Apply the part beyond tap jitter even if the browser coalesced the
+      // entire swipe into one move. Subsequent deltas follow the finger 1:1.
+      previous = { x: pan.start.x + (point.x - pan.start.x) * slop / travel,
+        y: pan.start.y + (point.y - pan.start.y) * slop / travel };
     }
     if (this.touchOrigin) this.touchOrigin.moved = true;
     const dx = point.x - previous.x, dy = point.y - previous.y;
@@ -1125,6 +1145,7 @@ export class PaperCanvas {
   }
 
   private endTouchPointer(event: PointerEvent): void {
+    const pageTurn = event.type === "pointerup" ? this.fittedPageSwipe(event.pointerId) : 0;
     const palm = this.palmContacts.delete(event.pointerId);
     const dragged = this.draggedContacts.delete(event.pointerId);
     const now = performance.now();
@@ -1134,6 +1155,27 @@ export class PaperCanvas {
     if (!this.touchPointers.size && !this.palmContacts.size) this.touchOrigin = null;
     if (!tracked) return;
     this.rebaseTouchGesture();
+    if (pageTurn) this.callbacks.onPageTurn?.(pageTurn);
+  }
+
+  private fittedPageSwipe(id: number): -1 | 0 | 1 {
+    if (this.navigationMode !== "paged" || !this.callbacks.onPageTurn ||
+        this.width * this.scale > this.viewport.getBoundingClientRect().width + 1) return 0;
+    const point = this.touchPointers.get(id);
+    if (!point) return 0;
+    let start: CanvasPoint, end: CanvasPoint;
+    if (this.singlePan?.id === id && this.singlePan.active) {
+      start = this.singlePan.start;
+      end = point;
+    } else if (this.pinchStart && this.touchPointers.size === 2) {
+      const [first, second] = this.touchPointers.values();
+      if (!first || !second || Math.abs(distance(first, second) / this.pinchStart.distance - 1) > .08) return 0;
+      start = this.pinchStart.center;
+      end = midpoint(first, second);
+    } else return 0;
+    const dx = end.x - start.x;
+    if (Math.abs(dx) < 70 || Math.abs(dx) < 2 * Math.abs(end.y - start.y)) return 0;
+    return dx < 0 ? 1 : -1;
   }
 
   private applyPan(): void {

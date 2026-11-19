@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { readdir, readFile, writeFile } from "node:fs/promises";
-import { join, relative, sep } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = fileURLToPath(new URL("../dist", import.meta.url));
+const root = process.argv[2] ? resolve(process.argv[2]) : fileURLToPath(new URL("../dist", import.meta.url));
 const files = [];
 
 async function visit(directory) {
@@ -21,59 +21,15 @@ for (const file of files) {
   digest.update(relative(root, file).split(sep).join("/"));
   digest.update(await readFile(file));
 }
-const cacheName = `notepad-static-${digest.digest("hex").slice(0, 12)}`;
-const precache = files.map((file) => `./${relative(root, file).split(sep).join("/")}`);
-const source = `const CACHE_PREFIX = "notepad-static-";
-const CACHE_NAME = ${JSON.stringify(cacheName)};
-const PRECACHE = ${JSON.stringify(precache)};
-
-function appRoot() { return new URL("./", self.registration.scope).pathname; }
-function isAppRequest(request) {
-  const url = new URL(request.url);
-  if (url.origin !== self.location.origin || !url.pathname.startsWith(appRoot())) return false;
-  if (request.headers.has("Authorization")) return false;
-  return !url.pathname.startsWith(appRoot() + "v1/");
-}
-
-function notifyCacheError(error) {
-  const message = error instanceof Error ? error.message : "precache failed";
-  return self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
-    clients.forEach((client) => client.postMessage({ type: "notepad-cache-error", message }));
-  });
-}
-
-function cacheResponse(event, response) {
-  if (!response.ok) return response;
-  const copy = response.clone();
-  event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy))
-    .catch(() => { /* Runtime caching is best effort when storage is full. */ }));
-  return response;
-}
-
-self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE)).catch((error) => notifyCacheError(error).then(() => { throw error; })));
-  self.skipWaiting();
-});
-self.addEventListener("activate", (event) => {
-  event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE_NAME).map((key) => caches.delete(key)))));
-  self.clients.claim();
-});
-self.addEventListener("fetch", (event) => {
-  if (event.request.method !== "GET" || !isAppRequest(event.request)) return;
-  if (event.request.mode === "navigate") {
-    event.respondWith(fetch(event.request).then(response => cacheResponse(event, response)).catch(async () => {
-      const cached = await caches.match(event.request);
-      if (cached) return cached;
-      const fallback = await caches.match(new URL("./index.html", self.registration.scope).toString())
-        || await caches.match(new URL("./", self.registration.scope).toString());
-      return fallback || new Response("NotePad is offline and its app shell is not cached yet. Open it once while online, then try again.", { status: 503, headers: { "Content-Type": "text/plain; charset=utf-8" } });
-    }));
-    return;
-  }
-  // Static precache requests and module/stylesheet requests may carry different
-  // Origin headers (Vary: Origin on the preview server). Their asset bytes are identical.
-  event.respondWith(caches.match(event.request, { ignoreVary: true }).then(cached =>
-    cached || fetch(event.request).then(response => cacheResponse(event, response))));
-});
-`;
+const template = await readFile(new URL("../public/sw.js", import.meta.url), "utf8");
+digest.update(template);
+const buildId = digest.digest("hex").slice(0, 12);
+// Publish the shell last. Its presence also identifies a completely populated cache after an interrupted install.
+const precache = files.map(file => `./${relative(root, file).split(sep).join("/")}`).filter(path => path !== "./index.html");
+precache.push("./index.html");
+const indexHash = createHash("sha256").update(await readFile(join(root, "index.html"))).digest("base64");
+const source = template
+  .replace(/^const BUILD_ID = .*;$/m, `const BUILD_ID = ${JSON.stringify(buildId)};`)
+  .replace(/^const PRECACHE = .*;$/m, `const PRECACHE = ${JSON.stringify(precache)};`)
+  .replace(/^const INDEX_INTEGRITY = .*;$/m, `const INDEX_INTEGRITY = "sha256-${indexHash}";`);
 await writeFile(join(root, "sw.js"), source);

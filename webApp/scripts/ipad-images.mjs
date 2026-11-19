@@ -169,10 +169,12 @@ try {
   const normal = await scrollPhoto();
   assert(normal.single > 10 && normal.pair > 10, "One intentional finger and two fingers must each scroll the photo page");
   await page.locator("#auth-button").click();
-  const strict = page.locator("#require-two-fingers");
-  assert.equal(await strict.isChecked(), false);
+  const scrollChoice = page.getByRole("group", { name: "Scroll while writing" });
+  const oneFinger = scrollChoice.getByRole("radio", { name: "One finger", exact: true });
+  const strict = scrollChoice.getByRole("radio", { name: "Two fingers only", exact: true });
+  assert.equal(await oneFinger.isChecked(), true);
   await strict.check();
-  await page.locator("#settings-form").getByRole("button", { name: "Save settings" }).click();
+  await page.locator("#cancel-settings").click();
   const guarded = await scrollPhoto();
   assert.equal(guarded.single, 0, "The writing preference must hold the page still with one finger");
   assert(guarded.pair > 10, "The writing preference must preserve two-finger pan");
@@ -252,6 +254,11 @@ try {
   await page.reload();
   await page.locator("#library-settings").click();
   assert.equal(await strict.isChecked(), true, "The two-finger preference must persist after reopening");
+  await oneFinger.check();
+  await page.locator("#cancel-settings").click();
+  await page.reload();
+  await page.locator("#library-settings").click();
+  assert.equal(await oneFinger.isChecked(), true, "Changing back to one finger must persist without Save settings");
   assert.equal(await settings.locator("#return-after-erase").isChecked(), false);
   assert.equal(await settings.locator("#show-eraser-shortcut").isChecked(), false);
   assert.deepEqual(errors, []);

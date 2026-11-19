@@ -1,3 +1,4 @@
+import { observeOfflineWorker } from "./offline-worker";
 import "./styles.css";
 import { lockBrowserZoom } from "./browser-zoom";
 import { AuthClient, AuthSession, getEndpoint, setEndpoint, workspaceAccountKey } from "./auth";
@@ -29,7 +30,7 @@ import { removeGuestData } from "./remove-guest-data";
 import { FloatingTools } from "./floating-tools";
 
 const BASE = import.meta.env.BASE_URL;
-const APP_BUILD = "2026.11.19.2";
+const APP_BUILD = "2026.11.19.3";
 const editDate = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
 const olderEditDate = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" });
 type OfflineCacheStatus = "preparing" | "ready" | "error" | "unsupported" | "development";
@@ -262,6 +263,7 @@ class NotePadApp {
     this.canvas = new PaperCanvas(canvas, byId("paper"), byId("paper-viewport"), {
       onChange: (strokes) => this.handleCanvasChange(strokes),
       onSelectionChange: () => this.updateInkSelection(),
+      onPageTurn: direction => { void this.turnPage(direction); },
       onEraseComplete: () => {
         if (this.returnAfterErase && this.selectedTool === "eraser") this.selectTool(this.lastInkTool);
       },
@@ -564,6 +566,12 @@ class NotePadApp {
     }));
     this.bindAuthEvents();
     byId<HTMLFormElement>("settings-form").addEventListener("submit", (event) => { event.preventDefault(); void this.saveSettings(); });
+    byId("scroll-while-writing").addEventListener("change", () => {
+      this.requireTwoFingersWhileWriting = byId<HTMLInputElement>("require-two-fingers").checked;
+      this.canvas?.setRequireTwoFingersWhileWriting(this.requireTwoFingersWhileWriting);
+      this.updateGestureHint();
+      this.saveToolSettings();
+    });
     byId<HTMLFormElement>("notebook-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       const submit = byId("notebook-form").querySelector<HTMLButtonElement>('button[type="submit"]')!;
@@ -846,6 +854,7 @@ class NotePadApp {
   private openSettings(): void {
     byId<HTMLInputElement>("return-after-erase").checked = this.returnAfterErase;
     byId<HTMLInputElement>("show-eraser-shortcut").checked = this.showEraserShortcut;
+    byId<HTMLInputElement>("scroll-one-finger").checked = !this.requireTwoFingersWhileWriting;
     byId<HTMLInputElement>("require-two-fingers").checked = this.requireTwoFingersWhileWriting;
     this.renderWorkspaceRecovery();
     this.openDialog("settings-dialog");
@@ -2479,9 +2488,9 @@ class NotePadApp {
   }
 
   private updateGestureHint(): void {
-    byId("paper-gesture-hint").textContent = this.selectedTool === "select" ? "Drag to select ink · Two fingers to pan or zoom"
-      : this.selectedTool !== "hand" && this.requireTwoFingersWhileWriting ? "Two fingers to pan or zoom"
-      : "One finger to pan · Pinch to zoom";
+    byId("paper-gesture-hint").textContent = this.selectedTool === "select" ? "Drag to select ink · Scroll with two fingers"
+      : this.selectedTool !== "hand" && this.requireTwoFingersWhileWriting ? "Scroll with two fingers · Pinch to zoom"
+      : "Scroll with one finger · Pinch to zoom";
   }
 
   private saveToolSettings(): void {
@@ -2918,12 +2927,6 @@ class NotePadApp {
     }
     this.returnAfterErase = byId<HTMLInputElement>("return-after-erase").checked;
     this.showEraserShortcut = byId<HTMLInputElement>("show-eraser-shortcut").checked;
-    const requireTwo = byId<HTMLInputElement>("require-two-fingers").checked;
-    if (this.requireTwoFingersWhileWriting !== requireTwo) {
-      this.requireTwoFingersWhileWriting = requireTwo;
-      this.canvas?.setRequireTwoFingersWhileWriting(requireTwo);
-      this.updateGestureHint();
-    }
     this.saveToolSettings();
     this.floatingTools?.setEraserShortcut(this.showEraserShortcut);
     if (previous !== next) {
@@ -3066,13 +3069,6 @@ class NotePadApp {
     }
   }
 
-  private readonly handleServiceWorkerMessage = (event: MessageEvent): void => {
-    const data = event.data;
-    if (!data || typeof data !== "object" || data.type !== "notepad-cache-error") return;
-    const message = typeof data.message === "string" && data.message.trim() ? data.message : "The offline cache could not be prepared.";
-    this.setOfflineCacheStatus("error", `Offline cache error: ${message}`);
-  };
-
   private async registerServiceWorker(): Promise<void> {
     if (!("serviceWorker" in navigator)) {
       this.setOfflineCacheStatus("unsupported", "Offline cache is unavailable in this browser.");
@@ -3091,14 +3087,9 @@ class NotePadApp {
       return;
     }
     this.setOfflineCacheStatus("preparing", "Preparing offline cache…");
-    navigator.serviceWorker.addEventListener("message", this.handleServiceWorkerMessage);
     try {
-      const registration = await navigator.serviceWorker.register(`${BASE}sw.js`, { scope: BASE });
-      const worker = registration.installing ?? registration.waiting;
-      if (worker) await waitForServiceWorker(worker);
-      await navigator.serviceWorker.ready;
-      if (!registration.active || registration.active.state !== "activated") throw new Error("The service worker did not activate.");
-      this.setOfflineCacheStatus("ready", navigator.serviceWorker.controller ? "Offline cache ready." : "Offline cache ready; available after reload.");
+      const registration = await navigator.serviceWorker.register(`${BASE}sw.js`, { scope: BASE, updateViaCache: "none" });
+      observeOfflineWorker(navigator.serviceWorker, registration, (status, message) => this.setOfflineCacheStatus(status, message));
     } catch (error) {
       this.setOfflineCacheStatus("error", `Offline cache error: ${error instanceof Error ? error.message : "installation failed"}`);
     }
@@ -3254,7 +3245,7 @@ function shellMarkup(auth: AuthSession): string {
           <div class="paper-scroll" id="paper-scroll"><div class="page-flow" id="page-flow"><article class="flow-page active" id="active-page-slot" data-flow-page=""><div class="paper-viewport" id="paper-viewport"><div class="paper" id="paper"><canvas id="ink-canvas" aria-label="Note page drawing surface"></canvas><div class="paper-image-layer" id="paper-image-layer" aria-label="Page images"></div></div></div></article></div></div>
           <div class="print-note" aria-hidden="true"><h1 id="print-title"></h1><p id="print-text"></p></div>
           <div class="stage-foot">
-            <div class="paper-gesture"><span id="tool-name" aria-live="polite">Pen</span><span id="paper-gesture-hint">One finger to pan · Pinch to zoom</span></div>
+            <div class="paper-gesture"><span id="tool-name" aria-live="polite">Pen</span><span id="paper-gesture-hint">Scroll with one finger · Pinch to zoom</span></div>
             <select id="page-view-mode" aria-label="Page view mode" title="Page view mode"><option value="continuous">Scroll</option><option value="horizontal">Book scroll</option><option value="paged">Page turn</option></select>
             <div class="view-controls">
               <button class="quiet-button" id="zoom-out" aria-label="Zoom out" title="Zoom out">−</button>
@@ -3349,10 +3340,17 @@ function dialogMarkup(auth: AuthSession): string {
   <dialog class="dialog" id="versions-dialog" aria-labelledby="versions-title"><div class="dialog-form"><div class="dialog-head"><h2 id="versions-title">Saved versions</h2><button type="button" class="icon-button" id="close-versions" aria-label="Close saved versions">×</button></div><p>Sync resolves simultaneous edits without creating extra notebooks. Earlier versions stay on this device. Restore as copy creates a new notebook without replacing current notes. Notebook versions contain notebook details only; page versions include ink, images and text.</p><div id="versions-list"></div><p id="versions-message" role="status"></p></div></dialog>
   <dialog class="dialog" id="settings-dialog" aria-labelledby="settings-title"><form class="dialog-form" id="settings-form">
     <div class="dialog-head"><h2 id="settings-title">Settings</h2><button type="button" class="icon-button" id="cancel-settings" aria-label="Close">×</button></div>
+    <fieldset class="writing-settings" id="scroll-while-writing" aria-describedby="scroll-choice-help">
+      <legend>Scroll while writing</legend>
+      <div class="scroll-choices">
+        <label><input id="scroll-one-finger" name="scroll-fingers" type="radio" value="one" />One finger</label>
+        <label><input id="require-two-fingers" name="scroll-fingers" type="radio" value="two" />Two fingers only</label>
+      </div>
+      <p id="scroll-choice-help">Applies immediately to pen, highlighter, line and eraser. Pinch with two fingers to zoom.</p>
+    </fieldset>
     <fieldset class="writing-settings"><legend>Writing</legend>
       <label><input id="return-after-erase" type="checkbox" />Return to previous pen after erasing</label>
       <label><input id="show-eraser-shortcut" type="checkbox" />Show quick eraser in Focus mode</label>
-      <label><input id="require-two-fingers" type="checkbox" /> Require two fingers to scroll while writing</label>
     </fieldset>
     <section class="settings-section" aria-labelledby="sync-heading">
       <h3 id="sync-heading">Sync</h3>
@@ -3486,26 +3484,6 @@ async function makePageImage(file: File, page: NotePage, index: number): Promise
     const height = canvas.height * scale;
     return { id: id(), src, x: Math.min(64 + index * 16, page.width - width), y: Math.min(64 + index * 16, page.height - height), width, height };
   } finally { canvas.width = canvas.height = 1; }
-}
-
-function waitForServiceWorker(worker: ServiceWorker): Promise<void> {
-  if (worker.state === "activated") return Promise.resolve();
-  if (worker.state === "redundant") return Promise.reject(new Error("installation failed"));
-  return new Promise((resolve, reject) => {
-    const timeout = window.setTimeout(() => finish(new Error("installation timed out")), 20_000);
-    const onStateChange = (): void => {
-      if (worker.state === "activated") finish();
-      else if (worker.state === "redundant") finish(new Error("installation failed"));
-    };
-    const finish = (error?: Error): void => {
-      window.clearTimeout(timeout);
-      worker.removeEventListener("statechange", onStateChange);
-      if (error) reject(error);
-      else resolve();
-    };
-    worker.addEventListener("statechange", onStateChange);
-    onStateChange();
-  });
 }
 
 const appRoot = document.getElementById("app");

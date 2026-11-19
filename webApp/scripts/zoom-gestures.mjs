@@ -6,7 +6,8 @@ import { readFile } from "node:fs/promises";
 // Disposable accounts and local storage; never connects to a real sync server.
 const port = "4191";
 const url = process.env.QA_URL || `http://127.0.0.1:${port}/native-notes/`;
-if (!/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(url)) throw new Error("QA_URL must be a local test server.");
+const published = url === "https://singtoblood-s.github.io/native-notes/";
+if (!published && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(url)) throw new Error("QA_URL must be local or the published static app.");
 const server = process.env.QA_URL ? null : spawn(process.execPath, ["node_modules/vite/bin/vite.js", "--port", port, "--strictPort"], { windowsHide: true, stdio: "ignore" });
 try {
   for (let attempt = 0; attempt < 60; attempt++) {
@@ -17,10 +18,14 @@ try {
   for (const engine of [chromium, webkit]) {
     const browser = await engine.launch({ headless: true });
     try {
-      const context = await browser.newContext({ ...devices["iPad (gen 7)"] });
+      const context = await browser.newContext({ ...devices["iPad (gen 7)"], serviceWorkers: "block" });
       const page = await context.newPage();
       const errors = [];
       page.on("pageerror", error => errors.push(error.message));
+      if (published) await context.route("**/*", route => {
+        const request = route.request();
+        return request.method() === "GET" && request.url().startsWith(url) ? route.continue() : route.abort();
+      });
       await page.addInitScript(() => {
         localStorage.setItem("notepad.endpoint", "https://qa.invalid");
         sessionStorage.setItem("notepad.session", JSON.stringify({ endpoint: "https://qa.invalid", user: { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", identifier: "QA" }, sessionToken: "qa-only", expiresAt: "2099-01-01T00:00:00Z" }));
@@ -69,6 +74,9 @@ try {
       assert(Math.abs(await paperWidth() - original) < 2, "Typing in a field must not change paper zoom");
       assert.equal(await webScale(), 1);
       await page.locator("#close-inspector").click();
+      const nativeSession = engine === chromium ? await context.newCDPSession(page) : null;
+      await checkFingerSizes(page, nativeSession);
+      await checkPageTravel(page, nativeSession, 1);
       for (const mode of ["continuous", "horizontal", "paged"]) {
         await page.locator("#page-view-mode").selectOption(mode);
         for (const tool of ["pen", "hand", "select"]) {
@@ -134,10 +142,13 @@ try {
         await session.detach();
       }
       await checkFirstPreviewStroke(page);
+      await checkPageTravel(page, nativeSession, 2);
+      await checkPageTurn(page, nativeSession, engine.name());
+      await nativeSession?.detach();
       await page.setViewportSize({ width: 1024, height: 768 });
       assert.equal(await webScale(), 1, "Rotation must keep browser scale fixed");
       assert.deepEqual(errors, []);
-      console.log(`PASS ${engine.name()}: 1/2/3-finger transitions in Scroll, Book scroll and Page turn with pen/hand/select, library, toolbar, dialogs, form focus, wheel, Safari gesture cancellation, keyboard paper zoom, rotation${engine === chromium ? ", native mobile pinch" : ""}`);
+      console.log(`PASS ${engine.name()}: wide fingertips, Touch Events, fit-page edges and adjacent sheets, 1/2/3-finger transitions, pen/hand/select, browser zoom guards and rotation${engine === chromium ? ", trusted mobile swipe/pinch" : ""}`);
     } finally { await browser.close(); }
   }
 } finally { server?.kill(); }
@@ -188,6 +199,185 @@ async function checkFingerCounts(page, mode, tool) {
   assert.deepEqual(samples.afterRelease, samples.newPair, `${label}: the remaining finger moved the viewport`);
 }
 
+// Chromium can drive a trusted swipe. WebKit's Playwright touchscreen exposes tap
+// only, so also exercise a real DOM TouchEvent sequence with no Pointer Events.
+async function swipePaper(page, session, { axis = "y", distance = 70, count = 1, width = 48, height = 40, stream = "touch-only", firstId = 1, loseEnd = false, spread = 0 }) {
+  const rect = await page.locator("#paper-scroll").boundingBox();
+  const x = Math.round(rect.x + rect.width / 2), y = Math.round(rect.y + rect.height / 2);
+  const points = step => Array.from({ length: count }, (_, i) => ({
+    x: x + i * 80 - (axis === "x" ? distance * step : 0) + (i - .5) * spread * step,
+    y: y - (axis === "y" ? distance * step : 0) - i * spread * step / 2,
+  }));
+  const groups = [points(0), points(.5), points(1)];
+  if (session) {
+    const native = points => points.map((point, i) => ({ ...point, id: firstId + i, radiusX: width / 2, radiusY: height / 2, force: .45 }));
+    await session.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: native(groups[0]) });
+    await session.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: native(groups[2]) });
+    await session.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    return;
+  }
+  await page.evaluate(({ groups, width, height, stream, firstId, loseEnd }) => {
+    const targets = groups[0].map(point => document.elementFromPoint(point.x, point.y));
+    if (!targets.every(target => target?.closest("#paper-scroll"))) throw new Error("Touch must hit paper");
+    const touchList = touches => document.createTouchList ? document.createTouchList(...touches) : touches;
+    const contacts = positions => targets.map((target, i) => {
+      const { x: clientX, y: clientY } = positions[i];
+      if (document.createTouch) {
+        return document.createTouch(window, target, firstId + i, clientX, clientY, clientX, clientY, width / 2, height / 2, 0, .45);
+      }
+      return new Touch({ target, identifier: firstId + i, clientX, clientY, radiusX: width / 2, radiusY: height / 2, force: .45 });
+    });
+    const emit = (type, active, changed) => targets[0].dispatchEvent(new TouchEvent(type, {
+      bubbles: true, cancelable: true, touches: touchList(active), targetTouches: touchList(active), changedTouches: touchList(changed),
+    }));
+    const pointer = (phase, contacts) => contacts.forEach((touch, i) => targets[i].dispatchEvent(new PointerEvent(phase === "lostpointercapture" ? phase : `pointer${phase}`, {
+      bubbles: true, cancelable: true, pointerType: "touch", pointerId: 41 + i, isPrimary: i === 0,
+      clientX: touch.clientX, clientY: touch.clientY, width, height, buttons: phase === "down" || phase === "move" ? 1 : 0,
+    })));
+    const start = contacts(groups[0]), finish = contacts(groups[2]);
+    if (stream !== "touch-only") pointer("down", start);
+    emit("touchstart", start, start);
+    if (stream !== "touch-only") {
+      const mid = contacts(groups[1]);
+      pointer("move", mid);
+      emit("touchmove", mid, mid);
+      if (stream === "cancelled-pointer") {
+        pointer("cancel", mid);
+        pointer("lostpointercapture", mid);
+      }
+      if (stream === "paired") pointer("move", finish);
+    }
+    emit("touchmove", finish, finish);
+    if (loseEnd) return;
+    if (stream !== "touch-only" && stream !== "cancelled-pointer") pointer("up", finish);
+    emit("touchend", [], finish);
+  }, { groups, width, height, stream, firstId, loseEnd });
+}
+
+async function setStrictWriting(page, strict) {
+  await page.locator("#auth-button").click();
+  await page.locator(strict ? "#require-two-fingers" : "#scroll-one-finger").check();
+  await page.locator("#settings-form").getByRole("button", { name: "Save settings" }).click();
+}
+
+async function checkFingerSizes(page, nativeSession) {
+  await page.locator("#page-view-mode").selectOption("continuous");
+  await page.locator("#fit-button").click();
+  await page.locator("#zoom-in").click();
+  await page.locator("#zoom-in").click();
+  await page.locator("#pen-tool").click();
+  const scroll = page.locator("#paper-scroll");
+  const test = async (session, count, width, height, allowed, stream = "touch-only") => {
+    await scroll.evaluate(el => { el.scrollTop = 0; });
+    await swipePaper(page, session, { count, width, height, stream });
+    const top = await scroll.evaluate(el => el.scrollTop);
+    const label = `${session ? "trusted" : stream} ${count} × ${width} by ${height}`;
+    if (allowed) assert(top > 40 && top <= 73, `${label} moved ${top}px on a 70px swipe`);
+    else assert.equal(top, 0, `${label} moved despite the writing preference or palm guard`);
+  };
+  const streams = nativeSession ? [nativeSession, null] : [null];
+  for (const stream of streams) {
+    for (const [width, height] of [[36, 36], [54, 38]]) await test(stream, 1, width, height, true);
+    await test(stream, 1, 72, 72, false);
+  }
+  for (const stream of ["paired", "missing-move", "cancelled-pointer"]) await test(null, 1, 48, 42, true, stream);
+  await test(null, 1, 72, 72, false, "cancelled-pointer");
+  await swipePaper(page, null, { width: 76, height: 72, firstId: 55, loseEnd: true });
+  await test(null, 1, 48, 42, true);
+  await setStrictWriting(page, true);
+  for (const stream of streams) {
+    await test(stream, 1, 48, 48, false);
+    await test(stream, 2, 48, 48, true);
+  }
+  await setStrictWriting(page, false);
+}
+
+async function checkPageTravel(page, session, sheetCount) {
+  const scroll = page.locator("#paper-scroll");
+  for (const mode of ["continuous", "horizontal"]) {
+    const horizontal = mode === "horizontal";
+    await page.locator("#page-view-mode").selectOption(mode);
+    await page.locator("#fit-button").click();
+    await scroll.evaluate(async (el, horizontal) => {
+      await new Promise(requestAnimationFrame);
+      if (horizontal) el.scrollLeft = el.scrollWidth;
+      else el.scrollTop = el.scrollHeight;
+      await new Promise(requestAnimationFrame);
+    }, horizontal);
+    const read = () => scroll.evaluate((el, horizontal) => ({
+      position: horizontal ? el.scrollLeft : el.scrollTop,
+      limit: horizontal ? el.scrollWidth - el.clientWidth : el.scrollHeight - el.clientHeight,
+    }), horizontal);
+    const edge = await read();
+    assert(Math.abs(edge.position - edge.limit) <= 2, `${mode}: fit-page edge must be reachable`);
+    const axis = horizontal ? "x" : "y";
+    await swipePaper(page, session, { axis, distance: 80 });
+    const blocked = await read();
+    assert(Math.abs(blocked.position - edge.position) <= 2, `${mode}: cannot scroll beyond the final sheet`);
+    await swipePaper(page, session, { axis, distance: -80 });
+    const reversed = await read();
+    if (edge.limit > 40) assert(reversed.position < edge.position - 20, `${mode}: reverse drag stuck at the edge`);
+    else assert(reversed.position <= edge.position, `${mode}: fitted sheet moved the wrong way`);
+    if (sheetCount === 2) {
+      assert(edge.limit > 100, `${mode}: second sheet must add scrollable space`);
+      await scroll.evaluate((el, horizontal) => {
+        const next = el.querySelectorAll(".flow-page")[1].getBoundingClientRect();
+        const box = el.getBoundingClientRect();
+        if (horizontal) el.scrollLeft += next.left - (box.left + box.width / 2) - 50;
+        else el.scrollTop += next.top - (box.top + box.height / 2) - 50;
+      }, horizontal);
+      const hitSheet = () => scroll.evaluate(el => {
+        const box = el.getBoundingClientRect();
+        return document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2)?.closest(".flow-page")?.getAttribute("aria-label");
+      });
+      assert.equal(await hitSheet(), "First page", `${mode}: start on the first sheet`);
+      await swipePaper(page, session, { axis, distance: 130 });
+      assert.equal(await hitSheet(), "Page 2", `${mode}: finger swipe must reach the next sheet at fit`);
+    }
+  }
+}
+
+async function checkPageTurn(page, session, engineName) {
+  await page.locator("#page-view-mode").selectOption("paged");
+  if (await page.locator("#previous-page").isEnabled()) await page.locator("#previous-page").click();
+  const position = n => page.waitForFunction(expected => document.querySelector("#page-position").textContent === expected, `${n} / 2`, { timeout: 3000 });
+  const unchanged = async n => {
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    assert.equal(await page.locator("#page-position").textContent(), `${n} / 2`);
+  };
+  const paperWidth = () => page.locator("#paper").evaluate(el => el.getBoundingClientRect().width);
+  await position(1);
+  await page.locator("#fit-button").click();
+  await page.locator("#pen-tool").click();
+  await swipePaper(page, session, { axis: "x", distance: 130 });
+  await position(2);
+  assert.equal(await page.locator("#next-page").isEnabled(), false);
+  await page.locator("#zoom-in").click();
+  await page.locator("#zoom-in").click();
+  await swipePaper(page, session, { axis: "x", distance: -130 });
+  await unchanged(2);
+  await page.locator("#fit-button").click();
+  await swipePaper(page, session, { axis: "x", distance: -130 });
+  await position(1);
+  await setStrictWriting(page, true);
+  await swipePaper(page, session, { axis: "x", distance: 130 });
+  await unchanged(1);
+  const fitWidth = await paperWidth();
+  await swipePaper(page, session, { axis: "x", distance: 130, count: 2, spread: 100 });
+  assert(await paperWidth() > fitWidth * 1.3, "The moving two-finger pinch must scale the fitted sheet");
+  await unchanged(1);
+  await page.locator("#fit-button").click();
+  await swipePaper(page, session, { axis: "x", distance: 130, count: 2 });
+  await position(2);
+  await setStrictWriting(page, false);
+  await page.locator("#select-tool").click();
+  await swipePaper(page, session, { axis: "x", distance: -130 });
+  await unchanged(2);
+  await swipePaper(page, session, { axis: "x", distance: -130, count: 2 });
+  await position(1);
+  console.log(`PASS ${engineName}: fitted pages turn with a swipe, zoomed pages pan, strict mode and Select require a pair, and a pinch preserves the page`);
+}
+
 async function checkPalmRejection(page) {
   await page.locator("#zoom-in").click();
   await page.locator("#zoom-in").click();
@@ -199,7 +389,7 @@ async function checkPalmRejection(page) {
     const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
     const event = (kind, phase, id, dy = 0, size = 8) => {
       canvas.dispatchEvent(new PointerEvent(`pointer${phase}`, {
-        pointerId: id, pointerType: kind, isPrimary: true, bubbles: true, cancelable: true,
+        pointerId: id, pointerType: kind, isPrimary: id !== 14, bubbles: true, cancelable: true,
         width: size, height: size, pressure: phase === "down" || phase === "move" ? .45 : 0,
         buttons: phase === "down" || phase === "move" ? 1 : 0, button: 0,
         clientX: rect.x + (kind === "pen" ? 220 : 350), clientY: rect.y + 270 + dy,
@@ -239,11 +429,12 @@ async function checkPalmRejection(page) {
     const intentional = snapshot(); event("touch", "up", 16, -80);
     return { baseline, penFirst, jitter, micro, tentative, rolledBack, persistent, broad, rested, intentional };
   });
-  for (const key of ["penFirst", "jitter", "micro", "rolledBack", "persistent", "broad", "rested"]) {
+  for (const key of ["penFirst", "jitter", "micro", "rolledBack", "persistent", "broad"]) {
     assert.deepEqual(samples[key], samples.baseline, `Palm sequence moved the viewport at ${key}`);
   }
   assert(samples.tentative[1] > samples.baseline[1] + 10, "Expected an actual pan before the stylus arrived");
-  assert(samples.intentional[1] > samples.baseline[1] + 10, "A fresh single finger could not scroll after palms lifted");
+  assert(samples.rested[1] > samples.baseline[1] + 10, "Resting a finger without a nearby pen must still allow intentional scrolling");
+  assert(samples.intentional[1] > samples.rested[1] + 10, "A fresh single finger could not scroll after palms lifted");
   const archive = await notebookBackup(page);
   assert.equal(archive.pages[0].strokes.length, 3, "The three Pencil contacts must produce exactly three strokes");
 }

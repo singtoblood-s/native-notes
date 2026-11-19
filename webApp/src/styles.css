@@ -29,7 +29,10 @@
 [hidden], .hidden { display: none !important; }
 html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 body { background: var(--surface); color: var(--ink); }
-.app-shell { position: relative; height: 100dvh; overflow: hidden; }
+.app-shell {
+  position: relative; height: 100%; height: 100dvh; overflow: hidden;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+}
 .login-required .app-shell > :not(dialog) { visibility: hidden; }
 button, input, textarea, select { font: inherit; color: inherit; }
 button {
@@ -108,7 +111,7 @@ h1, h2, h3, p { margin: 0; }
 [data-state="syncing"] [data-sync-icon] { animation: spin 1.1s linear infinite; }
 [data-sync-label] { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .library-workspace { grid-area: workspace; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-.library-body { flex: 1; min-width: 0; overflow-y: auto; scrollbar-width: thin; }
+.library-body { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; scrollbar-width: thin; }
 .library-heading, .library-content { width: 100%; max-width: 1180px; margin-inline: auto; padding-inline: var(--library-padding); }
 .library-content { padding-bottom: 24px; }
 .library-heading { display: flex; flex: none; align-items: center; gap: 12px; padding-block: 24px 16px; }
@@ -381,7 +384,7 @@ h1, h2, h3, p { margin: 0; }
   display: flex; flex: none; flex-direction: column; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 600;
 }
 .title-field, .text-field, .select-field { margin-bottom: 11px; }
-.title-field input, .text-field textarea, .select-field select, .dialog :is(input:not([type="checkbox"]), select, textarea) {
+.title-field input, .text-field textarea, .select-field select, .dialog :is(input:not([type="checkbox"], [type="radio"]), select, textarea) {
   width: 100%; min-height: 40px; padding: 7px 9px; border: 1px solid var(--line-strong); border-radius: var(--radius);
   background: var(--surface); color: var(--ink); font-size: 14px; font-weight: 400;
 }
@@ -462,7 +465,10 @@ h1, h2, h3, p { margin: 0; }
 .is-list .book-cover { background-image: none; }
 
 .settings-section { display: flex; flex-direction: column; gap: 6px; padding-top: 10px; border-top: 1px solid var(--line); }
-#settings-dialog { scroll-padding-bottom: 76px; }
+#settings-dialog {
+  max-height: calc(100dvh - 2 * max(12px, env(safe-area-inset-top), env(safe-area-inset-bottom)));
+  scroll-padding-bottom: 76px; overscroll-behavior: contain;
+}
 .settings-save {
   position: sticky; bottom: 0; z-index: 1;
   display: grid; gap: 6px; padding: 8px 0;
@@ -470,6 +476,12 @@ h1, h2, h3, p { margin: 0; }
 }
 .dialog .writing-settings label { flex-direction: row; align-items: center; gap: 8px; min-height: 34px; font-size: 13px; font-weight: 400; cursor: pointer; }
 .writing-settings input { flex: none; width: 17px; height: 17px; margin: 0; }
+.scroll-choices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.dialog .scroll-choices label {
+  min-height: 44px; padding: 6px 9px; border: 1px solid var(--line-strong); border-radius: var(--radius); color: var(--ink);
+}
+.scroll-choices label:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+#scroll-choice-help { margin-top: 6px; }
 .account-line, .recovery-row, .app-build { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 12px; color: var(--muted); }
 .account-line > strong { flex: 1; min-width: 0; color: var(--ink); overflow-wrap: anywhere; }
 #logout-button, #settings-sync-button { flex: none; }

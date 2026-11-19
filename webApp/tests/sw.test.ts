@@ -1,4 +1,6 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
@@ -45,40 +47,47 @@ class TestResponse {
   clone(): TestResponse { return new TestResponse(this.body, this.status); }
 }
 
+let sourcePromise: Promise<string> | undefined;
+async function generateFixture(): Promise<string> {
+  const directory = await mkdtemp(resolve(tmpdir(), "notepad-sw-unit-"));
+  try {
+    await mkdir(resolve(directory, "assets"));
+    for (const file of precache) await writeFile(resolve(directory, file), file);
+    execFileSync(process.execPath, [generatorPath, directory], { windowsHide: true });
+    return await readFile(resolve(directory, "sw.js"), "utf8");
+  } finally { await rm(directory, { recursive: true, force: true }); }
+}
+
 async function loadGeneratedServiceWorker() {
-  const generator = await readFile(generatorPath, "utf8");
-  const match = generator.match(/const source = `([\s\S]*?)`;\r?\nawait writeFile/);
-  if (!match?.[1]) throw new Error("Could not locate the generated service-worker source template.");
-  const source = match[1]
-    .replace("${JSON.stringify(cacheName)}", JSON.stringify("notepad-static-test"))
-    .replace("${JSON.stringify(precache)}", JSON.stringify(precache));
+  const source = await (sourcePromise ??= generateFixture());
 
   const handlers = new Map<string, (event: any) => void>();
   const cache = {
     added: [] as string[],
-    async addAll(resources: string[]) { this.added = [...resources]; },
+    async addAll(resources: Request[]) { this.added.push(...resources.map(req => "." + new URL(req.url).pathname.slice("/native-notes".length))); },
+    async match() { return undefined; },
     async put(_request: TestRequest, _response: Response) {},
   };
   const caches = {
     async open() { return cache; },
     async keys() { return ["notepad-static-old", "unrelated-cache"]; },
-    async delete() { return true; },
-    async match(_request: string | TestRequest, _options?: { ignoreVary?: boolean }) { return undefined as TestResponse | undefined; },
+    async delete(_name: string) { return true; },
+    async match(_request: string | TestRequest, _options?: { ignoreVary?: boolean; cacheName?: string }) { return undefined as TestResponse | undefined; },
   };
   const self = {
     location: { origin: "https://notes.example.test" },
     registration: { scope: "https://notes.example.test/native-notes/" },
-    clients: { async matchAll() { return []; } },
+    clients: { async matchAll() { return []; }, async claim() {} },
     addEventListener(type: string, listener: (event: any) => void) { handlers.set(type, listener); },
     skipWaiting() { /* no-op */ },
   };
-  const context = { self, caches, URL, Response: TestResponse, console, fetch: async (): Promise<Response> => { throw new Error("offline"); } };
+  const context = { self, caches, URL, Request, Response: TestResponse, console, fetch: async (): Promise<Response> => { throw new Error("offline"); } };
   vm.runInNewContext(source, context);
   return { handlers, cache, caches, context };
 }
 
 describe("generated service worker contract", () => {
-  it.each(["navigate", "cors"] as const)("keeps an independent offline copy of a %s response", async mode => {
+  it("keeps an independent offline copy of a fetched static asset", async () => {
     const { handlers, caches, cache, context } = await loadGeneratedServiceWorker();
     context.fetch = async () => new Response("online content");
     let openCache!: () => void;
@@ -89,7 +98,7 @@ describe("generated service worker contract", () => {
     let served!: Promise<Response>;
     let written: Promise<void> | undefined;
     handlers.get("fetch")!({
-      request: new TestRequest("https://notes.example.test/native-notes/resource", mode),
+      request: new TestRequest("https://notes.example.test/native-notes/resource", "cors"),
       respondWith(response: Promise<Response>) { served = response; },
       waitUntil(write: Promise<void>) { written = write; },
     });
@@ -116,7 +125,8 @@ describe("generated service worker contract", () => {
     let installPromise: Promise<unknown> | undefined;
     handlers.get("install")?.({ waitUntil(value: Promise<unknown>) { installPromise = value; } });
     await installPromise;
-    expect(cache.added).toEqual(precache);
+    expect([...cache.added].sort()).toEqual([...precache].sort());
+    expect(cache.added.at(-1)).toBe("./index.html");
     expect(cache.added).toContain("./index.html");
     expect(cache.added.some((path) => path.endsWith(".js"))).toBe(true);
     expect(cache.added.some((path) => path.includes("worker"))).toBe(true);
@@ -137,6 +147,52 @@ describe("generated service worker contract", () => {
       respondWith(value: Promise<TestResponse>) { responsePromise = value; },
     });
     await expect(responsePromise).resolves.toBe(shell);
+  });
+
+  it.each([
+    ["/native-notes/", 503, true],
+    ["/native-notes/index.html", 404, true],
+    ["/native-notes/", 401, false],
+    ["/native-notes/missing.pdf", 404, false],
+  ] as const)("handles navigation to %s returning %i", async (path, status, fallback) => {
+    const { handlers, caches, context } = await loadGeneratedServiceWorker();
+    const shell = new TestResponse("offline shell");
+    caches.match = async () => shell;
+    const failure = new Response("error", { status });
+    context.fetch = async () => failure;
+    let served!: Promise<Response>;
+    handlers.get("fetch")!({
+      request: new TestRequest("https://notes.example.test" + path, "navigate"),
+      respondWith(value: Promise<Response>) { served = value; },
+    });
+    await expect(served).resolves.toBe(fallback ? shell : failure);
+  });
+
+  it("retains a complete prior version for open tabs and claims clients only after cleanup", async () => {
+    const { handlers, caches } = await loadGeneratedServiceWorker();
+    const removed: string[] = [];
+    const prefix = "notepad-static-%2Fnative-notes%2F:";
+    const legacy = "notepad-static-123412341234";
+    const foreignLegacy = "notepad-static-ffffffffffff";
+    caches.keys = async () => [legacy, prefix + "previous", prefix + "interrupted", foreignLegacy, "unrelated"];
+    caches.match = async (_url, options) => [legacy, prefix + "previous"].includes(options?.cacheName ?? "") ? new TestResponse("shell") : undefined;
+    caches.delete = async (key: string) => { removed.push(key); return true; };
+    let activation!: Promise<void>;
+    handlers.get("activate")!({ waitUntil(value: Promise<void>) { activation = value; } });
+    await activation;
+    expect(removed).toEqual([legacy, prefix + "interrupted"]);
+  });
+
+  it("removes a partially downloaded build and rejects installation so the previous worker stays active", async () => {
+    const { handlers, caches, cache } = await loadGeneratedServiceWorker();
+    cache.addAll = async () => { throw new Error("network interrupted"); };
+    const deleted: string[] = [];
+    caches.delete = async (name: string) => { deleted.push(name); return true; };
+    let install!: Promise<void>;
+    handlers.get("install")!({ waitUntil(value: Promise<void>) { install = value; } });
+    await expect(install).rejects.toThrow("network interrupted");
+    expect(deleted).toHaveLength(1);
+    expect(deleted[0]).toMatch(/^notepad-static-%2Fnative-notes%2F:[a-f0-9]{12}$/);
   });
 
   it("does not intercept external or authenticated API requests", async () => {
