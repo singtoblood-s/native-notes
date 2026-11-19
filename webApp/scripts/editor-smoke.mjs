@@ -246,12 +246,17 @@ try {
       assert(Math.abs(wheeled[i][1] / pinched[i][1] - 1.08) < .005, `${mode}: wheel zoom must resize every sheet equally`);
     }
     await page.locator("#hand-tool").click();
+    await page.locator("#paper-scroll").evaluate((element, mode) => {
+      if (mode === "horizontal") element.scrollLeft = 0;
+      else element.scrollTop = 0;
+    }, mode);
     const beforeDrag = await page.locator("#paper-scroll").evaluate((element, mode) => mode === "horizontal" ? element.scrollLeft : element.scrollTop, mode);
     const contact = { pointerId: 81, pointerType: "touch", clientX: 450, clientY: 450, button: 0, buttons: 1 };
     await page.locator("#ink-canvas").dispatchEvent("pointerdown", contact);
+    await page.locator("#ink-canvas").dispatchEvent("pointermove", { ...contact, clientX: mode === "horizontal" ? 435 : 450, clientY: mode === "continuous" ? 435 : 450 });
     await page.locator("#ink-canvas").dispatchEvent("pointermove", { ...contact, clientX: mode === "horizontal" ? 350 : 450, clientY: mode === "continuous" ? 350 : 450 });
     const afterDrag = await page.locator("#paper-scroll").evaluate((element, mode) => mode === "horizontal" ? element.scrollLeft : element.scrollTop, mode);
-    assert.equal(afterDrag, beforeDrag, `${mode}: one finger must leave the zoomed sheet stationary in Hand mode`);
+    assert(afterDrag > beforeDrag + 20, `${mode}: one deliberate finger must pan the zoomed sheet in Hand mode`);
     await page.locator("#ink-canvas").dispatchEvent("pointercancel", contact);
     await page.locator("#pen-tool").click();
     await page.screenshot({ path: `${output}/${mode}-zoom.png` });
@@ -290,6 +295,26 @@ try {
   assert.equal(await page.locator("#paper-clipboard-menu").evaluate(element => element.hidden), true);
   await ink.dispatchEvent("pointercancel", touch);
   await ink.dispatchEvent("pointercancel", { ...touch, pointerId: 92 });
+  await ink.dispatchEvent("pointerdown", touch);
+  await ink.evaluate((canvas, contact) => canvas.dispatchEvent(new PointerEvent("contextmenu", {
+    ...contact, button: 2, bubbles: true, cancelable: true,
+  })), touch);
+  await page.waitForTimeout(600);
+  assert.equal(await page.locator("#paper-clipboard-menu").isVisible(), false, "A writing palm must not open the clipboard menu");
+  await ink.dispatchEvent("pointerup", touch);
+  await page.locator("#hand-tool").click();
+  await ink.dispatchEvent("pointerdown", { ...touch, width: 70, height: 52 });
+  await page.waitForTimeout(600);
+  assert.equal(await page.locator("#paper-clipboard-menu").isVisible(), false, "A broad palm must not open Hand's clipboard menu");
+  await ink.dispatchEvent("pointerup", touch);
+  const tip = { ...touch, pointerType: "pen", pointerId: 80, width: 2, height: 2 };
+  await ink.dispatchEvent("pointerdown", tip);
+  await ink.dispatchEvent("pointerup", { ...tip, buttons: 0 });
+  await ink.dispatchEvent("pointerout", { ...tip, buttons: 0 });
+  await ink.dispatchEvent("pointerdown", touch);
+  await page.waitForTimeout(600);
+  assert.equal(await page.locator("#paper-clipboard-menu").isVisible(), false, "A touch near a recent stylus must not open Hand's clipboard menu");
+  await ink.dispatchEvent("pointerup", touch);
   await ink.dispatchEvent("pointerdown", touch);
   await page.waitForTimeout(600);
   assert.equal(await page.locator("#paper-clipboard-menu").evaluate(element => element.hidden), false);

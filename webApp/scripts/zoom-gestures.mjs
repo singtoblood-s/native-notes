@@ -1,11 +1,13 @@
 import { chromium, webkit, devices } from "playwright";
 import { spawn } from "node:child_process";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 
 // Disposable accounts and local storage; never connects to a real sync server.
 const port = "4191";
-const url = `http://127.0.0.1:${port}/native-notes/`;
-const server = spawn(process.execPath, ["node_modules/vite/bin/vite.js", "--port", port, "--strictPort"], { windowsHide: true, stdio: "ignore" });
+const url = process.env.QA_URL || `http://127.0.0.1:${port}/native-notes/`;
+if (!/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(url)) throw new Error("QA_URL must be a local test server.");
+const server = process.env.QA_URL ? null : spawn(process.execPath, ["node_modules/vite/bin/vite.js", "--port", port, "--strictPort"], { windowsHide: true, stdio: "ignore" });
 try {
   for (let attempt = 0; attempt < 60; attempt++) {
     if (await fetch(url).then(response => response.ok).catch(() => false)) break;
@@ -69,15 +71,18 @@ try {
       await page.locator("#close-inspector").click();
       for (const mode of ["continuous", "horizontal", "paged"]) {
         await page.locator("#page-view-mode").selectOption(mode);
-        await page.locator("#fit-button").click();
-        await page.locator("#zoom-in").click();
-        await page.locator("#zoom-in").click();
         for (const tool of ["pen", "hand", "select"]) {
+          await page.locator("#fit-button").click();
+          await page.locator("#zoom-in").click();
+          await page.locator("#zoom-in").click();
           await page.locator(`#${tool}-tool`).click();
           await checkFingerCounts(page, mode, tool);
         }
       }
       await page.locator("#page-view-mode").selectOption("continuous");
+      await page.locator("#fit-button").click();
+      await page.locator("#pen-tool").click();
+      await checkPalmRejection(page);
       await page.locator("#fit-button").click();
       if (engine === chromium) {
         const session = await context.newCDPSession(page);
@@ -96,6 +101,8 @@ try {
         const area = await page.locator("#paper-scroll").boundingBox();
         await pinch(area.y + 180, true);
         await page.locator("#fit-button").click();
+        await page.locator("#zoom-in").click();
+        await page.locator("#paper-scroll").evaluate(element => { element.scrollTop = 0; });
         const nativeState = () => page.evaluate(() => {
           const scroll = document.querySelector("#paper-scroll");
           return [scroll.scrollLeft, scroll.scrollTop, document.querySelector("#paper").style.transform];
@@ -103,14 +110,18 @@ try {
         const initial = await nativeState();
         const points = [{ id: 1, x: 300, y: area.y + 220 }, { id: 2, x: 480, y: area.y + 220 }, { id: 3, x: 560, y: area.y + 220 }];
         await session.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: points.slice(0, 1) });
-        points[0].y -= 50;
-        await session.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: points.slice(0, 1) });
-        assert.deepEqual(await nativeState(), initial, "A real one-finger drag must leave the paper fixed");
+        for (let index = 0; index < 8; index++) {
+          points[0].y -= 9;
+          await session.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: points.slice(0, 1) });
+          await page.waitForTimeout(20);
+        }
+        const single = await nativeState();
+        assert(single[1] > initial[1] + 10, `Native one-finger drag scrolled from ${initial[1]} to ${single[1]}`);
         await session.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: points.slice(0, 2) });
         await session.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: points });
         for (const point of points) point.y -= 40;
         await session.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: points });
-        assert.deepEqual(await nativeState(), initial, "A real three-finger drag must leave the paper fixed");
+        assert.deepEqual(await nativeState(), single, "A real three-finger drag must leave the paper fixed");
         await session.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
         await page.locator("#paper-scroll").evaluate(element => { element.scrollTop = 0; });
         const fingers = [{ id: 1, x: 300, y: area.y + 180 }, { id: 2, x: 450, y: area.y + 180 }];
@@ -128,21 +139,24 @@ try {
       console.log(`PASS ${engine.name()}: 1/2/3-finger transitions in Scroll, Book scroll and Page turn with pen/hand/select, library, toolbar, dialogs, form focus, wheel, Safari gesture cancellation, keyboard paper zoom, rotation${engine === chromium ? ", native mobile pinch" : ""}`);
     } finally { await browser.close(); }
   }
-} finally { server.kill(); }
+} finally { server?.kill(); }
 
 async function checkFingerCounts(page, mode, tool) {
   const label = `${mode}/${tool}`;
-  const samples = await page.evaluate(() => {
+  const samples = await page.evaluate(async () => {
     const canvas = document.querySelector("#ink-canvas");
     const scroll = document.querySelector("#paper-scroll");
     const bounds = scroll.getBoundingClientRect();
     const snapshot = () => [scroll.scrollLeft, scroll.scrollTop, canvas.parentElement.style.transform];
     const send = (type, id, x, y) => canvas.dispatchEvent(new PointerEvent(type, {
       pointerType: "touch", pointerId: id, bubbles: true, cancelable: true, isPrimary: id === 101,
-      clientX: bounds.left + x, clientY: bounds.top + y, button: 0, buttons: type === "pointerup" ? 0 : 1,
+      clientX: bounds.left + x, clientY: bounds.top + y, button: 0, buttons: type === "pointerup" ? 0 : 1, width: 8, height: 8,
     }));
     const initial = snapshot();
     send("pointerdown", 101, 220, 230);
+    send("pointermove", 101, 210, 220);
+    await new Promise(resolve => setTimeout(resolve, 115));
+    send("pointermove", 101, 198, 208);
     send("pointermove", 101, 190, 200);
     const single = snapshot();
     send("pointerdown", 102, 390, 200);
@@ -164,10 +178,73 @@ async function checkFingerCounts(page, mode, tool) {
     send("pointerup", 102, 250, 85);
     return { initial, single, pair, three, resumed, newPair, afterRelease: snapshot() };
   });
-  assert.deepEqual(samples.single, samples.initial, `${label}: one touch moved the viewport`);
+  if (tool === "select") assert.deepEqual(samples.single, samples.initial, `${label}: drawing a selection moved the paper`);
+  else assert.notDeepEqual(samples.single, samples.initial, `${label}: deliberate one-finger pan did not scroll`);
   assert.notDeepEqual(samples.pair, samples.single, `${label}: the pair did not move the viewport`);
   assert.deepEqual(samples.three, samples.pair, `${label}: three touches moved the viewport`);
   assert.deepEqual(samples.resumed, samples.three, `${label}: replacing a finger jumped`);
   assert.notDeepEqual(samples.newPair, samples.resumed, `${label}: the new pair did not resume`);
   assert.deepEqual(samples.afterRelease, samples.newPair, `${label}: the remaining finger moved the viewport`);
+}
+
+async function checkPalmRejection(page) {
+  await page.locator("#zoom-in").click();
+  await page.locator("#zoom-in").click();
+  const samples = await page.evaluate(async () => {
+    const canvas = document.querySelector("#ink-canvas"), scroll = document.querySelector("#paper-scroll");
+    scroll.scrollTop = (scroll.scrollHeight - scroll.clientHeight) / 2;
+    const rect = scroll.getBoundingClientRect();
+    const snapshot = () => [scroll.scrollLeft, scroll.scrollTop, canvas.getBoundingClientRect().width];
+    const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const event = (kind, phase, id, dy = 0, size = 8) => {
+      canvas.dispatchEvent(new PointerEvent(`pointer${phase}`, {
+        pointerId: id, pointerType: kind, isPrimary: true, bubbles: true, cancelable: true,
+        width: size, height: size, pressure: phase === "down" || phase === "move" ? .45 : 0,
+        buttons: phase === "down" || phase === "move" ? 1 : 0, button: 0,
+        clientX: rect.x + (kind === "pen" ? 220 : 350), clientY: rect.y + 270 + dy,
+      }));
+    };
+    const liftPen = () => { event("pen", "move", 80, 12); event("pen", "up", 80, 12); event("pen", "out", 80, 12); };
+    const baseline = snapshot();
+    // A small contact that overlaps the Pencil remains quarantined even when
+    // the Pencil has lifted, left the canvas, and its hover cooldown has elapsed.
+    event("pen", "down", 80); event("touch", "down", 10); event("touch", "move", 10, -40);
+    liftPen(); await pause(390); event("touch", "move", 10, -100);
+    const penFirst = snapshot(); event("touch", "up", 10, -100);
+    event("touch", "down", 11); event("touch", "move", 11, -3);
+    const jitter = snapshot();
+    event("pen", "down", 80); liftPen(); await pause(390); event("touch", "move", 11, -85);
+    const micro = snapshot(); event("touch", "up", 11, -85);
+
+    // An ambiguous wrist contact may look like a finger until the stylus
+    // arrives. The tentative pan should be rolled back at that point.
+    event("touch", "down", 12); event("touch", "move", 12, -12);
+    await pause(115); event("touch", "move", 12, -40); event("touch", "move", 12, -65);
+    const tentative = snapshot();
+    event("pen", "down", 80); const rolledBack = snapshot();
+    liftPen(); await pause(390); event("touch", "move", 12, -115);
+    const persistent = snapshot(); event("touch", "up", 12, -115);
+
+    event("touch", "down", 13, 0, 72); event("touch", "down", 14);
+    event("touch", "move", 13, -45, 72); event("touch", "move", 14, -55);
+    event("touch", "up", 13, -45, 72); event("touch", "move", 14, -110);
+    const broad = snapshot(); event("touch", "up", 14, -110);
+    event("touch", "down", 15); event("touch", "move", 15, -2);
+    await pause(405); event("touch", "move", 15, -40); event("touch", "move", 15, -80);
+    const rested = snapshot(); event("touch", "up", 15, -80);
+
+    event("touch", "down", 16); event("touch", "move", 16, -12);
+    await pause(115); event("touch", "move", 16, -45); event("touch", "move", 16, -80);
+    const intentional = snapshot(); event("touch", "up", 16, -80);
+    return { baseline, penFirst, jitter, micro, tentative, rolledBack, persistent, broad, rested, intentional };
+  });
+  for (const key of ["penFirst", "jitter", "micro", "rolledBack", "persistent", "broad", "rested"]) {
+    assert.deepEqual(samples[key], samples.baseline, `Palm sequence moved the viewport at ${key}`);
+  }
+  assert(samples.tentative[1] > samples.baseline[1] + 10, "Expected an actual pan before the stylus arrived");
+  assert(samples.intentional[1] > samples.baseline[1] + 10, "A fresh single finger could not scroll after palms lifted");
+  await page.locator("#notebook-menu").click();
+  const [download] = await Promise.all([page.waitForEvent("download"), page.locator("#notebook-menu-popup [data-action=export-notebook-backup]").click()]);
+  const archive = JSON.parse(await readFile(await download.path(), "utf8"));
+  assert.equal(archive.pages[0].strokes.length, 3, "The three Pencil contacts must produce exactly three strokes");
 }

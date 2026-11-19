@@ -73,6 +73,277 @@ it("repaints the same Unicode lines without measuring again and reflows for a ne
 });
 
 describe("PaperCanvas pointer contract", () => {
+  describe("single-finger navigation and palm rejection", () => {
+    let now: number;
+    beforeEach(() => {
+      now = 1_000;
+      vi.spyOn(performance, "now").mockImplementation(() => now);
+    });
+    afterEach(() => { vi.restoreAllMocks(); });
+
+    function input(target: Element, type: string, elapsed: number, y: number, extra: Record<string, unknown> = {}): void {
+      now = 1_000 + elapsed;
+      target.dispatchEvent(pointer(type, {
+        pointerType: "touch", pointerId: 71, clientX: 200, clientY: y, width: 9, height: 10,
+        buttons: type === "pointerup" ? 0 : 1, timeStamp: now, ...extra,
+      }));
+    }
+
+    function page(mode: "continuous" | "horizontal" | "paged" = "continuous") {
+      const fixture = setup();
+      const { viewport, paper, canvasController } = fixture;
+      const scroll = document.createElement("div");
+      const preview = document.createElement("canvas");
+      document.body.append(scroll);
+      scroll.append(viewport, preview);
+      canvasController.setNavigationMode(mode, scroll);
+      canvasController.zoomBy(2);
+      scroll.scrollTop = 120;
+      scroll.scrollLeft = 80;
+      const pose = () => ({ top: scroll.scrollTop, left: scroll.scrollLeft, ...transformOf(paper) });
+      return { ...fixture, scroll, preview, pose };
+    }
+
+    it.each(["pen", "highlighter", "line", "eraser"] as const)(
+      "waits for both time and movement before a finger pans with %s selected", kind => {
+        const { canvas, scroll, canvasController, changes } = page();
+        canvasController.setTool({ kind, color: 0xff123456, width: 4 });
+        const draw = vi.spyOn(canvasController as unknown as { renderStatic: () => void }, "renderStatic");
+        input(canvas, "pointerdown", 0, 300);
+        input(canvas, "pointermove", 20, 285);
+        input(canvas, "pointermove", 50, 280);
+        expect(scroll.scrollTop).toBe(120);
+        input(canvas, "pointermove", 100, 278);
+        expect(scroll.scrollTop).toBe(120);
+        input(canvas, "pointermove", 122, 264);
+        expect(scroll.scrollTop).toBe(134);
+        input(canvas, "pointerup", 140, 264);
+        expect(changes).not.toHaveBeenCalled();
+        expect(draw).not.toHaveBeenCalled();
+        canvasController.destroy();
+      },
+    );
+
+    it("starts a short drag immediately in Read and leaves an image control to its own drag handler", () => {
+      const { canvas, paper, scroll, canvasController, changes } = page();
+      canvasController.setTool({ kind: "hand" });
+      const image = document.createElement("div");
+      image.className = "paper-image-object";
+      const handle = document.createElement("button");
+      handle.className = "image-resize-handle";
+      image.append(handle);
+      paper.append(image);
+      input(handle, "pointerdown", 0, 300);
+      input(handle, "pointermove", 12, 270);
+      input(handle, "pointermove", 24, 240);
+      input(handle, "pointerup", 32, 240);
+      expect(scroll.scrollTop).toBe(120);
+      input(canvas, "pointerdown", 50, 300);
+      input(canvas, "pointermove", 52, 298);
+      expect(scroll.scrollTop).toBe(120);
+      input(canvas, "pointermove", 55, 294);
+      input(canvas, "pointermove", 65, 278);
+      expect(scroll.scrollTop).toBeGreaterThanOrEqual(136);
+      expect(changes).not.toHaveBeenCalled();
+      canvasController.destroy();
+    });
+
+    it.each(["paged", "continuous", "horizontal"] as const)(
+      "restores the %s viewport before a pen stroke and ignores a pinky still down after lift", mode => {
+        const { canvas, preview, changes, canvasController, pose } = page(mode);
+        const initial = pose();
+        input(canvas, "pointerdown", 0, 300);
+        input(canvas, "pointermove", 100, 283);
+        input(canvas, "pointermove", 145, 259, { clientX: 185 });
+        expect(pose()).not.toEqual(initial);
+
+        const pen = { pointerType: "pen", pointerId: 74, pressure: .55 };
+        if (mode !== "paged") {
+          input(preview, "pointerover", 160, 80, { ...pen, buttons: 0, pressure: 0 });
+          expect(pose()).toEqual(initial);
+        }
+        input(canvas, "pointerdown", 170, 80, pen);
+        expect(pose()).toEqual(initial);
+        input(canvas, "pointermove", 185, 92, pen);
+        input(canvas, "pointermove", 195, 205);
+        input(canvas, "pointerup", 210, 105, pen);
+        input(canvas, "pointermove", 620, 180);
+        input(canvas, "pointermove", 740, 150);
+        expect(pose()).toEqual(initial);
+        expect(changes).toHaveBeenCalledTimes(1);
+        const points = changes.mock.lastCall![0][0].points;
+        expect(points[0]).toMatchObject({ x: 400, y: 160 });
+        expect(points.at(-1)).toMatchObject({ x: 400, y: 210 });
+        input(canvas, "pointerup", 755, 150);
+        input(canvas, "pointerdown", 785, 300);
+        input(canvas, "pointermove", 891, 280);
+        input(canvas, "pointermove", 925, 250, { clientX: 185 });
+        expect(pose()).not.toEqual(initial);
+        canvasController.destroy();
+      },
+    );
+
+    it.each([[30, 30], [48, 12], [12, 48]])(
+      "suppresses the whole held group after a %d by %d contact until all contacts have ended", (width, height) => {
+        const { canvas, canvasController, pose } = page();
+        const initial = pose();
+        input(canvas, "pointerdown", 0, 300, { width, height });
+        input(canvas, "pointerdown", 20, 300, { pointerId: 72, clientX: 330 });
+        input(canvas, "pointermove", 115, 230, { pointerId: 72, clientX: 390 });
+        input(canvas, "pointermove", 140, 200, { width, height });
+        expect(pose()).toEqual(initial);
+        input(canvas, "pointercancel", 150, 200, { width, height });
+        input(canvas, "pointermove", 260, 180, { pointerId: 72 });
+        input(canvas, "pointermove", 290, 150, { pointerId: 72 });
+        expect(pose()).toEqual(initial);
+        input(canvas, "pointerup", 310, 150, { pointerId: 72 });
+        input(canvas, "pointerdown", 350, 300);
+        input(canvas, "pointermove", 450, 270);
+        input(canvas, "pointermove", 485, 240);
+        expect(pose()).not.toEqual(initial);
+        canvasController.destroy();
+      },
+    );
+
+    it("stops a two-finger pinch if a tracked fingertip spreads into a palm", () => {
+      const { canvas, canvasController, pose } = page();
+      const initial = pose();
+      input(canvas, "pointerdown", 0, 300);
+      input(canvas, "pointerdown", 15, 300, { pointerId: 72, clientX: 350 });
+      input(canvas, "pointermove", 65, 290, { pointerId: 72, clientX: 380 });
+      const beforePalm = pose();
+      expect(beforePalm).not.toEqual(initial);
+      input(canvas, "pointermove", 75, 285, { width: 38, height: 32 });
+      input(canvas, "pointermove", 110, 255, { pointerId: 72, clientX: 430 });
+      input(canvas, "pointerup", 130, 285);
+      input(canvas, "pointermove", 240, 215, { pointerId: 72, clientX: 520 });
+      expect(pose()).toEqual(beforePalm);
+      input(canvas, "pointerdown", 255, 100, { pointerType: "pen", pointerId: 75 });
+      expect(pose()).toEqual(initial);
+      canvasController.destroy();
+    });
+
+    it.each(["continuous", "horizontal", "paged"] as const)(
+      "rolls back both scale and position for two resting fingertips when a pen arrives in %s", mode => {
+        const { canvas, preview, changes, canvasController, pose } = page(mode);
+        const initial = pose();
+        input(canvas, "pointerdown", 0, 330);
+        input(canvas, "pointerdown", 40, 330, { pointerId: 72, clientX: 350 });
+        input(canvas, "pointermove", 120, 270, { clientX: 180 });
+        input(canvas, "pointermove", 145, 270, { pointerId: 72, clientX: 370 });
+        const drift = pose();
+        expect(drift.scale).not.toBeCloseTo(initial.scale, 4);
+        expect(mode === "paged" ? drift.y : drift.top).not.toBeCloseTo(mode === "paged" ? initial.y : initial.top, 4);
+        const pen = { pointerType: "pen", pointerId: 74 };
+        input(mode === "paged" ? canvas : preview, "pointerover", 180, 120, { ...pen, pressure: 0, buttons: 0 });
+        expect(pose()).toEqual(initial);
+        input(canvas, "pointerdown", 190, 120, pen);
+        input(canvas, "pointermove", 206, 135, pen);
+        input(canvas, "pointerup", 230, 158, pen);
+        input(canvas, "pointermove", 290, 215);
+        input(canvas, "pointermove", 600, 205, { pointerId: 72, clientX: 480 });
+        expect(pose()).toEqual(initial);
+        expect(changes).toHaveBeenCalledTimes(1);
+        const points = changes.mock.lastCall![0][0].points;
+        expect(points[0]).toMatchObject({ x: 400, y: 240 });
+        expect(points.at(-1)).toMatchObject({ x: 400, y: 316 });
+        canvasController.destroy();
+      },
+    );
+
+    it("retains the position and zoom of a deliberate older pinch when writing starts", () => {
+      const { canvas, canvasController, pose } = page("paged");
+      const initial = pose();
+      input(canvas, "pointerdown", 0, 300);
+      input(canvas, "pointerdown", 40, 300, { pointerId: 72, clientX: 360 });
+      input(canvas, "pointermove", 125, 245, { clientX: 165 });
+      input(canvas, "pointermove", 180, 243, { pointerId: 72, clientX: 392 });
+      const intended = pose();
+      expect(intended.scale).not.toBeCloseTo(initial.scale, 4);
+      input(canvas, "pointerdown", 600, 120, { pointerType: "pen", pointerId: 75 });
+      expect(pose()).toEqual(intended);
+      canvasController.destroy();
+    });
+
+    it("prevents a preview pan from becoming a click and accepts a fresh tap on the same preview", () => {
+      const { preview, scroll, canvasController } = page();
+      const click = vi.fn();
+      preview.addEventListener("click", click);
+      const releaseClick = (y: number) => preview.dispatchEvent(pointer("click", {
+        pointerType: "touch", pointerId: 71, clientX: 200, clientY: y, detail: 1,
+      }));
+      input(preview, "pointerdown", 0, 300);
+      input(preview, "pointermove", 120, 275);
+      input(preview, "pointermove", 155, 240);
+      input(preview, "pointerup", 180, 240);
+      expect(scroll.scrollTop).toBe(155);
+      releaseClick(240);
+      expect(click).not.toHaveBeenCalled();
+      input(preview, "pointerdown", 255, 240);
+      input(preview, "pointerup", 280, 240);
+      releaseClick(240);
+      expect(click).toHaveBeenCalledTimes(1);
+      canvasController.destroy();
+    });
+
+    it("keeps jitter below the distance threshold stable after the writing time gate opens", () => {
+      const { canvas, scroll, canvasController } = page();
+      input(canvas, "pointerdown", 0, 300);
+      input(canvas, "pointermove", 100, 295);
+      input(canvas, "pointermove", 125, 292);
+      expect(scroll.scrollTop).toBe(120);
+      input(canvas, "pointermove", 155, 290);
+      expect(scroll.scrollTop).toBe(120);
+      input(canvas, "pointermove", 185, 280);
+      expect(scroll.scrollTop).toBe(130);
+      canvasController.destroy();
+    });
+
+    it("rejects a small resting pinky even if it subsequently slides, and accepts a new contact with its ID", () => {
+      const { canvas, canvasController, pose } = page();
+      const initial = pose();
+      input(canvas, "pointerdown", 0, 300);
+      input(canvas, "pointermove", 130, 298);
+      input(canvas, "pointermove", 370, 299);
+      input(canvas, "pointermove", 390, 276);
+      input(canvas, "pointermove", 410, 253);
+      expect(pose()).toEqual(initial);
+      input(canvas, "lostpointercapture", 450, 253);
+      input(canvas, "pointermove", 580, 232);
+      expect(pose()).toEqual(initial);
+      input(canvas, "pointerup", 590, 232);
+      input(canvas, "pointerdown", 610, 300);
+      input(canvas, "pointermove", 720, 275);
+      input(canvas, "pointermove", 745, 250);
+      expect(pose()).not.toEqual(initial);
+      canvasController.destroy();
+    });
+
+    it("preserves an established scroll when a pen appears and suppresses a new touch during the post-pen interval", () => {
+      const { canvas, canvasController, pose } = page();
+      input(canvas, "pointerdown", 0, 300);
+      input(canvas, "pointermove", 100, 278);
+      input(canvas, "pointermove", 130, 252);
+      const deliberate = pose();
+      expect(deliberate.top).toBeGreaterThan(120);
+      const pen = { pointerType: "pen", pointerId: 74 };
+      input(canvas, "pointerdown", 460, 90, pen);
+      input(canvas, "pointerup", 495, 104, pen);
+      input(canvas, "pointerup", 510, 252);
+      expect(pose()).toEqual(deliberate);
+      input(canvas, "pointerdown", 530, 295);
+      input(canvas, "pointermove", 645, 267);
+      input(canvas, "pointermove", 700, 233);
+      expect(pose()).toEqual(deliberate);
+      input(canvas, "pointerup", 725, 233);
+      input(canvas, "pointerdown", 900, 295);
+      input(canvas, "pointermove", 1_005, 268);
+      input(canvas, "pointermove", 1_045, 242);
+      expect(pose().top).toBeGreaterThan(deliberate.top);
+      canvasController.destroy();
+    });
+  });
+
   function selectionFixture() {
     const fixture = setup();
     const { canvas, canvasController } = fixture;
@@ -617,12 +888,13 @@ describe("PaperCanvas pointer contract", () => {
     expect(changes).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps one-finger touch inert in writing mode while allowing a two-finger pinch", () => {
+  it("can require two fingers while writing and keeps the remaining finger still after a pinch", () => {
     const { canvas, paper, canvasController } = setup();
+    canvasController.setRequireTwoFingersWhileWriting(true);
     const before = transformOf(paper);
     canvas.dispatchEvent(pointer("pointerdown", { pointerId: 50, pointerType: "touch", clientX: 300, clientY: 300 }));
-    expect(canvasController.isInputActive).toBe(false);
-    canvas.dispatchEvent(pointer("pointermove", { pointerId: 50, pointerType: "touch", clientX: 320, clientY: 320 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 50, pointerType: "touch", clientX: 320, clientY: 320, timeStamp: 120 }));
+    canvas.dispatchEvent(pointer("pointermove", { pointerId: 50, pointerType: "touch", clientX: 335, clientY: 335, timeStamp: 145 }));
     expect(transformOf(paper)).toEqual(before);
     canvas.dispatchEvent(pointer("pointerdown", { pointerId: 51, pointerType: "touch", clientX: 500, clientY: 300 }));
     expect(canvasController.isInputActive).toBe(true);
@@ -639,7 +911,7 @@ describe("PaperCanvas pointer contract", () => {
   });
 
   it.each(["continuous", "horizontal", "paged"] as const)(
-    "moves the %s viewport only with exactly two fingers and rebases after extra contacts", mode => {
+    "rebases two-finger navigation in %s after extra contacts and keeps a remaining finger still", mode => {
       const { canvas, paper, viewport, changes, canvasController } = setup();
       canvasController.setNavigationMode(mode);
       canvasController.setTool({ kind: "hand" });

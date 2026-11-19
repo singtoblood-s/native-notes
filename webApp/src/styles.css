@@ -255,7 +255,9 @@ h1, h2, h3, p { margin: 0; }
   display: flex; align-items: center; justify-content: space-between; gap: 4px; min-height: 40px;
   padding-bottom: env(safe-area-inset-bottom); border-top: 1px solid var(--line); color: var(--muted); font-size: 12px;
 }
-#tool-name { margin-inline-end: auto; color: var(--accent-dark); font-weight: 600; white-space: nowrap; }
+.paper-gesture { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; }
+#tool-name { color: var(--accent-dark); font-weight: 600; white-space: nowrap; }
+#paper-gesture-hint { color: var(--muted); }
 .view-controls { flex: none; gap: 1px; }
 .view-controls .quiet-button { width: auto; min-width: 32px; padding: 0 7px; font-size: 12px; white-space: nowrap; }
 .view-controls #zoom-out { font-size: 19px; }
@@ -617,6 +619,8 @@ h1, h2, h3, p { margin: 0; }
   .dialog-form { padding: 14px 16px 16px; }
 }
 @media (max-width: 480px) {
+  .stage-foot { flex-wrap: wrap; }
+  .stage-foot .paper-gesture { flex: 0 0 100%; padding-top: 4px; }
   :root { --workspace-padding: 6px; }
   .workspace > .topbar #auth-button { display: none; }
   .primary-tools .toolbar-divider { display: none; }

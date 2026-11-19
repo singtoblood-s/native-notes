@@ -5,8 +5,9 @@ import assert from "node:assert/strict";
 
 // Isolated local data. Desktop WebKit catches engine regressions, not iPad GPU speed.
 const port = "4188";
-const url = `http://127.0.0.1:${port}/native-notes/`;
-const server = spawn(process.execPath, ["node_modules/vite/bin/vite.js", "--port", port, "--strictPort"], { windowsHide: true, stdio: "ignore" });
+const url = process.env.QA_URL || `http://127.0.0.1:${port}/native-notes/`;
+if (!/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(url)) throw new Error("QA_URL must be a local test server.");
+const server = process.env.QA_URL ? null : spawn(process.execPath, ["node_modules/vite/bin/vite.js", "--port", port, "--strictPort"], { windowsHide: true, stdio: "ignore" });
 let browser;
 try {
   for (let attempt = 0; attempt < 60; attempt++) {
@@ -143,7 +144,7 @@ try {
   await page.waitForFunction(() => document.querySelector("#page-position").textContent === "2 / 2");
   await page.locator("#previous-page").click();
   await page.waitForFunction(() => document.querySelector("#page-position").textContent === "1 / 2");
-  const scroll = await page.evaluate(async () => {
+  const scrollPhoto = () => page.evaluate(async () => {
     const surface = document.querySelector("#ink-canvas");
     const scroller = document.querySelector("#paper-scroll");
     const before = scroller.scrollTop;
@@ -151,19 +152,30 @@ try {
     const pointer = (type, id, y) => surface.dispatchEvent(new PointerEvent(type, { pointerId: id, pointerType: "touch", bubbles: true, cancelable: true, isPrimary: id === 22, clientX: rect.left + (id === 22 ? 30 : 180), clientY: y, button: 0, buttons: 1 }));
     pointer("pointerdown", 22, rect.top + 370);
     pointer("pointermove", 22, rect.top + 350);
+    await new Promise(resolve => setTimeout(resolve, 115));
+    pointer("pointermove", 22, rect.top + 325);
+    pointer("pointermove", 22, rect.top + 300);
     const single = scroller.scrollTop - before;
-    pointer("pointerdown", 23, rect.top + 350);
-    pointer("pointermove", 22, rect.top + 250);
-    pointer("pointermove", 23, rect.top + 250);
+    pointer("pointerdown", 23, rect.top + 300);
+    pointer("pointermove", 22, rect.top + 235);
+    pointer("pointermove", 23, rect.top + 235);
     await new Promise(requestAnimationFrame);
     const after = scroller.scrollTop;
     pointer("pointercancel", 22, rect.top + 250);
     pointer("pointercancel", 23, rect.top + 250);
     scroller.scrollTop = before;
-    return { single, pair: after - before };
+    return { single, pair: after - before - single };
   });
-  assert.equal(scroll.single, 0, "One finger must leave the photo page stationary");
-  assert(scroll.pair > 0, "Two fingers must scroll the photo page while the pen tool is selected");
+  const normal = await scrollPhoto();
+  assert(normal.single > 10 && normal.pair > 10, "One intentional finger and two fingers must each scroll the photo page");
+  await page.locator("#auth-button").click();
+  const strict = page.locator("#require-two-fingers");
+  assert.equal(await strict.isChecked(), false);
+  await strict.check();
+  await page.locator("#settings-form").getByRole("button", { name: "Save settings" }).click();
+  const guarded = await scrollPhoto();
+  assert.equal(guarded.single, 0, "The writing preference must hold the page still with one finger");
+  assert(guarded.pair > 10, "The writing preference must preserve two-finger pan");
   const saves = await page.evaluate(() => window.qa.saves);
   await page.reload();
   await page.locator("[data-open-book]").click();
@@ -239,6 +251,7 @@ try {
   await page.locator("#back-library").click();
   await page.reload();
   await page.locator("#library-settings").click();
+  assert.equal(await strict.isChecked(), true, "The two-finger preference must persist after reopening");
   assert.equal(await settings.locator("#return-after-erase").isChecked(), false);
   assert.equal(await settings.locator("#show-eraser-shortcut").isChecked(), false);
   assert.deepEqual(errors, []);
@@ -246,5 +259,5 @@ try {
   console.log(JSON.stringify({ engine: engine.name(), persistence: "indexeddb", photoSurvivedReload: true, strokesSurvivedReload: true, eraserSettingsVerified: true, fullPageCopies: 0, frameP95Ms: Math.round(frames[Math.floor(frames.length * .95)]), saves }, null, 2));
 } finally {
   await browser?.close();
-  server.kill();
+  server?.kill();
 }

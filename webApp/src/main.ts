@@ -29,7 +29,7 @@ import { removeGuestData } from "./remove-guest-data";
 import { FloatingTools } from "./floating-tools";
 
 const BASE = import.meta.env.BASE_URL;
-const APP_BUILD = "2026.11.19.1";
+const APP_BUILD = "2026.11.19.2";
 const editDate = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
 const olderEditDate = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" });
 type OfflineCacheStatus = "preparing" | "ready" | "error" | "unsupported" | "development";
@@ -81,7 +81,7 @@ class NotePadApp {
   private clipboardImage: PageImage | null = null;
   private clipboardPoint: { x: number; y: number } | null = null;
   private longPress: { pointerID: number; x: number; y: number; timer: number } | null = null;
-  private readonly heldPointers = new Set<number>();
+  private readonly heldPointers = new Map<number, string>();
   private shellEvents = new AbortController();
   private imageDrag: { pointerID: number; pageID: string; imageID: string; startX: number; startY: number; originX: number; originY: number } | null = null;
   private imageResize: { pointerID: number; pageID: string; imageID: string; startX: number; startWidth: number; ratio: number } | null = null;
@@ -115,6 +115,7 @@ class NotePadApp {
   private lastInkTool: Exclude<CanvasTool["kind"], "hand" | "eraser" | "select"> = "pen";
   private returnAfterErase = true;
   private showEraserShortcut = true;
+  private requireTwoFingersWhileWriting = false;
   private floatingTools?: FloatingTools;
   private readonly toolSettings = {
     pen: { color: 0xff252429, width: 3 },
@@ -273,6 +274,7 @@ class NotePadApp {
     this.bindEvents();
     this.restoreLibraryPreferences();
     this.restoreToolSettings();
+    if (this.requireTwoFingersWhileWriting) this.canvas.setRequireTwoFingersWhileWriting(true);
     this.selectTool(this.selectedTool);
     byId<HTMLInputElement>("endpoint-input").value = getEndpoint();
     this.renderWorkspaceRecovery();
@@ -844,6 +846,7 @@ class NotePadApp {
   private openSettings(): void {
     byId<HTMLInputElement>("return-after-erase").checked = this.returnAfterErase;
     byId<HTMLInputElement>("show-eraser-shortcut").checked = this.showEraserShortcut;
+    byId<HTMLInputElement>("require-two-fingers").checked = this.requireTwoFingersWhileWriting;
     this.renderWorkspaceRecovery();
     this.openDialog("settings-dialog");
   }
@@ -1646,7 +1649,8 @@ class NotePadApp {
       }
       object.addEventListener("pointerdown", (event) => {
         if (this.showTrash || this.selectedTool !== "hand") return;
-        if (this.imageDrag || this.imageResize || (event.pointerType === "touch" && this.heldPointers.size > 1)) return;
+        if (this.imageDrag || this.imageResize || (event.pointerType === "touch" &&
+            (this.heldPointers.size > 1 || this.canvas?.isPalmTouch(event)))) return;
         const target = event.target as HTMLElement;
         if (target.closest("[data-image-resize]")) {
           event.preventDefault();
@@ -1757,6 +1761,11 @@ class NotePadApp {
   }
 
   private readonly handleImagePointerMove = (event: PointerEvent): void => {
+    if (event.pointerId !== this.imageDrag?.pointerID && event.pointerId !== this.imageResize?.pointerID) return;
+    if (event.pointerType === "touch" && this.canvas?.isPalmTouch(event)) {
+      this.imageDrag = this.imageResize = null;
+      return;
+    }
     if (this.imageDrag && this.imageDrag.pointerID === event.pointerId) {
       const page = this.currentPage;
       if (!page || page.id !== this.imageDrag.pageID) return;
@@ -1909,27 +1918,58 @@ class NotePadApp {
       menu.style.top = `${clampNumber(y, 8, window.innerHeight - menu.offsetHeight - 8)}px`;
       byId<HTMLButtonElement>("clipboard-copy").disabled = !this.selectedImageID;
     };
+    const surface = byId("paper-scroll");
+    let lastPaperContact = -Infinity;
+    let touchMenuOpen = false;
+    // Some engines emit contextmenu as a MouseEvent after the touch has ended.
+    // The Hand-tool timer owns touch menus and rechecks the contact before opening.
     paper.addEventListener("contextmenu", event => {
       event.preventDefault();
-      if (this.selectedTool !== "select") show(event.clientX, event.clientY);
+      const pointerType = (event as PointerEvent).pointerType;
+      const heldContact = [...this.heldPointers.values()].some(type => type === "touch" || type === "pen");
+      if (pointerType === "touch" || pointerType === "pen" || (Number.isFinite(lastPaperContact) &&
+          (heldContact || performance.now() - lastPaperContact < 1200))) return;
+      touchMenuOpen = false;
+      show(event.clientX, event.clientY);
     });
+    document.addEventListener("keydown", () => { lastPaperContact = -Infinity; }, { capture: true, signal });
+    const interruptTouchActions = (event: PointerEvent): void => {
+      if (event.pointerType !== "pen") return;
+      this.cancelLongPress();
+      if (touchMenuOpen) { byId("paper-clipboard-menu").hidden = true; touchMenuOpen = false; }
+      if (this.imageDrag && this.heldPointers.get(this.imageDrag.pointerID) === "touch") this.imageDrag = null;
+      if (this.imageResize && this.heldPointers.get(this.imageResize.pointerID) === "touch") this.imageResize = null;
+    };
+    for (const type of ["pointerover", "pointermove", "pointerdown"] as const) {
+      surface.addEventListener(type, interruptTouchActions, { capture: true, signal });
+    }
+    const canLongPress = (event: PointerEvent): boolean =>
+      this.selectedTool === "hand" && this.heldPointers.size === 1 && this.heldPointers.has(event.pointerId) &&
+      !this.canvas?.isWriting && !this.canvas?.isPalmTouch(event) && this.canInsertImage();
     document.addEventListener("pointerdown", event => {
-      this.heldPointers.add(event.pointerId);
+      this.heldPointers.set(event.pointerId, event.pointerType);
+      if (event.pointerType === "mouse") lastPaperContact = -Infinity;
+      else if (paper.contains(event.target as Node)) lastPaperContact = performance.now();
       if (event.pointerType === "touch" && this.heldPointers.size > 1) this.imageDrag = this.imageResize = null;
       this.cancelLongPress();
-      if (event.pointerType !== "touch" || this.heldPointers.size !== 1 || this.selectedTool === "select" || this.canvas?.isWriting || !paper.contains(event.target as Node) || !this.canInsertImage()) return;
+      if (event.pointerType !== "touch" || !paper.contains(event.target as Node) ||
+          (event.target instanceof Element && event.target.closest("button")) || !canLongPress(event)) return;
       const timer = window.setTimeout(() => {
         this.longPress = null;
+        if (!canLongPress(event)) return;
         this.suppressPaperClickUntil = performance.now() + 1000;
         this.imageDrag = this.imageResize = null;
+        touchMenuOpen = true;
         show(event.clientX, event.clientY);
       }, 550);
       this.longPress = { pointerID: event.pointerId, x: event.clientX, y: event.clientY, timer };
     }, { capture: true, signal });
     document.addEventListener("pointermove", event => {
-      if (this.longPress?.pointerID === event.pointerId && Math.hypot(event.clientX - this.longPress.x, event.clientY - this.longPress.y) > 10) this.cancelLongPress();
+      if (this.longPress?.pointerID === event.pointerId && (this.canvas?.isPalmTouch(event) ||
+          Math.hypot(event.clientX - this.longPress.x, event.clientY - this.longPress.y) > 8)) this.cancelLongPress();
     }, { capture: true, signal });
     for (const name of ["pointerup", "pointercancel"] as const) document.addEventListener(name, event => {
+      if (event.pointerType !== "mouse" && surface.contains(event.target as Node)) lastPaperContact = performance.now();
       this.heldPointers.delete(event.pointerId);
       this.cancelLongPress();
       if (event.pointerType === "touch" && byId("paper-scroll").contains(event.target as Node)) this.scheduleFlowActivation();
@@ -2395,6 +2435,7 @@ class NotePadApp {
     if (kind === "select" && this.showTrash) return;
     const changeImageInteraction = (this.selectedTool === "hand") !== (kind === "hand");
     this.selectedTool = kind;
+    this.updateGestureHint();
     if (kind === "pen" || kind === "line" || kind === "highlighter") this.lastInkTool = kind;
     for (const name of ["pen", "highlighter", "line", "eraser", "hand", "select"]) {
       byId(`${name}-tool`).classList.toggle("active", kind === name);
@@ -2437,6 +2478,12 @@ class NotePadApp {
     if (changeImageInteraction && this.currentPage) this.renderImageLayer(this.currentPage);
   }
 
+  private updateGestureHint(): void {
+    byId("paper-gesture-hint").textContent = this.selectedTool === "select" ? "Drag to select ink · Two fingers to pan or zoom"
+      : this.selectedTool !== "hand" && this.requireTwoFingersWhileWriting ? "Two fingers to pan or zoom"
+      : "One finger to pan · Pinch to zoom";
+  }
+
   private saveToolSettings(): void {
     try {
       localStorage.setItem("notepad.writing-tools", JSON.stringify({
@@ -2446,6 +2493,7 @@ class NotePadApp {
         penStyle: byId<HTMLSelectElement>("pen-style").value,
         returnAfterErase: this.returnAfterErase,
         showEraserShortcut: this.showEraserShortcut,
+        requireTwoFingersWhileWriting: this.requireTwoFingersWhileWriting,
       }));
     } catch { /* Tool preferences are optional; note durability uses SQLite. */ }
   }
@@ -2467,6 +2515,7 @@ class NotePadApp {
       if (saved.penStyle === "ball" || saved.penStyle === "fountain") byId<HTMLSelectElement>("pen-style").value = saved.penStyle;
       if (typeof saved.returnAfterErase === "boolean") this.returnAfterErase = saved.returnAfterErase;
       if (typeof saved.showEraserShortcut === "boolean") this.showEraserShortcut = saved.showEraserShortcut;
+      if (typeof saved.requireTwoFingersWhileWriting === "boolean") this.requireTwoFingersWhileWriting = saved.requireTwoFingersWhileWriting;
     } catch { /* Ignore unavailable storage or damaged preferences. */ }
   }
 
@@ -2869,6 +2918,12 @@ class NotePadApp {
     }
     this.returnAfterErase = byId<HTMLInputElement>("return-after-erase").checked;
     this.showEraserShortcut = byId<HTMLInputElement>("show-eraser-shortcut").checked;
+    const requireTwo = byId<HTMLInputElement>("require-two-fingers").checked;
+    if (this.requireTwoFingersWhileWriting !== requireTwo) {
+      this.requireTwoFingersWhileWriting = requireTwo;
+      this.canvas?.setRequireTwoFingersWhileWriting(requireTwo);
+      this.updateGestureHint();
+    }
     this.saveToolSettings();
     this.floatingTools?.setEraserShortcut(this.showEraserShortcut);
     if (previous !== next) {
@@ -3198,8 +3253,8 @@ function shellMarkup(auth: AuthSession): string {
           </div>
           <div class="paper-scroll" id="paper-scroll"><div class="page-flow" id="page-flow"><article class="flow-page active" id="active-page-slot" data-flow-page=""><div class="paper-viewport" id="paper-viewport"><div class="paper" id="paper"><canvas id="ink-canvas" aria-label="Note page drawing surface"></canvas><div class="paper-image-layer" id="paper-image-layer" aria-label="Page images"></div></div></div></article></div></div>
           <div class="print-note" aria-hidden="true"><h1 id="print-title"></h1><p id="print-text"></p></div>
-          <div class="stage-foot" title="Use two fingers to move or zoom the paper">
-            <span id="tool-name" aria-live="polite">Pen</span>
+          <div class="stage-foot">
+            <div class="paper-gesture"><span id="tool-name" aria-live="polite">Pen</span><span id="paper-gesture-hint">One finger to pan · Pinch to zoom</span></div>
             <select id="page-view-mode" aria-label="Page view mode" title="Page view mode"><option value="continuous">Scroll</option><option value="horizontal">Book scroll</option><option value="paged">Page turn</option></select>
             <div class="view-controls">
               <button class="quiet-button" id="zoom-out" aria-label="Zoom out" title="Zoom out">−</button>
@@ -3297,6 +3352,7 @@ function dialogMarkup(auth: AuthSession): string {
     <fieldset class="writing-settings"><legend>Writing</legend>
       <label><input id="return-after-erase" type="checkbox" />Return to previous pen after erasing</label>
       <label><input id="show-eraser-shortcut" type="checkbox" />Show quick eraser in Focus mode</label>
+      <label><input id="require-two-fingers" type="checkbox" /> Require two fingers to scroll while writing</label>
     </fieldset>
     <section class="settings-section" aria-labelledby="sync-heading">
       <h3 id="sync-heading">Sync</h3>

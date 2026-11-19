@@ -66,7 +66,9 @@ async function checkFingerCounts(page) {
   // without dragging the viewport. The second contact takes over navigation.
   await touch(page, "down", 1, at(0, 0));
   await touch(page, "move", 1, at(-12, -16));
-  sameViewport(await viewport(page), started, "One finger moved the page");
+  await page.waitForTimeout(115);
+  await touch(page, "move", 1, at(-25, -25));
+  sameViewport(await viewport(page), started, "An intentional marquee drag must select instead of panning the page");
   await touch(page, "down", 2, at(66, 0));
   await touch(page, "move", 1, at(-40, -30));
   await touch(page, "move", 2, at(95, -20));
